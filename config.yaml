@@ -1,0 +1,24 @@
+# Application Configuration
+
+project:
+  name: "ML Prediction API"
+  version: "0.1.0"
+  environment: "development"
+
+api:
+  prefix: "/api/v1"
+  allowed_origins:
+    - "*"
+
+database:
+  url: "sqlite:///./app.db"
+
+ml:
+  model_dir: "./models"
+  xgb_model_path: "./models/xgb_model.pkl"
+  lstm_model_path: "./models/lstm_model.h5"
+
+logging:
+  level: "INFO"
+  file: "./logs/app.log"
+
