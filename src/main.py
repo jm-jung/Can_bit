@@ -24,6 +24,7 @@ from src.realtime.updater import update_latest_candle
 from src.trading.engine import trading_step
 from src.trading.router import trading_router
 from src.trading.risk import risk_manager
+from src.trading.binance_real_client import binance_real
 
 # Setup logging
 setup_logging()
@@ -211,4 +212,48 @@ def reset_risk_day():
     risk_manager.today = datetime.utcnow().date()
     risk_manager.trading_disabled_reason = None
     return {"status": "ok", "equity": risk_manager.equity}
+
+
+@app.get("/trade/live-mode")
+def get_live_mode():
+    """
+    실전 Binance 주문 live_mode 조회용 엔드포인트.
+    
+    True일 경우 실제 Binance API로 주문을 시도할 수 있으므로 매우 주의가 필요하다.
+    이 값은 trade/mode가 REAL일 때만 의미가 있다.
+    """
+    return {
+        "live_mode": binance_real.get_live_mode(),
+        "warning": "live_mode가 True이면 실제 주문이 실행될 수 있습니다. 신중히 사용하세요.",
+    }
+
+
+@app.post("/trade/live-mode/{flag}")
+def set_live_mode(flag: str):
+    """
+    실전 Binance 주문 live_mode 설정 엔드포인트.
+    
+    - flag = "on"  → live_mode = True  (실제 주문 시도 가능)
+    - flag = "off" → live_mode = False (dry-run 모드)
+    
+    실제 운영 시에는 반드시 소액 및 sandbox 모드에서 충분히 검증 후 사용하는 것을 권장한다.
+    
+    주의사항:
+    - 이 API는 매우 위험할 수 있습니다.
+    - 실제 자금이 사용될 수 있으므로 신중하게 사용하세요.
+    - sandbox 모드에서 먼저 테스트하는 것을 강력히 권장합니다.
+    """
+    flag = flag.lower()
+    if flag == "on":
+        binance_real.enable_live_mode()
+    elif flag == "off":
+        binance_real.disable_live_mode()
+    else:
+        return {"error": "flag must be 'on' or 'off'"}
+    
+    return {
+        "live_mode": binance_real.get_live_mode(),
+        "message": f"Live mode has been turned {flag}",
+        "warning": "live_mode가 True이면 실제 주문이 실행될 수 있습니다." if binance_real.get_live_mode() else None,
+    }
 
