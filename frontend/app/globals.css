@@ -1,0 +1,12 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  @apply bg-background text-white min-h-screen;
+}
+
+::selection {
+  background: rgba(34, 211, 238, 0.4);
+}
+

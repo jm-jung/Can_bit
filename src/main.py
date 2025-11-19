@@ -25,6 +25,8 @@ from src.trading.engine import trading_step
 from src.trading.router import trading_router
 from src.trading.risk import risk_manager
 from src.trading.binance_real_client import binance_real
+from src.backoffice.router import router as backoffice_router
+from src.backoffice.logs import log_error_event
 
 # Setup logging
 setup_logging()
@@ -42,6 +44,7 @@ async def candle_updater():
                 logger.info("⏳ No new candle yet.")
         except Exception as exc:
             logger.error(f"❌ Realtime update error: {exc}")
+            log_error_event({"event": "candle_update_failed", "details": str(exc)})
         await asyncio.sleep(60)
 
 
@@ -53,6 +56,7 @@ async def auto_trader():
             logger.info("🤖 Trade step: %s", result)
         except Exception as exc:
             logger.error(f"❌ Trading engine error: {exc}")
+            log_error_event({"event": "trading_step_failed", "details": str(exc)})
         await asyncio.sleep(60)
 
 
@@ -111,6 +115,7 @@ app.add_middleware(
 # Include routers
 app.include_router(status_router, tags=["status"])
 app.include_router(prediction_router, prefix="/api/v1", tags=["prediction"])
+app.include_router(backoffice_router, prefix="/backoffice", tags=["backoffice"])
 
 
 @app.get("/debug/ohlcv/last", response_model=OHLCVCandle)

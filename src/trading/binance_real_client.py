@@ -99,6 +99,7 @@ class BinanceRealClient:
                 "side": side,
                 "price": price,
                 "amount": amount,
+                "entry_time": now,
                 "executed": False,
                 "mode": "dry-run",
             }
@@ -133,6 +134,7 @@ class BinanceRealClient:
                 "side": self.position["side"],
                 "price": self.position["price"],
                 "amount": self.position["amount"],
+                "entry_time": now,
                 "executed": True,
                 "mode": "live",
             }
@@ -198,6 +200,7 @@ class BinanceRealClient:
         return {
             "entry": entry,
             "exit_price": exit_exec_price,
+            "exit_time": datetime.utcnow().isoformat(),
             "pnl": float(pnl),
             "executed": executed,
         }
