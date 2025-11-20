@@ -19,7 +19,9 @@ from src.api.routes_status import router as status_router
 from src.schemas.ohlcv import OHLCVCandle
 from src.services.ohlcv_service import get_last_candle, get_recent_candles
 from src.strategies.basic import simple_ema_rsi_strategy
-from src.backtest.engine import run_backtest
+from src.strategies.ml_xgb import ml_xgb_strategy
+from src.strategies.dl_lstm_attn import get_lstm_attn_signal
+from src.backtest.engine import run_backtest, run_backtest_with_ml, run_backtest_with_dl_lstm_attn
 from src.realtime.updater import update_latest_candle
 from src.trading.engine import trading_step
 from src.trading.router import trading_router
@@ -144,6 +146,46 @@ def read_backtest_simple():
     EMA+RSI 기반 전략의 전체 백테스트 리포트 반환
     """
     return run_backtest()
+
+
+@app.get("/debug/strategy/xgb-ml")
+def read_xgb_ml_strategy():
+    """
+    XGBoost ML 전략의 신호와 확률을 반환
+    """
+    result = ml_xgb_strategy()
+    if result["proba_up"] is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=503, detail="ML model not available")
+    return result
+
+
+@app.get("/debug/backtest/xgb-ml")
+def read_backtest_xgb_ml():
+    """
+    XGBoost ML 기반 전략의 전체 백테스트 리포트 반환
+    """
+    return run_backtest_with_ml()
+
+
+@app.get("/debug/strategy/dl-lstm-attn")
+def read_dl_lstm_attn_strategy():
+    """
+    LSTM + Attention 딥러닝 전략의 신호와 확률을 반환
+    """
+    result = get_lstm_attn_signal()
+    if result["proba_up"] is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=503, detail="DL model not available")
+    return result
+
+
+@app.get("/debug/backtest/dl-lstm-attn")
+def read_backtest_dl_lstm_attn():
+    """
+    LSTM + Attention 딥러닝 기반 전략의 전체 백테스트 리포트 반환
+    """
+    return run_backtest_with_dl_lstm_attn()
 
 
 @app.get("/realtime/last")

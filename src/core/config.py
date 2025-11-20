@@ -1,11 +1,15 @@
 """
 Configuration management
 """
+import os
 from pathlib import Path
 from typing import List, Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 import yaml
+
+# 프로젝트 루트 디렉토리 계산 (src/core/config.py 기준으로 상위 2단계)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 class Settings(BaseSettings):
@@ -32,8 +36,14 @@ class Settings(BaseSettings):
 
     # ML Model settings
     MODEL_DIR: str = "./models"
-    XGB_MODEL_PATH: str = "./models/xgb_model.pkl"
-    LSTM_MODEL_PATH: str = "./models/lstm_model.h5"
+    XGB_MODEL_PATH: str = "../models/xgb_model.pkl"
+    LSTM_MODEL_PATH: str = "../models/lstm_model.h5"
+    # LSTM + Attention 모델 경로 (프로젝트 루트 기준)
+    LSTM_ATTN_MODEL_PATH: str = str(PROJECT_ROOT / "models" / "lstm_attn_v1.pt")
+
+    # DL LSTM + Attention strategy thresholds
+    DL_LSTM_ATTN_THRESHOLD_UP: float = 0.55
+    DL_LSTM_ATTN_THRESHOLD_DOWN: float = 0.45
 
     # Logging settings
     LOG_LEVEL: str = "INFO"

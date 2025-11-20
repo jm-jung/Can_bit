@@ -12,6 +12,7 @@ from src.backoffice.utils import (
 from src.backoffice.equity_manager import load_equity_curve
 from src.trading.binance_real_client import binance_real
 from src.trading.engine import get_last_signal, get_last_trade
+from src.strategies.ml_xgb import ml_xgb_strategy
 from src.trading.router import trading_router
 from src.trading.risk import risk_manager
 
@@ -53,9 +54,15 @@ def get_daily_report():
 def monitor_state():
     client = trading_router.get_client()
     risk_status = risk_manager.status()
+    
+    # Get ML strategy signal
+    ml_result = ml_xgb_strategy()
+    
     return {
         "position": client.get_position(),
         "last_signal": get_last_signal(),
+        "last_ml_signal": ml_result.get("signal"),
+        "last_ml_proba_up": ml_result.get("proba_up"),
         "risk": {
             "equity": risk_status.get("equity"),
             "drawdown_today": risk_status.get("drawdown_today"),

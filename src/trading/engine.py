@@ -2,11 +2,13 @@
 from __future__ import annotations
 
 from datetime import datetime
+from enum import Enum
 from typing import Any, Dict, Literal, Optional
 
 from src.backoffice.equity_manager import append_equity_point
 from src.backoffice.logs import log_error_event, log_risk_event, log_trade_event
 from src.strategies.basic import simple_ema_rsi_strategy
+from src.strategies.ml_xgb import ml_xgb_strategy
 from src.trading.router import trading_router
 from src.trading.risk import risk_manager
 
@@ -16,6 +18,16 @@ SLIPPAGE_BPS = 0.0005  # 5 bps
 _last_signal: str = "HOLD"
 _last_trade: Optional[Dict[str, Any]] = None
 
+# Strategy type selection
+class StrategyType(str, Enum):
+    RULE = "RULE"  # EMA + RSI rule-based
+    ML = "ML"  # XGBoost ML strategy
+    HYBRID = "HYBRID"  # Both strategies must agree
+
+
+# Global strategy type (default: RULE)
+_current_strategy_type: StrategyType = StrategyType.RULE
+
 
 def _apply_slippage(price: float, side: Literal["BUY", "SELL"]) -> float:
     slip = price * SLIPPAGE_BPS
@@ -24,13 +36,72 @@ def _apply_slippage(price: float, side: Literal["BUY", "SELL"]) -> float:
     return max(price - slip, 0)
 
 
+def set_strategy_type(strategy_type: StrategyType) -> None:
+    """Set the strategy type for trading engine."""
+    global _current_strategy_type
+    _current_strategy_type = strategy_type
+
+
+def get_strategy_type() -> StrategyType:
+    """Get current strategy type."""
+    return _current_strategy_type
+
+
+def _get_strategy_signal() -> tuple[str, float]:
+    """
+    Get signal from current strategy type.
+
+    Returns:
+        Tuple of (signal, price)
+    """
+    global _current_strategy_type
+
+    if _current_strategy_type == StrategyType.RULE:
+        strat = simple_ema_rsi_strategy()
+        return strat["signal"], float(strat["close"])
+
+    elif _current_strategy_type == StrategyType.ML:
+        # ML strategy - warn if in REAL mode
+        if trading_router.mode == "REAL":
+            log_risk_event(
+                {
+                    "event": "ml_strategy_warning",
+                    "message": "ML strategy used in REAL mode - use with caution",
+                }
+            )
+        strat = ml_xgb_strategy()
+        if strat["proba_up"] is None:
+            # Model not available, fallback to HOLD
+            return "HOLD", float(strat["close"])
+        return strat["signal"], float(strat["close"])
+
+    elif _current_strategy_type == StrategyType.HYBRID:
+        rule_strat = simple_ema_rsi_strategy()
+        ml_strat = ml_xgb_strategy()
+
+        rule_signal = rule_strat["signal"]
+        ml_signal = ml_strat["signal"] if ml_strat["proba_up"] is not None else "HOLD"
+        price = float(rule_strat["close"])
+
+        # Both must agree for LONG or SHORT
+        if rule_signal == "LONG" and ml_signal == "LONG":
+            return "LONG", price
+        elif rule_signal == "SHORT" and ml_signal == "SHORT":
+            return "SHORT", price
+        else:
+            return "HOLD", price
+
+    else:
+        # Fallback to RULE
+        strat = simple_ema_rsi_strategy()
+        return strat["signal"], float(strat["close"])
+
+
 def trading_step():
     """Execute a single trading step based on current strategy signal."""
     global _last_signal, _last_trade
 
-    strat = simple_ema_rsi_strategy()
-    signal = strat["signal"]
-    price = float(strat["close"])
+    signal, price = _get_strategy_signal()
     _last_signal = signal
 
     client = trading_router.get_client()

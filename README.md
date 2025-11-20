@@ -27,7 +27,7 @@
 
 ### ✓ 3. 전략 엔진 (Strategy Engine)
 
-기본 전략: **EMA + RSI Strategy**
+#### 기본 전략: **EMA + RSI Strategy**
 
 조건:  
 - 가격 > EMA20 AND RSI < 70 → **LONG**  
@@ -36,6 +36,20 @@
 
 엔드포인트:
 `GET /debug/strategy/simple`
+
+#### ML 전략: **XGBoost Strategy**
+
+XGBoost 기반 머신러닝 전략으로 다음 5분 수익률 > 0 여부를 이진 분류합니다.
+
+- 학습 실행: `python -m src.ml.train_xgb`
+- 전략 호출: `GET /debug/strategy/xgb-ml`
+- 백테스트: `GET /debug/backtest/xgb-ml`
+
+규칙:
+- proba_up >= 0.55 → **LONG**
+- proba_up <= 0.45 → **SHORT**
+- 0.45 < proba_up < 0.55 → **HOLD**
+
 ---
 
 ### ✓ 4. 백테스트 엔진 (Backtest Engine)
@@ -172,7 +186,12 @@ src/
 ├── indicators/
 │ └── basic.py # EMA, RSI, SMA
 ├── strategies/
-│ └── basic.py # EMA+RSI strategy
+│ ├── basic.py # EMA+RSI strategy
+│ └── ml_xgb.py # XGBoost ML strategy
+├── ml/
+│ ├── features.py # Feature engineering
+│ ├── train_xgb.py # Model training script
+│ └── xgb_model.py # Model loader
 ├── realtime/
 │ └── updater.py # Live OHLCV updater
 ├── backtest/
@@ -197,9 +216,11 @@ src/
 ### 데이터 & 전략
 `GET /realtime/last`
 `GET /debug/strategy/simple`
+`GET /debug/strategy/xgb-ml`
 
 ### 백테스트
 `GET /debug/backtest/simple`
+`GET /debug/backtest/xgb-ml`
 
 ### 자동매매 엔진
 `GET /trade/step`

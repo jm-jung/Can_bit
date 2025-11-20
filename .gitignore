@@ -135,6 +135,7 @@ celerybeat.pid
 *.sage.py
 
 # Environments
+frontend/.next/
 node_modules/
 .env
 .env.local
