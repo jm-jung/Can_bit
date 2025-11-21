@@ -14,7 +14,7 @@ import torch
 from src.core.config import settings
 from src.dl.models.lstm_attn import LSTMAttentionModel
 from src.indicators.basic import add_basic_indicators
-from src.ml.features import build_ml_dataset
+from src.ml.features import build_feature_frame, build_ml_dataset
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +99,10 @@ class LSTMAttnSignalModel:
 
                 df = load_ohlcv_df()
                 df = df.sort_values("timestamp").reset_index(drop=True)
-                X_features, _ = build_ml_dataset(df, horizon=5)
+                X_features = build_feature_frame(
+                    df,
+                    use_events=settings.EVENTS_ENABLED,
+                ).dropna()
                 self.feature_cols = X_features.columns.tolist()
 
             feature_dim = len(self.feature_cols)
@@ -118,7 +121,14 @@ class LSTMAttnSignalModel:
                 dropout=self.dropout,
                 device=self.device,
             )
-            logger.info(f"Successfully loaded LSTM model (feature_dim={feature_dim})")
+            logger.info(
+                f"Successfully loaded LSTM model: "
+                f"feature_dim={feature_dim}, hidden_size={self.hidden_size}, "
+                f"num_layers={self.num_layers}, dropout={self.dropout}"
+            )
+            logger.info(f"Model input_size attribute: {self.model.input_size}")
+            logger.info(f"Feature columns count: {len(self.feature_cols)}")
+            logger.info(f"Feature columns (first 10): {self.feature_cols[:10]}")
         except RuntimeError as e:
             # Handle size mismatch or other model loading errors
             error_msg = str(e)
@@ -151,20 +161,28 @@ class LSTMAttnSignalModel:
             Features DataFrame
         """
         df = df.copy()
-        df = add_basic_indicators(df)
 
-        # Build features using same function as training
-        X_features, _ = build_ml_dataset(df, horizon=5)
+        features = build_feature_frame(
+            df,
+            use_events=settings.EVENTS_ENABLED,
+        )
+        features = features.dropna()
 
         # Cache feature columns if not set
         if self.feature_cols is None:
-            self.feature_cols = X_features.columns.tolist()
+            self.feature_cols = features.columns.tolist()
 
-        return X_features
+        # 추론 시점에 피처 순서를 학습 시점과 동일하게 맞춘다
+        features = features.reindex(columns=self.feature_cols, fill_value=0.0)
+        return features
 
     def _prepare_sequence(self, df: pd.DataFrame) -> torch.Tensor:
         """
         Prepare sequence for LSTM model.
+        
+        IMPORTANT: 이 함수는 학습 시점의 정규화 방식과 완전히 동일해야 함.
+        - 학습 시: 각 시퀀스마다 rolling(window=window_size)로 정규화
+        - 예측 시: 동일한 방식으로 정규화 (현재 시점 기준 rolling window)
 
         Args:
             df: DataFrame with OHLCV + indicators (must be sorted by timestamp)
@@ -184,9 +202,20 @@ class LSTMAttnSignalModel:
         seq_features = features.iloc[-self.window_size :].copy()
 
         # Normalize features (using rolling statistics, same as training)
-        # Use the full feature history for normalization to match training
+        # IMPORTANT: 학습 시점과 동일한 방식으로 정규화
+        #
+        # 정규화 방식 (학습 시점과 동일):
+        # - 학습 시: 각 행 i에 대해 [i-window_size+1:i+1] 구간의 평균/표준편차로 정규화
+        # - 예측 시: 마지막 시퀀스의 마지막 행에서 [len-window_size:len] 구간의 평균/표준편차 사용
+        #
+        # 예: window_size=60, 전체 데이터가 1000행일 때
+        #   - 학습 시: 행 60은 [0:61] 구간의 통계로 정규화
+        #   - 예측 시: 행 999는 [939:1000] 구간의 통계로 정규화
+        #
+        # 이렇게 하면 학습 시점과 예측 시점의 정규화 방식이 일치함
         for col in seq_features.columns:
             # Calculate mean and std from the full feature history
+            # 마지막 시퀀스의 마지막 행에서 rolling window의 마지막 값 사용
             mean = features[col].rolling(window=self.window_size, min_periods=1).mean().iloc[-1]
             std = features[col].rolling(window=self.window_size, min_periods=1).std().iloc[-1]
             if std == 0:
@@ -196,6 +225,24 @@ class LSTMAttnSignalModel:
         # Convert to numpy and then tensor
         seq_array = seq_features.values.astype(np.float32)
         seq_tensor = torch.FloatTensor(seq_array).unsqueeze(0)  # Add batch dimension
+        
+        # Feature dimension 검증 로깅 (디버깅용)
+        actual_feature_dim = seq_tensor.shape[2]
+        if self.model is not None and hasattr(self.model, 'input_size'):
+            expected_feature_dim = self.model.input_size
+            if actual_feature_dim != expected_feature_dim:
+                logger.error(
+                    f"Feature dimension mismatch! "
+                    f"Expected: {expected_feature_dim}, Got: {actual_feature_dim}. "
+                    f"This will cause model inference to fail."
+                )
+                raise ValueError(
+                    f"Feature dimension mismatch: expected {expected_feature_dim}, got {actual_feature_dim}"
+                )
+            logger.debug(
+                f"Feature dimension check: expected={expected_feature_dim}, "
+                f"actual={actual_feature_dim}, sequence shape={seq_tensor.shape}"
+            )
 
         return seq_tensor
 
@@ -215,6 +262,12 @@ class LSTMAttnSignalModel:
         # Prepare sequence
         seq_tensor = self._prepare_sequence(df)
         seq_tensor = seq_tensor.to(self.device)
+        
+        # 입력 텐서 shape 로깅 (디버깅용)
+        logger.debug(
+            f"predict_proba_latest: input tensor shape={seq_tensor.shape}, "
+            f"feature_dim={seq_tensor.shape[2] if len(seq_tensor.shape) >= 3 else 'N/A'}"
+        )
 
         # Predict
         self.model.eval()
@@ -222,28 +275,36 @@ class LSTMAttnSignalModel:
             logits = self.model(seq_tensor)  # (1, 1), raw logit
             prob = torch.sigmoid(logits)  # (1, 1), 0~1
             prob_up = float(prob.cpu().item())
+            
+            logger.debug(f"predict_proba_latest: logit={logits.item():.4f}, prob_up={prob_up:.4f}")
 
         return prob_up
 
     def predict_label_latest(
         self,
         df: pd.DataFrame,
-        threshold_up: float = 0.55,
-        threshold_down: float = 0.45,
+        threshold_up: float | None = None,
+        threshold_down: float | None = None,
     ) -> str:
         """
         Predict trading signal based on probability.
 
         Args:
             df: DataFrame with OHLCV + indicators (must be sorted by timestamp)
-            threshold_up: Probability threshold for LONG signal (default: 0.55)
-            threshold_down: Probability threshold for SHORT signal (default: 0.45)
+            threshold_up: Probability threshold for LONG signal (default: from settings)
+            threshold_down: Probability threshold for SHORT signal (default: from settings)
 
         Returns:
             Trading signal: "LONG", "SHORT", or "HOLD"
         """
         if not self.is_loaded():
             raise ValueError("Model not loaded. Train model first or check model path.")
+
+        # Use settings defaults if not provided
+        if threshold_up is None:
+            threshold_up = settings.LSTM_ATTN_THRESHOLD_UP
+        if threshold_down is None:
+            threshold_down = settings.LSTM_ATTN_THRESHOLD_DOWN
 
         prob_up = self.predict_proba_latest(df)
 

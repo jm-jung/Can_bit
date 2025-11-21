@@ -12,7 +12,7 @@ import pandas as pd
 from xgboost import XGBClassifier
 
 from src.core.config import settings
-from src.ml.features import build_ml_dataset
+from src.ml.features import build_feature_frame
 
 
 class XGBSignalModel:
@@ -53,37 +53,10 @@ class XGBSignalModel:
         Returns:
             Features DataFrame
         """
-        from src.indicators.basic import add_basic_indicators
-
-        df = df.copy()
-        df = add_basic_indicators(df)
-
-        features = pd.DataFrame(index=df.index)
-
-        # Basic OHLCV features
-        features["close"] = df["close"]
-        features["high"] = df["high"]
-        features["low"] = df["low"]
-        features["volume"] = df["volume"]
-
-        # Price differences
-        features["high_low"] = df["high"] - df["low"]
-        features["close_open"] = df["close"] - df["open"]
-        features["close_open_pct"] = (df["close"] / df["open"]) - 1
-
-        # Indicators
-        features["ema_20"] = df["ema_20"]
-        features["sma_20"] = df["sma_20"]
-        features["rsi_14"] = df["rsi_14"]
-
-        # Rolling statistics
-        features["rolling_std_20"] = df["close"].rolling(window=20, min_periods=1).std()
-        features["rolling_mean_20"] = df["close"].rolling(window=20, min_periods=1).mean()
-
-        # Price relative to moving averages
-        features["close_ema_ratio"] = df["close"] / df["ema_20"]
-        features["close_sma_ratio"] = df["close"] / df["sma_20"]
-
+        features = build_feature_frame(
+            df,
+            use_events=settings.EVENTS_ENABLED,
+        )
         return features
 
     def predict_proba_latest(self, df: pd.DataFrame) -> float:

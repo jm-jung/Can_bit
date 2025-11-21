@@ -24,6 +24,7 @@ def train_xgb_model(
     learning_rate: float = 0.05,
     subsample: float = 0.8,
     colsample_bytree: float = 0.8,
+    use_events: bool | None = None,
 ) -> XGBClassifier:
     """
     Train XGBoost classifier for BTC price direction prediction.
@@ -43,8 +44,16 @@ def train_xgb_model(
     print("Loading OHLCV data...")
     df = load_ohlcv_df()
 
-    print(f"Building ML dataset (horizon={horizon})...")
-    X, y = build_ml_dataset(df, horizon=horizon)
+    if use_events is None:
+        use_events = settings.EVENTS_ENABLED
+    print(
+        f"Building ML dataset (horizon={horizon}, use_events={use_events})..."
+    )
+    X, y = build_ml_dataset(
+        df,
+        horizon=horizon,
+        use_events=use_events,
+    )
 
     print(f"Dataset shape: X={X.shape}, y={y.shape}")
     print(f"Positive samples: {y.sum()} ({y.mean()*100:.2f}%)")

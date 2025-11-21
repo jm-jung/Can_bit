@@ -45,6 +45,9 @@ def get_lstm_attn_signal(
     Returns:
         DLStrategyOutput with prediction and signal
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    
     try:
         if ohlcv_df is None:
             df = get_df_with_indicators()
@@ -67,20 +70,26 @@ def get_lstm_attn_signal(
 
         # Use config defaults if not provided
         if threshold_up is None:
-            threshold_up = settings.DL_LSTM_ATTN_THRESHOLD_UP
+            threshold_up = settings.LSTM_ATTN_THRESHOLD_UP
         if threshold_down is None:
-            threshold_down = settings.DL_LSTM_ATTN_THRESHOLD_DOWN
+            threshold_down = settings.LSTM_ATTN_THRESHOLD_DOWN
 
         proba_up = model.predict_proba_latest(df)
         last_row = df.iloc[-1]
 
-        # Determine signal based on probability
-        if proba_up >= threshold_up:
-            signal: Signal = "LONG"
-        elif proba_up <= threshold_down:
-            signal = "SHORT"
-        else:
-            signal = "HOLD"
+        # Use predict_label_latest for consistent signal generation
+        signal: Signal = model.predict_label_latest(
+            df,
+            threshold_up=threshold_up,
+            threshold_down=threshold_down,
+        )
+
+        # 디버그 로깅: threshold와 signal 확인
+        logger.info(
+            f"[LSTM Strategy] prob_up={proba_up:.4f}, "
+            f"threshold_up={threshold_up:.2f}, threshold_down={threshold_down:.2f}, "
+            f"signal={signal}"
+        )
 
         return DLStrategyOutput(
             timestamp=str(last_row["timestamp"]),

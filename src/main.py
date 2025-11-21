@@ -17,11 +17,16 @@ from src.ml.predictor import load_model
 from src.api.routes_prediction import router as prediction_router
 from src.api.routes_status import router as status_router
 from src.schemas.ohlcv import OHLCVCandle
-from src.services.ohlcv_service import get_last_candle, get_recent_candles
+from src.services.ohlcv_service import get_last_candle, get_recent_candles, load_ohlcv_df
 from src.strategies.basic import simple_ema_rsi_strategy
 from src.strategies.ml_xgb import ml_xgb_strategy
 from src.strategies.dl_lstm_attn import get_lstm_attn_signal
-from src.backtest.engine import run_backtest, run_backtest_with_ml, run_backtest_with_dl_lstm_attn
+from src.backtest.engine import (
+    run_backtest,
+    run_backtest_with_ml,
+    run_backtest_with_dl_lstm_attn,
+    run_backtest_compare,
+)
 from src.realtime.updater import update_latest_candle
 from src.trading.engine import trading_step
 from src.trading.router import trading_router
@@ -29,6 +34,11 @@ from src.trading.risk import risk_manager
 from src.trading.binance_real_client import binance_real
 from src.backoffice.router import router as backoffice_router
 from src.backoffice.logs import log_error_event
+from src.events.dataset import (
+    build_event_feature_df,
+    load_event_features,
+    load_processed_events,
+)
 
 # Setup logging
 setup_logging()
@@ -177,15 +187,130 @@ def read_dl_lstm_attn_strategy():
     if result["proba_up"] is None:
         from fastapi import HTTPException
         raise HTTPException(status_code=503, detail="DL model not available")
+    # 로깅은 get_lstm_attn_signal 내부에서 처리됨
     return result
 
 
 @app.get("/debug/backtest/dl-lstm-attn")
-def read_backtest_dl_lstm_attn():
+def read_backtest_dl_lstm_attn(
+    threshold_up: float | None = Query(
+        None,
+        description="Optional override for LSTM up-threshold (e.g. 0.52)",
+    ),
+    threshold_down: float | None = Query(
+        None,
+        description="Optional override for LSTM down-threshold (e.g. 0.48)",
+    ),
+):
     """
     LSTM + Attention 딥러닝 기반 전략의 전체 백테스트 리포트 반환
+    
+    NOTE: threshold_up/down can be overridden via API query params now.
     """
-    return run_backtest_with_dl_lstm_attn()
+    logger.info(
+        "[DEBUG] /debug/backtest/dl-lstm-attn called (threshold_up=%s, threshold_down=%s)",
+        threshold_up,
+        threshold_down,
+    )
+    return run_backtest_with_dl_lstm_attn(
+        threshold_up=threshold_up,
+        threshold_down=threshold_down,
+    )
+
+
+@app.get("/debug/backtest/compare")
+def read_backtest_compare(
+    threshold_up: float | None = Query(
+        None,
+        description="Optional override for LSTM up-threshold",
+    ),
+    threshold_down: float | None = Query(
+        None,
+        description="Optional override for LSTM down-threshold",
+    ),
+):
+    """
+    simple / XGB-ML / DL-LSTM-Attn 3가지 전략의 백테스트 성능을 한 번에 비교해서 반환.
+    """
+    logger.info(
+        "[DEBUG] /debug/backtest/compare called (threshold_up=%s, threshold_down=%s)",
+        threshold_up,
+        threshold_down,
+    )
+    return run_backtest_compare(
+        threshold_up=threshold_up,
+        threshold_down=threshold_down,
+    )
+
+
+@app.get("/debug/events/latest")
+def read_debug_events_latest(limit: int = Query(50, ge=1, le=500)):
+    """
+    최근 분류된 이벤트 목록을 반환
+    """
+    try:
+        events = load_processed_events(limit=limit)
+        return {
+            "count": len(events),
+            "events": [event.model_dump() for event in events]
+        }
+    except Exception as exc:
+        logger.error("이벤트 로드 실패: %s", exc, exc_info=True)
+        return {
+            "count": 0,
+            "events": [],
+            "error": str(exc)
+        }
+
+
+@app.get("/debug/events/features")
+def read_debug_event_features(
+    limit: int = Query(200, ge=1, le=2000),
+    refresh: bool = False,
+):
+    """
+    이벤트 피처 집계결과를 반환 (옵션: refresh로 재생성)
+    """
+    try:
+        feature_df = load_event_features()
+        if feature_df.empty or refresh:
+            logger.info("이벤트 피처를 재생성합니다...")
+            ohlcv_df = load_ohlcv_df()
+            if ohlcv_df.empty:
+                return {
+                    "count": 0,
+                    "features": [],
+                    "error": "OHLCV 데이터가 없어 이벤트 피처를 생성할 수 없습니다."
+                }
+            feature_df = build_event_feature_df(ohlcv_df, save=True)
+        
+        if feature_df.empty:
+            return {
+                "count": 0,
+                "features": [],
+                "message": "이벤트 피처가 비어있습니다."
+            }
+        
+        payload = (
+            feature_df.sort_index()
+            .tail(limit)
+            .reset_index()
+            .rename(columns={"index": "timestamp"})
+            .to_dict("records")
+        )
+        return {
+            "count": len(payload),
+            "shape": list(feature_df.shape),
+            "columns": list(feature_df.columns),
+            "features": payload
+        }
+    except Exception as exc:
+        logger.error("이벤트 피처 로드/생성 실패: %s", exc, exc_info=True)
+        return {
+            "count": 0,
+            "features": [],
+            "error": str(exc)
+        }
 
 
 @app.get("/realtime/last")
