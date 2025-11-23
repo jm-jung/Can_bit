@@ -3,6 +3,7 @@ Training script for LSTM + Attention model.
 """
 from __future__ import annotations
 
+import argparse
 import logging
 from pathlib import Path
 
@@ -17,6 +18,14 @@ from src.indicators.basic import add_basic_indicators
 from src.ml.features import build_ml_dataset
 from src.services.ohlcv_service import load_ohlcv_df
 from src.dl.models.lstm_attn import LSTMAttentionModel
+from src.debug.overfit_checks import (
+    run_single_sample_overfit,
+    run_two_sample_overfit,
+    run_small_batch_overfit,
+    print_label_stats,
+    check_backbone_feature_std,
+)
+from src.debug.gradient_check import report_gradient_issues
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -361,6 +370,7 @@ def train_model(
     patience_es: int = 10,
     min_delta: float = 1e-4,
     device: torch.device | None = None,
+    debug_overfit_mode: str | None = None,
 ) -> LSTMAttentionModel:
     """
     Train LSTM + Attention model with improved training pipeline.
@@ -559,6 +569,121 @@ def train_model(
         verbose=True,
         min_lr=1e-6,
     )
+
+    # ============================================================
+    # Debug Overfit Mode: 오버핏 테스트 실행
+    # ============================================================
+    if debug_overfit_mode is not None:
+        logger.info("=" * 60)
+        logger.info("DEBUG OVERFIT MODE ENABLED")
+        logger.info("=" * 60)
+        
+        # Gradient flow 검사
+        model_files = [
+            Path(__file__),
+            Path(__file__).parent.parent / "models" / "lstm_attn.py",
+        ]
+        report_gradient_issues(model_files)
+        
+        # Label 분포 출력
+        print_label_stats(train_dataset, prefix="[DEBUG][TRAIN][LABEL]")
+        
+        # Backbone feature std 확인
+        if len(train_dataset) > 0:
+            X_sample, _ = train_dataset[0]
+            if isinstance(X_sample, torch.Tensor):
+                X_sample_batch = X_sample.unsqueeze(0).to(device)
+            else:
+                X_sample_batch = torch.tensor(X_sample).unsqueeze(0).to(device)
+            check_backbone_feature_std(model, X_sample_batch, device, prefix="[DEBUG][STD]")
+        
+        # 오버핏 테스트 실행
+        test_results = {}
+        
+        if debug_overfit_mode in ["1", "all"]:
+            logger.info("\n" + "=" * 60)
+            logger.info("Running 1-sample overfit test...")
+            logger.info("=" * 60)
+            success, result = run_single_sample_overfit(
+                model,
+                optimizer,
+                train_dataset,
+                device,
+                max_steps=1000,
+                lr_override=learning_rate,
+                loss_fn=criterion,
+            )
+            test_results["1-sample"] = {"success": success, "result": result}
+            if not success:
+                logger.error(
+                    "[ERROR][OVERFIT] 1-sample overfit FAILED → "
+                    "모델/옵티마이저/데이터 플로우 중 하나에 구조적인 버그 가능성 매우 높음"
+                )
+        
+        if debug_overfit_mode in ["2", "all"]:
+            logger.info("\n" + "=" * 60)
+            logger.info("Running 2-sample overfit test...")
+            logger.info("=" * 60)
+            success, result = run_two_sample_overfit(
+                model,
+                optimizer,
+                train_dataset,
+                device,
+                max_steps=2000,
+                lr_override=learning_rate,
+                loss_fn=criterion,
+            )
+            test_results["2-sample"] = {"success": success, "result": result}
+            if not success:
+                logger.error(
+                    "[ERROR][OVERFIT] 2-sample overfit FAILED → "
+                    "먼저 여기부터 디버깅 필요"
+                )
+        
+        if debug_overfit_mode in ["32", "all"]:
+            logger.info("\n" + "=" * 60)
+            logger.info("Running 32-sample overfit test...")
+            logger.info("=" * 60)
+            success, result = run_small_batch_overfit(
+                model,
+                optimizer,
+                train_dataset,
+                device,
+                n_samples=32,
+                max_steps=5000,
+                lr_override=learning_rate,
+                loss_fn=criterion,
+            )
+            test_results["32-sample"] = {"success": success, "result": result}
+        
+        if debug_overfit_mode in ["64", "all"]:
+            logger.info("\n" + "=" * 60)
+            logger.info("Running 64-sample overfit test...")
+            logger.info("=" * 60)
+            success, result = run_small_batch_overfit(
+                model,
+                optimizer,
+                train_dataset,
+                device,
+                n_samples=64,
+                max_steps=5000,
+                lr_override=learning_rate,
+                loss_fn=criterion,
+            )
+            test_results["64-sample"] = {"success": success, "result": result}
+        
+        # 결과 요약
+        logger.info("\n" + "=" * 60)
+        logger.info("OVERFIT TEST SUMMARY")
+        logger.info("=" * 60)
+        for test_name, test_data in test_results.items():
+            status = "✓ PASSED" if test_data["success"] else "✗ FAILED"
+            logger.info(f"{test_name}: {status}")
+        logger.info("=" * 60)
+        
+        # 오버핏 모드에서는 실제 학습을 건너뛰고 모델 반환
+        logger.info("Overfit tests completed. Returning model without full training.")
+        return model
 
     # Training loop
     logger.info("Starting training...")
@@ -943,6 +1068,20 @@ def train_model(
 
 if __name__ == "__main__":
     # ============================================================
+    # Argument Parser 설정
+    # ============================================================
+    parser = argparse.ArgumentParser(description="Train LSTM + Attention model")
+    parser.add_argument(
+        "--debug-overfit",
+        type=str,
+        default=None,
+        choices=["1", "2", "32", "64", "all"],
+        help="Debug overfit mode: 1=single sample, 2=two samples, 32=32 samples, 64=64 samples, all=all tests",
+    )
+    
+    args = parser.parse_args()
+    
+    # ============================================================
     # 학습 설정 (Hyperparameters)
     # ============================================================
     # NOTE: horizon, pos_threshold, neg_threshold, ignore_margin는
@@ -983,6 +1122,7 @@ if __name__ == "__main__":
         train_split=TRAIN_SPLIT,
         patience_es=PATIENCE_ES,
         min_delta=MIN_DELTA,
+        debug_overfit_mode=args.debug_overfit,
     )
 
     logger.info("Model training completed successfully!")
