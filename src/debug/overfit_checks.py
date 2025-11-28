@@ -353,7 +353,7 @@ def run_two_sample_overfit(
 ) -> Tuple[bool, dict]:
     """
     샘플 2개(라벨 0/1)에 대한 오버핏 테스트를 실행합니다.
-    
+
     Args:
         model: 모델 인스턴스
         optimizer: 옵티마이저
@@ -362,157 +362,314 @@ def run_two_sample_overfit(
         max_steps: 최대 학습 스텝
         lr_override: 학습률 오버라이드
         loss_fn: 손실 함수
-        
+
     Returns:
         (성공 여부, 결과 딕셔너리)
     """
     logger.info("=" * 60)
     logger.info("[DEBUG][OVERFIT-2] Starting two sample overfit test")
     logger.info("=" * 60)
-    
+
+    # Dropout 설정 확인
+    dropout_ps = [m.p for m in model.modules() if isinstance(m, torch.nn.Dropout)]
+    if dropout_ps:
+        logger.info(f"[CHECK][OVERFIT-2][DROPOUT] dropout_ps={dropout_ps}")
+    else:
+        logger.info("[CHECK][OVERFIT-2][DROPOUT] No Dropout layers found")
+
     # Label 분포 출력
     print_label_stats(base_dataset, prefix="[DEBUG][OVERFIT-2][LABEL]")
-    
+
     # Label이 서로 다른 두 샘플 선택
-    sample_0_idx = None
-    sample_1_idx = None
-    
+    sample_0_idx: Optional[int] = None
+    sample_1_idx: Optional[int] = None
+
     for i in range(len(base_dataset)):
         _, y = base_dataset[i]
         if isinstance(y, torch.Tensor):
             label = int(y.item() if y.numel() == 1 else y.cpu().numpy().flatten()[0])
         else:
             label = int(y)
-        
+
         if label == 0 and sample_0_idx is None:
             sample_0_idx = i
         elif label == 1 and sample_1_idx is None:
             sample_1_idx = i
-        
+
         if sample_0_idx is not None and sample_1_idx is not None:
             break
-    
+
     if sample_0_idx is None or sample_1_idx is None:
-        logger.error("[ERROR][OVERFIT-2] Could not find samples with both labels")
+        logger.error("[ERROR][OVERFIT-2] Could not find samples with both labels (0 and 1)")
         return False, {"error": "Could not find samples with both labels"}
-    
+
     logger.info(
         f"[DEBUG][OVERFIT-2] Selected sample_0_idx={sample_0_idx} (label=0), "
         f"sample_1_idx={sample_1_idx} (label=1)"
     )
-    
-    # 2개 샘플만 포함하는 dataloader 생성
-    subset_loader = get_subset_dataloader(
-        base_dataset,
-        n_samples=2,
-        require_both_labels=True,
+
+    # ------------------------------------------------------------
+    # [CHECK][OVERFIT-2][INPUT_DIFF]
+    # 두 샘플의 원본 입력(X_0, X_1)이 실제로 얼마나 다른지 확인하는 디버그 로그
+    #  - 전체 abs diff의 mean/std/max
+    #  - feature_dim 방향(per-feature) 평균 abs diff (앞 몇 개만)
+    # ------------------------------------------------------------
+    X_0_raw, _ = base_dataset[sample_0_idx]
+    X_1_raw, _ = base_dataset[sample_1_idx]
+
+    # Tensor가 아니면 Tensor로 변환
+    if not isinstance(X_0_raw, torch.Tensor):
+        X_0 = torch.tensor(X_0_raw)
+    else:
+        X_0 = X_0_raw
+
+    if not isinstance(X_1_raw, torch.Tensor):
+        X_1 = torch.tensor(X_1_raw)
+    else:
+        X_1 = X_1_raw
+
+    # float32로 캐스팅
+    X_0 = X_0.float()
+    X_1 = X_1.float()
+
+    # shape 체크
+    if X_0.shape != X_1.shape:
+        logger.warning(
+            f"[CHECK][OVERFIT-2][INPUT_SHAPE_MISMATCH] "
+            f"X_0.shape={tuple(X_0.shape)}, X_1.shape={tuple(X_1.shape)}"
+        )
+    else:
+        diff = (X_1 - X_0).abs()
+
+        diff_mean = diff.mean().item()
+        diff_std = diff.std().item() if diff.numel() > 1 else 0.0
+        diff_max = diff.max().item()
+
+        logger.info(
+            "[CHECK][OVERFIT-2][INPUT_DIFF] "
+            f"abs_diff: mean={diff_mean:.6f}, std={diff_std:.6f}, max={diff_max:.6f}, "
+            f"shape={tuple(diff.shape)}"
+        )
+
+        # 보통 (seq_len, feature_dim) 형태라고 가정하고
+        # 마지막 차원(feature_dim)에 대해 per-feature mean abs diff 계산
+        if diff.dim() >= 2:
+            # 마지막 축 기준 feature-wise mean
+            per_feat_mean = diff.mean(dim=0) if diff.dim() == 2 else diff.view(-1, diff.shape[-1]).mean(dim=0)
+            feat_dim = per_feat_mean.shape[0]
+            k = min(8, feat_dim)  # 앞에서 최대 8개만 출력
+
+            first_k_vals = ", ".join(
+                f"{per_feat_mean[i].item():.6f}" for i in range(k)
+            )
+            logger.info(
+                "[CHECK][OVERFIT-2][INPUT_DIFF_PER_FEATURE] "
+                f"first_{k}_feature_mean_abs_diff=[{first_k_vals}] "
+                f"(feature_dim={feat_dim})"
+            )
+        else:
+            logger.info(
+                "[CHECK][OVERFIT-2][INPUT_DIFF_PER_FEATURE] "
+                f"skipped (unexpected diff.dim={diff.dim()})"
+            )
+
+    # 선택된 2개 샘플에 대한 backbone feature std 체크
+    X_0, _ = base_dataset[sample_0_idx]
+    X_1, _ = base_dataset[sample_1_idx]
+    if not isinstance(X_0, torch.Tensor):
+        X_0 = torch.tensor(X_0)
+    if not isinstance(X_1, torch.Tensor):
+        X_1 = torch.tensor(X_1)
+    X_pair = torch.stack([X_0, X_1], dim=0).to(device)
+    check_backbone_feature_std(
+        model,
+        X_pair,
+        device,
+        prefix="[DEBUG][OVERFIT-2][STD]",
+    )
+
+    # ★ 핵심 수정 포인트 ★
+    # get_subset_dataloader(require_both_labels=True)를 사용하는 대신,
+    # 이미 찾은 sample_0_idx / sample_1_idx를 직접 사용해서 Subset/DataLoader를 구성한다.
+    subset_indices = [sample_0_idx, sample_1_idx]
+    subset = Subset(base_dataset, subset_indices)
+    subset_loader = DataLoader(
+        subset,
+        batch_size=2,
+        shuffle=True,  # 순서는 섞어도 되지만, 두 개 샘플만 포함되도록 보장됨
+    )
+
+    # [작업 1] overfit-2용 라벨이 처음부터 올바른지 확인하는 로그
+    temp_iter = iter(subset_loader)
+    X_temp, y_overfit = next(temp_iter)
+    y_overfit = y_overfit.to(device)
+    if y_overfit.dim() == 1:
+        y_overfit = y_overfit.unsqueeze(1)
+    logger.info(
+        f"[CHECK][OVERFIT-2][RAW_LABEL] y_overfit={y_overfit.detach().cpu().tolist()}, "
+        f"shape={tuple(y_overfit.shape)}, dtype={y_overfit.dtype}, "
+        f"unique={torch.unique(y_overfit).cpu().tolist()}"
+    )
+
+    # RAW_LABEL 확인 후, 다시 학습용 DataLoader를 생성해도 되지만
+    # 여기서는 동일한 subset으로 다시 한 번 DataLoader를 만들어 명시적으로 사용한다.
+    subset_loader = DataLoader(
+        subset,
         batch_size=2,
         shuffle=True,
     )
-    
+
     # 학습률 설정
     if lr_override is not None:
         for param_group in optimizer.param_groups:
-            param_group['lr'] = lr_override
-    
+            param_group["lr"] = lr_override
+        logger.info(f"[DEBUG][OVERFIT-2] Learning rate overridden to {lr_override}")
+
     # 손실 함수 설정
     if loss_fn is None:
         loss_fn = nn.BCEWithLogitsLoss()
-    
+
     model.train()
-    
+
     # 학습 루프
-    best_loss = float('inf')
-    sample_results = {0: {"prob": None, "loss": float('inf')}, 1: {"prob": None, "loss": float('inf')}}
-    
+    best_loss = float("inf")
+    best_probs = None
+
     for step in range(max_steps):
         for X_batch, y_batch in subset_loader:
             X_batch = X_batch.to(device)
             y_batch = y_batch.to(device)
-            
+
             if y_batch.dim() == 1:
                 y_batch = y_batch.unsqueeze(1)
-            
+
+            # [작업 2] DataLoader 루프 초반에 y_batch의 실체를 확인하는 로그 추가
+            if step < 3:
+                logger.info(
+                    f"[CHECK][OVERFIT-2][DATALOADER] step={step}, "
+                    f"y_batch={y_batch.detach().cpu().tolist()}, "
+                    f"unique={torch.unique(y_batch).cpu().tolist()}, "
+                    f"shape={tuple(y_batch.shape)}, dtype={y_batch.dtype}"
+                )
+
+            # [목표 1] y_batch 디버그 로그 추가
+            logger.info(
+                f"[DEBUG][OVERFIT-2] y_batch={y_batch.detach().cpu().tolist()}, "
+                f"shape={tuple(y_batch.shape)}, dtype={y_batch.dtype}"
+            )
+
             optimizer.zero_grad()
-            
-            logits = model(X_batch)  # (B, 2) raw logits
+
+            # logits: (B, 1) 또는 (B,) 형태의 raw logits라고 가정
+            logits = model(X_batch)
             loss = loss_fn(logits, y_batch)
-            
+
+            # [작업 3] loss 계산에 쓰이는 y와 로그에서 표시하는 label이 동일한 텐서인지 확인
+            logger.info(
+                f"[CHECK][OVERFIT-2][LOSS-INPUT] loss_y={y_batch.detach().cpu().tolist()}"
+            )
+
             loss.backward()
+            # FC 레이어 초기 상태 체크
+            if hasattr(model, "fc_out"):
+                with torch.no_grad():
+                    w = model.fc_out.weight
+                    b = model.fc_out.bias
+                    logger.info(
+                        f"[CHECK][OVERFIT-2][FC_BEFORE] "
+                        f"w_mean={w.mean().item():.6f}, w_std={w.std().item():.6f}, "
+                        f"b_mean={b.mean().item():.6f}, b_std={b.std().item():.6f}"
+                    )
+
             optimizer.step()
-            
-            # 각 샘플별 결과 확인
-            with torch.no_grad():
-                probs = torch.sigmoid(logits)
-                for i in range(len(y_batch)):
-                    label = int(y_batch[i].item())
-                    prob = float(probs[i].item())
-                    if loss.item() < sample_results[label]["loss"]:
-                        sample_results[label]["prob"] = prob
-                        sample_results[label]["loss"] = loss.item()
-            
+
+            # [목표 2] best_loss와 best_probs 업데이트
             if loss.item() < best_loss:
                 best_loss = loss.item()
-            
+
+                # 각 샘플별 확률 계산 및 저장
+                with torch.no_grad():
+                    probs = torch.sigmoid(logits)
+                    # probs shape이 (B, 1)일 경우를 대비해 .view(-1)로 평탄화
+                    probs_flat = probs.view(-1)
+                    best_probs = {
+                        "sample_0": float(probs_flat[0].item()),
+                        "sample_1": float(probs_flat[1].item()),
+                    }
+
+                # 성공 조건 충족 시 즉시 반환
+                if (
+                    best_probs["sample_0"] <= 0.01
+                    and best_probs["sample_1"] >= 0.99
+                    and best_loss < 1e-3
+                ):
+                    logger.info(
+                        f"[DEBUG][OVERFIT-2] ✓ PASSED: loss={best_loss:.6f}, "
+                        f"best_prob_0={best_probs['sample_0']:.4f}, "
+                        f"best_prob_1={best_probs['sample_1']:.4f}"
+                    )
+                    return True, {
+                        "success": True,
+                        "final_loss": best_loss,
+                        "sample_0": {"prob": best_probs["sample_0"], "label": 0},
+                        "sample_1": {"prob": best_probs["sample_1"], "label": 1},
+                        "steps": step + 1,
+                    }
+
             # 주기적으로 로그 출력
             if step % 200 == 0 or step == max_steps - 1:
                 with torch.no_grad():
-                    # 두 샘플 모두에 대한 결과 출력
-                    X_0, y_0 = base_dataset[sample_0_idx]
-                    X_1, y_1 = base_dataset[sample_1_idx]
-                    
+                    # [작업 3] y_batch에서 직접 label 추출하여 일관성 확인
+                    label_0 = float(y_batch[0].item())
+                    label_1 = float(y_batch[1].item())
+
+                    # base_dataset에서 직접 샘플을 꺼내서 forward 결과 확인
+                    X_0, _ = base_dataset[sample_0_idx]
+                    X_1, _ = base_dataset[sample_1_idx]
+
                     if isinstance(X_0, torch.Tensor):
                         X_0_batch = X_0.unsqueeze(0).to(device)
                     else:
                         X_0_batch = torch.tensor(X_0).unsqueeze(0).to(device)
-                    
+
                     if isinstance(X_1, torch.Tensor):
                         X_1_batch = X_1.unsqueeze(0).to(device)
                     else:
                         X_1_batch = torch.tensor(X_1).unsqueeze(0).to(device)
-                    
+
                     logits_0 = model(X_0_batch)
                     logits_1 = model(X_1_batch)
-                    prob_0 = float(torch.sigmoid(logits_0).item())
-                    prob_1 = float(torch.sigmoid(logits_1).item())
-                    
+                    prob_0 = float(torch.sigmoid(logits_0).view(-1)[0].item())
+                    prob_1 = float(torch.sigmoid(logits_1).view(-1)[0].item())
+
                     logger.info(
                         f"[DEBUG][OVERFIT-2] step={step}, loss={loss.item():.6f}, "
-                        f"sample_0: prob_up={prob_0:.4f} (label=0), "
-                        f"sample_1: prob_up={prob_1:.4f} (label=1)"
+                        f"sample_0: prob_up={prob_0:.4f} (label={label_0:.0f}), "
+                        f"sample_1: prob_up={prob_1:.4f} (label={label_1:.0f})"
                     )
-    
-    # 성공 기준 확인
-    prob_0 = sample_results[0]["prob"]
-    prob_1 = sample_results[1]["prob"]
-    
-    success = (
-        prob_0 is not None and prob_1 is not None and
-        prob_0 <= 0.01 and prob_1 >= 0.99 and
-        best_loss < 1e-3
-    )
-    
-    result = {
-        "success": success,
-        "final_loss": best_loss,
-        "sample_0": {"prob": prob_0, "label": 0},
-        "sample_1": {"prob": prob_1, "label": 1},
-        "steps": max_steps,
-    }
-    
-    if success:
-        logger.info(
-            f"[DEBUG][OVERFIT-2] ✓ PASSED: loss={best_loss:.6f}, "
-            f"prob_0={prob_0:.4f}, prob_1={prob_1:.4f}"
-        )
+
+    # [목표 2] 실패 시 로그 출력 및 반환
+    # FC 레이어 학습 후 상태 체크
+    if hasattr(model, "fc_out"):
+        with torch.no_grad():
+            w = model.fc_out.weight
+            b = model.fc_out.bias
+            logger.info(
+                f"[CHECK][OVERFIT-2][FC_AFTER] "
+                f"w_mean={w.mean().item():.6f}, w_std={w.std().item():.6f}, "
+                f"b_mean={b.mean().item():.6f}, b_std={b.std().item():.6f}"
+            )
+
+    if best_probs is None:
+        logger.error("[ERROR][OVERFIT-2] ✗ FAILED: no valid step recorded")
     else:
         logger.error(
             f"[ERROR][OVERFIT-2] ✗ FAILED: loss={best_loss:.6f}, "
-            f"prob_0={prob_0:.4f}, prob_1={prob_1:.4f} → "
-            f"먼저 여기부터 디버깅 필요"
+            f"best_prob_0={best_probs['sample_0']:.4f}, "
+            f"best_prob_1={best_probs['sample_1']:.4f}"
         )
-    
-    return success, result
+
+    return False, None
 
 
 def run_small_batch_overfit(

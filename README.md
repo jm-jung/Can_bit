@@ -45,9 +45,28 @@
 - 백테스트: `GET /debug/backtest/xgb-ml`
 
 Prediction rule:
-- proba_up ≥ 0.55 → LONG  
-- proba_up ≤ 0.45 → SHORT  
-- 그 사이 → HOLD  
+- proba_up ≥ long_threshold → LONG  
+- proba_up ≤ short_threshold → SHORT (if short_threshold is set)
+- 그 사이 → HOLD
+
+**Threshold Auto-Optimization:**
+- 자동으로 최적의 threshold를 찾는 기능 제공
+- Grid search를 통해 여러 threshold 조합을 테스트
+- Sharpe ratio 또는 total return 기준으로 최적화
+- 최적화된 threshold는 JSON 파일로 저장되어 자동 로드 가능
+
+최적화 실행:
+```bash
+python -m src.optimization.optimize_ml_threshold
+```
+
+또는 API:
+```
+GET /optimization/threshold/ml-xgb?metric=sharpe&save=true
+GET /optimization/threshold/ml-xgb/load?strategy=ml_xgb&symbol=BTCUSDT&timeframe=1m
+```
+
+최적화 결과는 `data/thresholds/ml_xgb_BTCUSDT_1m.json`에 저장됩니다.  
 
 ---
 

@@ -99,8 +99,14 @@ class LSTMAttnSignalModel:
 
                 df = load_ohlcv_df()
                 df = df.sort_values("timestamp").reset_index(drop=True)
+                # Extract symbol and timeframe from settings
+                symbol = getattr(settings, "BINANCE_SYMBOL", "BTC/USDT").replace("/", "").upper()
+                timeframe = getattr(settings, "THRESHOLD_TIMEFRAME", "1m")
+                
                 X_features = build_feature_frame(
                     df,
+                    symbol=symbol,
+                    timeframe=timeframe,
                     use_events=settings.EVENTS_ENABLED,
                 ).dropna()
                 self.feature_cols = X_features.columns.tolist()
@@ -129,6 +135,19 @@ class LSTMAttnSignalModel:
             logger.info(f"Model input_size attribute: {self.model.input_size}")
             logger.info(f"Feature columns count: {len(self.feature_cols)}")
             logger.info(f"Feature columns (first 10): {self.feature_cols[:10]}")
+            
+            # Feature columns detailed logging
+            logger.info("=" * 60)
+            logger.info("[LSTM Inference] Feature Columns")
+            logger.info("=" * 60)
+            logger.info(f"[LSTM] Using {len(self.feature_cols)} feature columns:")
+            logger.info(f"[LSTM] FEATURE_COLS = {self.feature_cols}")
+            if settings.EVENTS_ENABLED:
+                event_cols = [c for c in self.feature_cols if c.startswith("event_")]
+                logger.info(f"[LSTM] Event features ({len(event_cols)}): {event_cols}")
+                basic_cols = [c for c in self.feature_cols if not c.startswith("event_")]
+                logger.info(f"[LSTM] Basic features ({len(basic_cols)}): {basic_cols}")
+            logger.info("=" * 60)
         except RuntimeError as e:
             # Handle size mismatch or other model loading errors
             error_msg = str(e)
@@ -150,20 +169,30 @@ class LSTMAttnSignalModel:
             )
             self.model = None
 
-    def _extract_features(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _extract_features(self, df: pd.DataFrame, symbol: str | None = None, timeframe: str | None = None) -> pd.DataFrame:
         """
         Extract features from DataFrame (same as training).
 
         Args:
             df: DataFrame with OHLCV + indicators
+            symbol: Trading symbol (default: from settings)
+            timeframe: Timeframe (default: from settings)
 
         Returns:
             Features DataFrame
         """
         df = df.copy()
 
+        # Extract symbol and timeframe from settings if not provided
+        if symbol is None:
+            symbol = getattr(settings, "BINANCE_SYMBOL", "BTC/USDT").replace("/", "").upper()
+        if timeframe is None:
+            timeframe = getattr(settings, "THRESHOLD_TIMEFRAME", "1m")
+        
         features = build_feature_frame(
             df,
+            symbol=symbol,
+            timeframe=timeframe,
             use_events=settings.EVENTS_ENABLED,
         )
         features = features.dropna()
@@ -176,7 +205,7 @@ class LSTMAttnSignalModel:
         features = features.reindex(columns=self.feature_cols, fill_value=0.0)
         return features
 
-    def _prepare_sequence(self, df: pd.DataFrame) -> torch.Tensor:
+    def _prepare_sequence(self, df: pd.DataFrame, symbol: str | None = None, timeframe: str | None = None) -> torch.Tensor:
         """
         Prepare sequence for LSTM model.
         
@@ -186,11 +215,13 @@ class LSTMAttnSignalModel:
 
         Args:
             df: DataFrame with OHLCV + indicators (must be sorted by timestamp)
+            symbol: Trading symbol (default: from settings)
+            timeframe: Timeframe (default: from settings)
 
         Returns:
             Tensor of shape (1, window_size, feature_dim)
         """
-        features = self._extract_features(df)
+        features = self._extract_features(df, symbol=symbol, timeframe=timeframe)
 
         # Ensure we have enough data
         if len(features) < self.window_size:
@@ -246,12 +277,14 @@ class LSTMAttnSignalModel:
 
         return seq_tensor
 
-    def predict_proba_latest(self, df: pd.DataFrame) -> float:
+    def predict_proba_latest(self, df: pd.DataFrame, symbol: str | None = None, timeframe: str | None = None) -> float:
         """
         Predict probability of price going up (next horizon periods).
 
         Args:
             df: DataFrame with OHLCV + indicators (must be sorted by timestamp)
+            symbol: Trading symbol (default: from settings)
+            timeframe: Timeframe (default: from settings)
 
         Returns:
             Probability of price going up (0.0 to 1.0)
@@ -259,8 +292,10 @@ class LSTMAttnSignalModel:
         if not self.is_loaded():
             raise ValueError("Model not loaded. Train model first or check model path.")
 
-        # Prepare sequence
-        seq_tensor = self._prepare_sequence(df)
+        # Prepare sequence (uses _extract_features which now accepts symbol/timeframe)
+        # Note: _prepare_sequence calls _extract_features internally
+        # We need to pass symbol/timeframe through _prepare_sequence
+        seq_tensor = self._prepare_sequence(df, symbol=symbol, timeframe=timeframe)
         seq_tensor = seq_tensor.to(self.device)
         
         # 입력 텐서 shape 로깅 (디버깅용)

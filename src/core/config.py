@@ -37,8 +37,8 @@ class Settings(BaseSettings):
 
     # ML Model settings
     MODEL_DIR: str = "./models"
-    XGB_MODEL_PATH: str = "../models/xgb_model.pkl"
-    LSTM_MODEL_PATH: str = "../models/lstm_model.h5"
+    XGB_MODEL_PATH: str = str(PROJECT_ROOT / "models" / "xgb_model.pkl")
+    LSTM_MODEL_PATH: str = str(PROJECT_ROOT / "models" / "lstm_model.h5")
     # LSTM + Attention 모델 경로 (프로젝트 루트 기준)
     LSTM_ATTN_MODEL_PATH: str = str(PROJECT_ROOT / "models" / "lstm_attn_v1.pt")
 
@@ -123,6 +123,58 @@ class Settings(BaseSettings):
     BINANCE_SYMBOL: str = "BTC/USDT"
     BINANCE_SANDBOX_MODE: bool = True
     BINANCE_LIVE_TRADING: bool = False
+    
+    # ML Threshold Optimization settings
+    USE_OPTIMIZED_THRESHOLDS: bool = Field(
+        default=False,
+        description="If True, automatically load optimized thresholds from JSON files"
+    )
+    THRESHOLD_OPTIMIZATION_METRIC: str = Field(
+        default="sharpe",
+        description="Metric to optimize: 'total_return' or 'sharpe'"
+    )
+    THRESHOLD_SYMBOL: str = Field(
+        default="BTCUSDT",
+        description="Symbol key used when loading optimized thresholds (e.g., BTCUSDT)"
+    )
+    THRESHOLD_TIMEFRAME: str = Field(
+        default="1m",
+        description="Timeframe key used when loading optimized thresholds (e.g., 1m)"
+    )
+    LONG_THRESHOLD_MIN: float = Field(
+        default=0.40,
+        description="Minimum long threshold for grid search"
+    )
+    LONG_THRESHOLD_MAX: float = Field(
+        default=0.70,
+        description="Maximum long threshold for grid search"
+    )
+    LONG_THRESHOLD_STEP: float = Field(
+        default=0.05,
+        description="Step size for long threshold grid search"
+    )
+    SHORT_THRESHOLD_MIN: float = Field(
+        default=0.30,
+        description="Minimum short threshold for grid search"
+    )
+    SHORT_THRESHOLD_MAX: float = Field(
+        default=0.50,
+        description="Maximum short threshold for grid search"
+    )
+    SHORT_THRESHOLD_STEP: float = Field(
+        default=0.05,
+        description="Step size for short threshold grid search"
+    )
+    
+    # Backtest settings (commission and slippage)
+    COMMISSION_RATE: float = Field(
+        default=0.0004,
+        description="Commission rate per trade side (0.0004 = 0.04% = 4 bps)"
+    )
+    SLIPPAGE_RATE: float = Field(
+        default=0.0005,
+        description="Slippage rate per trade side (0.0005 = 0.05% = 5 bps)"
+    )
 
 
 def load_config_yaml(config_path: str = "config.yaml") -> dict:

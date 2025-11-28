@@ -4,7 +4,8 @@ Simple backtesting engine for EMA + RSI strategy.
 from __future__ import annotations
 
 import logging
-from typing import List, Literal, TypedDict
+from dataclasses import dataclass
+from typing import Any, Callable, List, Literal, TypedDict
 
 import numpy as np
 import pandas as pd
@@ -13,8 +14,13 @@ from src.core.config import settings
 from src.indicators.basic import get_df_with_indicators
 from src.ml.xgb_model import get_xgb_model
 from src.dl.lstm_attn_model import get_lstm_attn_model
+from src.strategies.ml_thresholds import resolve_ml_thresholds
 
 logger = logging.getLogger(__name__)
+
+# 전역 기본 수수료/슬리피지 설정 (settings 값이 있으면 우선 사용)
+DEFAULT_COMMISSION_RATE = getattr(settings, "COMMISSION_RATE", 0.0004)
+DEFAULT_SLIPPAGE_RATE = getattr(settings, "SLIPPAGE_RATE", 0.0005)
 
 
 Signal = Literal["LONG", "SHORT", "HOLD"]
@@ -124,6 +130,45 @@ class BacktestResult(TypedDict):
     avg_loss: float  # 진 trade 들의 평균 profit
     max_consecutive_wins: int
     max_consecutive_losses: int
+
+
+@dataclass
+class MLBacktestAdapter:
+    """Defines how a specific ML strategy plugs into the generic backtester."""
+
+    name: str
+    strategy_name: str
+    get_model: Callable[[], Any]
+    min_history_provider: Callable[[Any], int]
+    default_long: float
+    default_short: float | None
+
+
+def _get_ml_adapter(strategy_name: str) -> MLBacktestAdapter:
+    """
+    Return adapter configuration for a given ML strategy identifier.
+    """
+    if strategy_name == "ml_lstm_attn":
+        return MLBacktestAdapter(
+            name="LSTM-Attn",
+            strategy_name=strategy_name,
+            get_model=get_lstm_attn_model,
+            min_history_provider=lambda model: getattr(model, "window_size", 60),
+            default_long=settings.LSTM_ATTN_THRESHOLD_UP,
+            default_short=settings.LSTM_ATTN_THRESHOLD_DOWN,
+        )
+
+    if strategy_name == "ml_xgb":
+        return MLBacktestAdapter(
+            name="XGBoost",
+            strategy_name="ml_xgb",
+            get_model=get_xgb_model,
+            min_history_provider=lambda _: 20,
+            default_long=0.5,
+            default_short=None,
+        )
+
+    raise ValueError(f"Unsupported ML strategy: {strategy_name}")
 
 
 def run_backtest() -> BacktestResult:
@@ -291,73 +336,210 @@ def run_backtest_compare(
         "dl_lstm_attn": summarize("dl_lstm_attn", dl_res),
     }
 
-def run_backtest_with_ml() -> BacktestResult:
+def run_backtest_with_ml(
+    long_threshold: float | None = None,
+    short_threshold: float | None = None,
+    *,
+    use_optimized_thresholds: bool | None = None,
+    strategy_name: str = "ml_xgb",
+    symbol: str | None = None,
+    timeframe: str | None = None,
+    proba_up_cache: np.ndarray | None = None,
+    df_with_proba: pd.DataFrame | None = None,
+    index_mask: np.ndarray | None = None,
+) -> BacktestResult:
     """
-    Run backtest using XGBoost ML strategy.
+    Run backtest using a pluggable ML strategy.
+    
+    Args:
+        long_threshold: Probability threshold for LONG signal
+        short_threshold: Probability threshold for SHORT signal
+        use_optimized_thresholds: Whether to use optimized thresholds from JSON
+        strategy_name: Strategy identifier (e.g., "ml_xgb", "ml_lstm_attn")
+        symbol: Optional symbol override for threshold lookup
+        timeframe: Optional timeframe override for threshold lookup
+        proba_up_cache: Optional pre-computed probability array (for optimization)
+        df_with_proba: Optional DataFrame aligned with proba_up_cache (for optimization)
+        index_mask: Optional boolean mask to filter rows (for in-sample/out-of-sample splits)
+    
+    Returns:
+        BacktestResult
     """
-    df: pd.DataFrame = get_df_with_indicators().copy()
+    if use_optimized_thresholds is None:
+        use_optimized_thresholds = getattr(settings, "USE_OPTIMIZED_THRESHOLDS", False)
 
-    # Get ML model
-    model = get_xgb_model()
-    if model is None or not model.is_loaded():
-        # Return empty result if model not available
-        empty_stats = _compute_trade_stats([])
-        return BacktestResult(
-            total_return=0.0,
-            win_rate=0.0,
-            max_drawdown=0.0,
-            trades=[],
-            equity_curve=[1.0],
-            total_trades=empty_stats["total_trades"],
-            long_trades=empty_stats["long_trades"],
-            short_trades=empty_stats["short_trades"],
-            avg_profit=empty_stats["avg_profit"],
-            median_profit=empty_stats["median_profit"],
-            avg_win=empty_stats["avg_win"],
-            avg_loss=empty_stats["avg_loss"],
-            max_consecutive_wins=empty_stats["max_consecutive_wins"],
-            max_consecutive_losses=empty_stats["max_consecutive_losses"],
+    adapter = _get_ml_adapter(strategy_name)
+    
+    # Use cached predictions if provided, otherwise compute on-the-fly
+    use_cached = proba_up_cache is not None and df_with_proba is not None
+
+    long_threshold, short_threshold = resolve_ml_thresholds(
+        long_threshold=long_threshold,
+        short_threshold=short_threshold,
+        use_optimized_thresholds=use_optimized_thresholds,
+        strategy_name=adapter.strategy_name,
+        symbol=symbol,
+        timeframe=timeframe,
+        default_long=adapter.default_long,
+        default_short=adapter.default_short,
+    )
+    
+    # Use cached predictions if provided, otherwise compute on-the-fly
+    use_cached = proba_up_cache is not None and df_with_proba is not None
+    
+    if use_cached:
+        df = df_with_proba.copy()
+        proba_arr = proba_up_cache.copy()
+        logger.debug(
+            f"[ML Backtest][{adapter.name}] Using cached predictions: "
+            f"df_rows={len(df)}, proba_len={len(proba_arr)}"
+        )
+    else:
+        df: pd.DataFrame = get_df_with_indicators().copy()
+        model = adapter.get_model()
+
+        def _empty_result(message: str) -> BacktestResult:
+            logger.error(message)
+            empty_stats = _compute_trade_stats([])
+            return BacktestResult(
+                total_return=0.0,
+                win_rate=0.0,
+                max_drawdown=0.0,
+                trades=[],
+                equity_curve=[1.0],
+                total_trades=empty_stats["total_trades"],
+                long_trades=empty_stats["long_trades"],
+                short_trades=empty_stats["short_trades"],
+                avg_profit=empty_stats["avg_profit"],
+                median_profit=empty_stats["median_profit"],
+                avg_win=empty_stats["avg_win"],
+                avg_loss=empty_stats["avg_loss"],
+                max_consecutive_wins=empty_stats["max_consecutive_wins"],
+                max_consecutive_losses=empty_stats["max_consecutive_losses"],
+            )
+
+        if model is None:
+            return _empty_result(f"{adapter.name} model instance is None. Cannot run ML backtest.")
+
+        if not getattr(model, "is_loaded", lambda: False)():
+            model_path = getattr(model, "model_path", None)
+            exists = model_path.exists() if model_path is not None else False
+            return _empty_result(
+                f"{adapter.name} model not loaded. Model path: {model_path}, exists={exists}"
+            )
+
+        proba_values: list[float] = []
+        prediction_errors = 0
+
+        logger.info(
+            f"[ML Backtest][{adapter.name}] Computing predictions: "
+            f"long_threshold={long_threshold}, short_threshold={short_threshold}, "
+            f"total_rows={len(df)}"
         )
 
-    # Generate ML signals
+        try:
+            min_rows_for_prediction = max(0, adapter.min_history_provider(model))
+            start_idx = min_rows_for_prediction
+
+            # Extract symbol and timeframe for event features
+            # Use provided symbol/timeframe or fall back to settings
+            backtest_symbol = symbol or getattr(settings, "BINANCE_SYMBOL", "BTC/USDT").replace("/", "").upper()
+            backtest_timeframe = timeframe or getattr(settings, "THRESHOLD_TIMEFRAME", "1m")
+            
+            for i in range(start_idx, len(df)):
+                df_slice = df.iloc[: i + 1]
+                try:
+                    proba_up = float(model.predict_proba_latest(df_slice, symbol=backtest_symbol, timeframe=backtest_timeframe))
+                    proba_values.append(proba_up)
+                except Exception as exc:
+                    prediction_errors += 1
+                    if prediction_errors <= 5:
+                        logger.warning(
+                            f"[ML Backtest][{adapter.name}] Prediction failed at index {i}: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    continue
+            
+            if not proba_values:
+                return _empty_result(
+                    f"[ML Backtest][{adapter.name}] No successful predictions!"
+                )
+            
+            proba_arr = np.array(proba_values, dtype=np.float32)
+            # Align df with proba_arr (remove rows where prediction failed)
+            df = df.iloc[start_idx:start_idx + len(proba_arr)].reset_index(drop=True)
+        except Exception as exc:
+            return _empty_result(
+                f"[ML Backtest][{adapter.name}] Prediction loop failed: {type(exc).__name__}: {exc}"
+            )
+
+    # Apply index_mask if provided (for in-sample/out-of-sample splits)
+    if index_mask is not None:
+        if len(index_mask) != len(df):
+            logger.warning(
+                f"[ML Backtest][{adapter.name}] index_mask length ({len(index_mask)}) "
+                f"!= df length ({len(df)}). Ignoring mask."
+            )
+        else:
+            df = df[index_mask].reset_index(drop=True)
+            proba_arr = proba_arr[index_mask]
+            logger.debug(
+                f"[ML Backtest][{adapter.name}] Applied index_mask: "
+                f"filtered to {len(df)} rows"
+            )
+
+    # Generate signals from probabilities
     df["signal"] = "HOLD"
-    try:
-        for i in range(len(df)):
-            df_slice = df.iloc[: i + 1]
-            try:
-                proba_up = model.predict_proba_latest(df_slice)
-                if proba_up >= 0.55:
-                    df.loc[df.index[i], "signal"] = "LONG"
-                elif proba_up <= 0.45:
-                    df.loc[df.index[i], "signal"] = "SHORT"
-            except Exception:
-                # Skip if prediction fails
-                continue
-    except Exception:
-        # If ML prediction fails entirely, return empty result
-        empty_stats = _compute_trade_stats([])
-        return BacktestResult(
-            total_return=0.0,
-            win_rate=0.0,
-            max_drawdown=0.0,
-            trades=[],
-            equity_curve=[1.0],
-            total_trades=empty_stats["total_trades"],
-            long_trades=empty_stats["long_trades"],
-            short_trades=empty_stats["short_trades"],
-            avg_profit=empty_stats["avg_profit"],
-            median_profit=empty_stats["median_profit"],
-            avg_win=empty_stats["avg_win"],
-            avg_loss=empty_stats["avg_loss"],
-            max_consecutive_wins=empty_stats["max_consecutive_wins"],
-            max_consecutive_losses=empty_stats["max_consecutive_losses"],
+    signal_counts = {"LONG": 0, "SHORT": 0, "HOLD": 0}
+    
+    for i in range(len(df)):
+        proba_up = proba_arr[i]
+        if proba_up >= long_threshold:
+            df.loc[df.index[i], "signal"] = "LONG"
+            signal_counts["LONG"] += 1
+        elif short_threshold is not None and proba_up <= short_threshold:
+            df.loc[df.index[i], "signal"] = "SHORT"
+            signal_counts["SHORT"] += 1
+        else:
+            signal_counts["HOLD"] += 1
+    
+    if not use_cached:
+        logger.info(
+            f"[ML Backtest][{adapter.name}] Starting signal generation: "
+            f"long_threshold={long_threshold}, short_threshold={short_threshold}, "
+            f"total_rows={len(df)}"
+        )
+        logger.info(
+            f"[ML Backtest][{adapter.name}] Signal generation summary: "
+            f"signals={signal_counts}"
+        )
+
+    # Log proba statistics if not using cached (to avoid duplicate logs)
+    if not use_cached and len(proba_arr) > 0:
+        logger.info(
+            f"[ML Backtest][{adapter.name}] Proba statistics: "
+            f"mean={proba_arr.mean():.4f}, min={proba_arr.min():.4f}, "
+            f"max={proba_arr.max():.4f}, std={proba_arr.std():.4f}"
+        )
+        lower_bound = short_threshold if short_threshold is not None else -1.0
+        logger.info(
+            f"[ML Backtest][{adapter.name}] Proba distribution vs thresholds: "
+            f"above_long_threshold={np.sum(proba_arr >= long_threshold)}, "
+            f"below_short_threshold={np.sum(proba_arr <= short_threshold) if short_threshold is not None else 0}, "
+            f"in_middle={np.sum((proba_arr < long_threshold) & (proba_arr > lower_bound))}"
         )
 
     trades: List[Trade] = []
     equity_curve: List[float] = []
-
     position: dict | None = None
     balance = 1.0
+    entries_attempted = 0
+    exits_executed = 0
+
+    if not use_cached:
+        logger.debug(
+            f"[ML Backtest][{adapter.name}] Starting trade execution loop: {len(df)} rows to process"
+        )
 
     for row in df.itertuples():
         signal: Signal = getattr(row, "signal")
@@ -369,16 +551,32 @@ def run_backtest_with_ml() -> BacktestResult:
                     "entry_price": float(getattr(row, "close")),
                     "entry_time": str(getattr(row, "timestamp")),
                 }
+                entries_attempted += 1
         else:
             if signal == "HOLD" or signal != position["side"]:
                 exit_price = float(getattr(row, "close"))
                 entry_price = position["entry_price"]
                 direction: Literal["LONG", "SHORT"] = position["side"]
 
+                # Apply commission and slippage
+                commission_rate = DEFAULT_COMMISSION_RATE
+                slippage_rate = DEFAULT_SLIPPAGE_RATE
+                
+                # Entry: apply commission + slippage
+                entry_cost = entry_price * (commission_rate + slippage_rate)
+                # Exit: apply commission + slippage
+                exit_cost = exit_price * (commission_rate + slippage_rate)
+                
                 if direction == "LONG":
-                    profit = (exit_price - entry_price) / entry_price
+                    # Long: buy at entry_price + costs, sell at exit_price - costs
+                    effective_entry = entry_price + entry_cost
+                    effective_exit = exit_price - exit_cost
+                    profit = (effective_exit - effective_entry) / effective_entry
                 else:
-                    profit = (entry_price - exit_price) / entry_price
+                    # Short: sell at entry_price - costs, buy at exit_price + costs
+                    effective_entry = entry_price - entry_cost
+                    effective_exit = exit_price + exit_cost
+                    profit = (effective_entry - effective_exit) / effective_entry
 
                 balance *= 1 + profit
 
@@ -394,19 +592,36 @@ def run_backtest_with_ml() -> BacktestResult:
                 )
 
                 equity_curve.append(balance)
+                exits_executed += 1
                 position = None
 
-    # Close remaining position
+    logger.info(
+        f"[ML Backtest][{adapter.name}] Trade execution summary: "
+        f"entries_attempted={entries_attempted}, exits_executed={exits_executed}, "
+        f"final_trades={len(trades)}, final_position={'OPEN' if position is not None else 'CLOSED'}"
+    )
+
     if position is not None:
         last_row = df.iloc[-1]
         last_price = float(last_row["close"])
         entry_price = position["entry_price"]
         direction: Literal["LONG", "SHORT"] = position["side"]
 
+        # Apply commission and slippage for closing position
+        commission_rate = DEFAULT_COMMISSION_RATE
+        slippage_rate = DEFAULT_SLIPPAGE_RATE
+        
+        entry_cost = entry_price * (commission_rate + slippage_rate)
+        exit_cost = last_price * (commission_rate + slippage_rate)
+        
         if direction == "LONG":
-            profit = (last_price - entry_price) / entry_price
+            effective_entry = entry_price + entry_cost
+            effective_exit = last_price - exit_cost
+            profit = (effective_exit - effective_entry) / effective_entry
         else:
-            profit = (entry_price - last_price) / entry_price
+            effective_entry = entry_price - entry_cost
+            effective_exit = last_price + exit_cost
+            profit = (effective_entry - effective_exit) / effective_entry
 
         balance *= 1 + profit
 
@@ -428,7 +643,6 @@ def run_backtest_with_ml() -> BacktestResult:
     else:
         win_rate = 0.0
 
-    # Max Drawdown calculation
     max_drawdown = 0.0
     running_max = float("-inf")
 
@@ -439,8 +653,20 @@ def run_backtest_with_ml() -> BacktestResult:
         drawdown = (value - running_max) / running_max
         max_drawdown = min(max_drawdown, drawdown)
 
-    # Compute extended statistics
     stats = _compute_trade_stats(trades)
+
+    if not use_cached:
+        # Log commission and slippage settings
+        logger.info(
+            f"[ML Backtest][{adapter.name}] Completed: "
+            f"total_trades={stats['total_trades']}, long={stats['long_trades']}, short={stats['short_trades']}, "
+            f"win_rate={win_rate:.2%}, total_return={balance - 1.0:.2%}, "
+            f"max_drawdown={max_drawdown:.2%}"
+        )
+        logger.info(
+            f"[ML Backtest][{adapter.name}] Commission rate: {DEFAULT_COMMISSION_RATE:.4f} ({DEFAULT_COMMISSION_RATE*100:.2f}%), "
+            f"Slippage rate: {DEFAULT_SLIPPAGE_RATE:.4f} ({DEFAULT_SLIPPAGE_RATE*100:.2f}%)"
+        )
 
     return BacktestResult(
         total_return=balance - 1.0,
@@ -510,289 +736,21 @@ def run_backtest_compare(
 def run_backtest_with_dl_lstm_attn(
     threshold_up: float | None = None,
     threshold_down: float | None = None,
+    *,
+    use_optimized_thresholds: bool | None = None,
+    symbol: str | None = None,
+    timeframe: str | None = None,
 ) -> BacktestResult:
     """
-    Run backtest using LSTM + Attention deep learning strategy.
-    
-    NOTE: threshold_up/down can be overridden via API query params now.
-    If not provided, uses settings.LSTM_ATTN_THRESHOLD_UP/DOWN.
-    
-    Args:
-        threshold_up: Optional override for LSTM up-threshold (default: from settings)
-        threshold_down: Optional override for LSTM down-threshold (default: from settings)
+    Compatibility wrapper that routes to the generic ML backtester using the LSTM adapter.
     """
-    logger.info("[DEBUG] run_backtest_with_dl_lstm_attn actually executing")
-    logger.info("[LSTM Backtest] >>> run_backtest_with_dl_lstm_attn called")
-    df: pd.DataFrame = get_df_with_indicators().copy()
-
-    # Get DL model
-    model = get_lstm_attn_model()
-    if model is None:
-        logger.warning(
-            "DL model instance is None. Cannot run DL backtest. "
-            "Please check if the model file exists and can be loaded."
-        )
-        empty_stats = _compute_trade_stats([])
-        return BacktestResult(
-            total_return=0.0,
-            win_rate=0.0,
-            max_drawdown=0.0,
-            trades=[],
-            equity_curve=[1.0],
-            total_trades=empty_stats["total_trades"],
-            long_trades=empty_stats["long_trades"],
-            short_trades=empty_stats["short_trades"],
-            avg_profit=empty_stats["avg_profit"],
-            median_profit=empty_stats["median_profit"],
-            avg_win=empty_stats["avg_win"],
-            avg_loss=empty_stats["avg_loss"],
-            max_consecutive_wins=empty_stats["max_consecutive_wins"],
-            max_consecutive_losses=empty_stats["max_consecutive_losses"],
-        )
-    
-    if not model.is_loaded():
-        logger.warning(
-            f"DL model not available (file not found or loading failed). "
-            f"Expected path: {model.model_path.resolve()}. "
-            f"Skipping DL backtest. Please train the model first."
-        )
-        empty_stats = _compute_trade_stats([])
-        return BacktestResult(
-            total_return=0.0,
-            win_rate=0.0,
-            max_drawdown=0.0,
-            trades=[],
-            equity_curve=[1.0],
-            total_trades=empty_stats["total_trades"],
-            long_trades=empty_stats["long_trades"],
-            short_trades=empty_stats["short_trades"],
-            avg_profit=empty_stats["avg_profit"],
-            median_profit=empty_stats["median_profit"],
-            avg_win=empty_stats["avg_win"],
-            avg_loss=empty_stats["avg_loss"],
-            max_consecutive_wins=empty_stats["max_consecutive_wins"],
-            max_consecutive_losses=empty_stats["max_consecutive_losses"],
-        )
-    
-    logger.info("DL model loaded successfully, starting backtest...")
-
-    # Use provided thresholds or fall back to settings
-    up = threshold_up if threshold_up is not None else settings.LSTM_ATTN_THRESHOLD_UP
-    down = threshold_down if threshold_down is not None else settings.LSTM_ATTN_THRESHOLD_DOWN
-    logger.info(
-        "[LSTM Backtest] Using thresholds: up=%.3f, down=%.3f",
-        up,
-        down,
-    )
-
-    # Generate DL signals
-    df["signal"] = "HOLD"
-    signal_counts = {"LONG": 0, "SHORT": 0, "HOLD": 0}
-    
-    # 통계 수집용 딕셔너리 초기화
-    stats = {
-        "long": 0,
-        "short": 0,
-        "hold": 0,
-        "probs": [],
-    }
-    
-    try:
-        window_size = model.window_size
-        logger.info(f"[LSTM Backtest] Window size: {window_size}, Total bars: {len(df)}")
-        
-        # Need at least window_size rows to make predictions
-        for i in range(window_size, len(df)):
-            df_slice = df.iloc[: i + 1]
-            try:
-                # prob_up 수집을 위해 predict_proba_latest 먼저 호출
-                proba_up = model.predict_proba_latest(df_slice)
-                stats["probs"].append(proba_up)
-                
-                # Use predict_label_latest for consistent signal generation
-                signal = model.predict_label_latest(
-                    df_slice,
-                    threshold_up=up,
-                    threshold_down=down,
-                )
-                df.loc[df.index[i], "signal"] = signal
-                signal_counts[signal] += 1
-                
-                # stats 업데이트
-                if signal == "LONG":
-                    stats["long"] += 1
-                elif signal == "SHORT":
-                    stats["short"] += 1
-                else:
-                    stats["hold"] += 1
-                
-                # 디버그 로깅: 처음 200개 bar와 일정 간격으로 샘플링
-                if i < window_size + 200 or (i - window_size) % 500 == 0:
-                    logger.debug(
-                        f"[LSTM Backtest] Bar {i}: prob_up={proba_up:.4f}, "
-                        f"signal={signal}, close={df.iloc[i]['close']:.2f}"
-                    )
-            except Exception as e:
-                # Skip if prediction fails
-                logger.debug(f"[LSTM Backtest] Prediction failed at bar {i}: {e}")
-                continue
-    except Exception as e:
-        logger.error(f"[LSTM Backtest] Signal generation failed: {e}")
-        # If DL prediction fails entirely, return empty result
-        empty_stats = _compute_trade_stats([])
-        return BacktestResult(
-            total_return=0.0,
-            win_rate=0.0,
-            max_drawdown=0.0,
-            trades=[],
-            equity_curve=[1.0],
-            total_trades=empty_stats["total_trades"],
-            long_trades=empty_stats["long_trades"],
-            short_trades=empty_stats["short_trades"],
-            avg_profit=empty_stats["avg_profit"],
-            median_profit=empty_stats["median_profit"],
-            avg_win=empty_stats["avg_win"],
-            avg_loss=empty_stats["avg_loss"],
-            max_consecutive_wins=empty_stats["max_consecutive_wins"],
-            max_consecutive_losses=empty_stats["max_consecutive_losses"],
-        )
-    
-    # Signal 통계 로깅
-    total_signals = sum(signal_counts.values())
-    logger.info(
-        f"[LSTM Backtest] Signal distribution: "
-        f"LONG={signal_counts['LONG']}, SHORT={signal_counts['SHORT']}, "
-        f"HOLD={signal_counts['HOLD']} (total={total_signals})"
-    )
-    
-    # Prediction Stats 출력
-    logger.info("---- Prediction Stats ----")
-    logger.info("LONG : %d", stats["long"])
-    logger.info("SHORT: %d", stats["short"])
-    logger.info("HOLD : %d", stats["hold"])
-    
-    if len(stats["probs"]) > 0:
-        probs = np.array(stats["probs"])
-        logger.info("prob_up mean: %.5f", probs.mean())
-        logger.info("prob_up min : %.5f", probs.min())
-        logger.info("prob_up max : %.5f", probs.max())
-        logger.info("prob_up std : %.5f", probs.std())
-    else:
-        logger.warning("No prob_up values collected")
-    logger.info("--------------------------")
-
-    trades: List[Trade] = []
-    equity_curve: List[float] = []
-
-    position: dict | None = None
-    balance = 1.0
-
-    for row in df.itertuples():
-        signal: Signal = getattr(row, "signal")
-
-        if position is None:
-            if signal in ("LONG", "SHORT"):
-                position = {
-                    "side": signal,
-                    "entry_price": float(getattr(row, "close")),
-                    "entry_time": str(getattr(row, "timestamp")),
-                }
-        else:
-            if signal == "HOLD" or signal != position["side"]:
-                exit_price = float(getattr(row, "close"))
-                entry_price = position["entry_price"]
-                direction: Literal["LONG", "SHORT"] = position["side"]
-
-                if direction == "LONG":
-                    profit = (exit_price - entry_price) / entry_price
-                else:
-                    profit = (entry_price - exit_price) / entry_price
-
-                balance *= 1 + profit
-
-                trades.append(
-                    Trade(
-                        entry_time=position["entry_time"],
-                        exit_time=str(getattr(row, "timestamp")),
-                        entry_price=entry_price,
-                        exit_price=exit_price,
-                        direction=direction,
-                        profit=profit,
-                    )
-                )
-
-                equity_curve.append(balance)
-                position = None
-
-    # Close remaining position
-    if position is not None:
-        last_row = df.iloc[-1]
-        last_price = float(last_row["close"])
-        entry_price = position["entry_price"]
-        direction: Literal["LONG", "SHORT"] = position["side"]
-
-        if direction == "LONG":
-            profit = (last_price - entry_price) / entry_price
-        else:
-            profit = (entry_price - last_price) / entry_price
-
-        balance *= 1 + profit
-
-        trades.append(
-            Trade(
-                entry_time=position["entry_time"],
-                exit_time=str(last_row["timestamp"]),
-                entry_price=entry_price,
-                exit_price=last_price,
-                direction=direction,
-                profit=profit,
-            )
-        )
-        equity_curve.append(balance)
-
-    if trades:
-        wins = sum(1 for trade in trades if trade["profit"] is not None and trade["profit"] > 0)
-        win_rate = wins / len(trades)
-    else:
-        win_rate = 0.0
-
-    # Max Drawdown calculation
-    max_drawdown = 0.0
-    running_max = float("-inf")
-
-    for value in equity_curve:
-        running_max = max(running_max, value)
-        if running_max == 0:
-            continue
-        drawdown = (value - running_max) / running_max
-        max_drawdown = min(max_drawdown, drawdown)
-
-    # Compute extended statistics
-    stats = _compute_trade_stats(trades)
-
-    # 백테스트 결과 요약 로깅
-    logger.info(
-        f"[LSTM Backtest] Completed: "
-        f"total_trades={stats['total_trades']}, long={stats['long_trades']}, short={stats['short_trades']}, "
-        f"win_rate={win_rate:.2%}, total_return={balance - 1.0:.2%}, "
-        f"max_drawdown={max_drawdown:.2%}"
-    )
-
-    return BacktestResult(
-        total_return=balance - 1.0,
-        win_rate=win_rate,
-        max_drawdown=max_drawdown,
-        trades=trades,
-        equity_curve=equity_curve,
-        total_trades=stats["total_trades"],
-        long_trades=stats["long_trades"],
-        short_trades=stats["short_trades"],
-        avg_profit=stats["avg_profit"],
-        median_profit=stats["median_profit"],
-        avg_win=stats["avg_win"],
-        avg_loss=stats["avg_loss"],
-        max_consecutive_wins=stats["max_consecutive_wins"],
-        max_consecutive_losses=stats["max_consecutive_losses"],
+    return run_backtest_with_ml(
+        long_threshold=threshold_up,
+        short_threshold=threshold_down,
+        use_optimized_thresholds=use_optimized_thresholds,
+        strategy_name="ml_lstm_attn",
+        symbol=symbol,
+        timeframe=timeframe,
     )
 
 

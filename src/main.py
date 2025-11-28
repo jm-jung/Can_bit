@@ -27,6 +27,8 @@ from src.backtest.engine import (
     run_backtest_with_dl_lstm_attn,
     run_backtest_compare,
 )
+from src.optimization.optimize_ml_threshold import run_threshold_optimization_for_ml_strategy
+from src.optimization.threshold_optimizer import load_threshold_result
 from src.realtime.updater import update_latest_candle
 from src.trading.engine import trading_step
 from src.trading.router import trading_router
@@ -189,6 +191,68 @@ def read_dl_lstm_attn_strategy():
         raise HTTPException(status_code=503, detail="DL model not available")
     # 로깅은 get_lstm_attn_signal 내부에서 처리됨
     return result
+
+
+@app.get("/optimization/threshold/ml-xgb")
+def optimize_ml_threshold(
+    metric: str = Query("sharpe", description="Metric to optimize: 'total_return' or 'sharpe'"),
+    save: bool = Query(True, description="Save result to JSON file"),
+):
+    """
+    Run threshold optimization for ML XGBoost strategy.
+    
+    This endpoint performs grid search over threshold candidates and selects
+    the best combination based on the specified metric.
+    """
+    try:
+        result = run_threshold_optimization_for_ml_strategy(
+            metric_name=metric,
+            save_result=save,
+        )
+        return {
+            "status": "success",
+            "best_long_threshold": result.best_long_threshold,
+            "best_short_threshold": result.best_short_threshold,
+            "best_metric_value": result.best_metric_value,
+            "metric_name": result.metric_name,
+            "total_trials": len(result.trials),
+        }
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=f"Optimization failed: {str(e)}")
+
+
+@app.get("/optimization/threshold/ml-xgb/load")
+def load_optimized_threshold(
+    strategy: str = Query("ml_xgb", description="Strategy name"),
+    symbol: str = Query("BTCUSDT", description="Trading symbol"),
+    timeframe: str = Query("1m", description="Timeframe"),
+):
+    """
+    Load optimized thresholds from JSON file.
+    """
+    from pathlib import Path
+    threshold_path = Path("data/thresholds") / f"{strategy}_{symbol}_{timeframe}.json"
+    
+    if not threshold_path.exists():
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=404,
+            detail=f"Optimized thresholds not found at {threshold_path}"
+        )
+    
+    try:
+        result = load_threshold_result(threshold_path)
+        return {
+            "status": "success",
+            "best_long_threshold": result.best_long_threshold,
+            "best_short_threshold": result.best_short_threshold,
+            "best_metric_value": result.best_metric_value,
+            "metric_name": result.metric_name,
+        }
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=f"Failed to load thresholds: {str(e)}")
 
 
 @app.get("/debug/backtest/dl-lstm-attn")

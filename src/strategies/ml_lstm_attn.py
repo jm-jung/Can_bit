@@ -1,16 +1,14 @@
 """
-XGBoost-based ML trading strategy.
+LSTM + Attention ML strategy aligned with the XGB interface.
 """
 from __future__ import annotations
 
 import logging
 from typing import Literal, TypedDict
 
-import pandas as pd
-
 from src.core.config import settings
+from src.dl.lstm_attn_model import get_lstm_attn_model
 from src.indicators.basic import get_df_with_indicators
-from src.ml.xgb_model import get_xgb_model
 from src.strategies.ml_thresholds import resolve_ml_thresholds
 
 Signal = Literal["LONG", "SHORT", "HOLD"]
@@ -27,34 +25,17 @@ class MLStrategyOutput(TypedDict):
     signal: Signal
 
 
-def ml_xgb_strategy(
+def ml_lstm_attn_strategy(
     long_threshold: float | None = None,
     short_threshold: float | None = None,
     use_optimized_thresholds: bool = True,
     *,
-    strategy_name: str = "ml_xgb",
+    strategy_name: str = "ml_lstm_attn",
     symbol: str | None = None,
     timeframe: str | None = None,
 ) -> MLStrategyOutput:
     """
-    XGBoost-based ML trading strategy.
-
-    Args:
-        long_threshold: Probability threshold for LONG signal (default: 0.5)
-        short_threshold: Probability threshold for SHORT signal (default: None, disabled)
-        use_optimized_thresholds: If True, try to load optimized thresholds from JSON file
-        strategy_name: Strategy identifier for threshold lookup
-        symbol: Optional override for symbol when resolving optimized thresholds
-        timeframe: Optional override for timeframe when resolving optimized thresholds
-
-    Rules:
-    - proba_up >= long_threshold → LONG
-    - proba_up <= short_threshold → SHORT (if short_threshold is not None)
-    - Otherwise → HOLD
-    - Model or data failure → proba_up=None, signal="HOLD"
-
-    Returns:
-        MLStrategyOutput with prediction and signal
+    LSTM Attention-based ML strategy that mirrors the XGB strategy contract.
     """
     long_threshold, short_threshold = resolve_ml_thresholds(
         long_threshold=long_threshold,
@@ -63,13 +44,13 @@ def ml_xgb_strategy(
         strategy_name=strategy_name,
         symbol=symbol,
         timeframe=timeframe,
-        default_long=0.5,
-        default_short=None,
+        default_long=settings.LSTM_ATTN_THRESHOLD_UP,
+        default_short=settings.LSTM_ATTN_THRESHOLD_DOWN,
     )
-    
+
     try:
         df = get_df_with_indicators()
-        model = get_xgb_model()
+        model = get_lstm_attn_model()
 
         if model is None or not model.is_loaded():
             last_row = df.iloc[-1]
@@ -83,13 +64,20 @@ def ml_xgb_strategy(
         proba_up = model.predict_proba_latest(df)
         last_row = df.iloc[-1]
 
-        # Determine signal based on probability thresholds
         if proba_up >= long_threshold:
             signal: Signal = "LONG"
         elif short_threshold is not None and proba_up <= short_threshold:
             signal = "SHORT"
         else:
             signal = "HOLD"
+
+        logger.debug(
+            "[ml_lstm_attn] prob_up=%.4f, long_threshold=%.3f, short_threshold=%s, signal=%s",
+            proba_up,
+            long_threshold,
+            f"{short_threshold:.3f}" if short_threshold is not None else "None",
+            signal,
+        )
 
         return MLStrategyOutput(
             timestamp=str(last_row["timestamp"]),
@@ -98,8 +86,8 @@ def ml_xgb_strategy(
             signal=signal,
         )
 
-    except Exception as e:
-        # On any error, return safe HOLD signal
+    except Exception as exc:
+        logger.exception("ml_lstm_attn_strategy failed: %s", exc)
         try:
             df = get_df_with_indicators()
             last_row = df.iloc[-1]
@@ -110,11 +98,11 @@ def ml_xgb_strategy(
                 signal="HOLD",
             )
         except Exception:
-            # Fallback if even getting data fails
             return MLStrategyOutput(
                 timestamp="",
                 close=0.0,
                 proba_up=None,
                 signal="HOLD",
             )
+
 

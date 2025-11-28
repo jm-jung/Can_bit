@@ -216,6 +216,8 @@ def load_processed_events(
 def merge_price_and_event_features(
     feature_df: pd.DataFrame,
     event_feature_df: pd.DataFrame | None,
+    *,
+    fill_event_only: bool = False,
 ) -> pd.DataFrame:
     """가격/인디케이터 피처와 이벤트 피처를 merge."""
     if event_feature_df is None or event_feature_df.empty:
@@ -226,7 +228,15 @@ def merge_price_and_event_features(
     aligned = event_feature_df.copy()
     aligned.index = pd.to_datetime(aligned.index)
     merged = merged.join(aligned, how="left")
-    merged = merged.fillna(0.0)
+    if fill_event_only:
+        event_cols = aligned.columns.tolist()
+        if event_cols:
+            for col in event_cols:
+                if col not in merged.columns:
+                    merged[col] = 0.0
+            merged[event_cols] = merged[event_cols].fillna(0.0)
+    else:
+        merged = merged.fillna(0.0)
     return merged
 
 

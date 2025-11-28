@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -18,6 +19,7 @@ from src.indicators.basic import add_basic_indicators
 from src.ml.features import build_ml_dataset
 from src.services.ohlcv_service import load_ohlcv_df
 from src.dl.models.lstm_attn import LSTMAttentionModel
+from src.dl.data.split import make_time_series_splits, log_split_summary
 from src.debug.overfit_checks import (
     run_single_sample_overfit,
     run_two_sample_overfit,
@@ -118,6 +120,170 @@ class TimeSeriesDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 
+def evaluate_split(
+    model: nn.Module,
+    X: np.ndarray | torch.Tensor,
+    y: np.ndarray | torch.Tensor,
+    device: torch.device,
+    split_name: str,
+    thresholds: list[float] = [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60],
+    batch_size: int = 64,
+    logger: Any = None,
+) -> None:
+    """
+    Evaluate model on a split (train/valid/test) and log metrics.
+    
+    Args:
+        model: Trained model
+        X: Input sequences (numpy array or torch tensor)
+        y: Labels (numpy array or torch tensor)
+        device: Device to run inference on
+        split_name: Name of the split (e.g., "Validation", "Test")
+        thresholds: List of probability thresholds to test
+        batch_size: Batch size for inference
+        logger: Logger instance (if None, uses default logger)
+    """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+    
+    # Convert to torch tensors if needed
+    if isinstance(X, np.ndarray):
+        X_tensor = torch.FloatTensor(X)
+    else:
+        X_tensor = X
+    
+    if isinstance(y, np.ndarray):
+        y_tensor = torch.FloatTensor(y)
+    else:
+        y_tensor = y
+    
+    model.eval()
+    all_probs = []
+    all_labels = []
+    
+    # Create dataset and dataloader
+    dataset = TimeSeriesDataset(X_tensor.numpy(), y_tensor.numpy())
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    
+    with torch.no_grad():
+        for X_batch, y_batch in dataloader:
+            X_batch = X_batch.to(device)
+            y_batch = y_batch.to(device).unsqueeze(1)
+            
+            logits = model(X_batch)
+            probs = torch.sigmoid(logits)
+            
+            all_probs.extend(probs.cpu().numpy().flatten().tolist())
+            all_labels.extend(y_batch.cpu().numpy().flatten().tolist())
+    
+    all_probs = np.array(all_probs)
+    all_labels = np.array(all_labels)
+    
+    # Calculate metrics at default threshold (0.5)
+    preds_default = (all_probs >= 0.5).astype(int)
+    tp_default = np.sum((preds_default == 1) & (all_labels == 1))
+    fp_default = np.sum((preds_default == 1) & (all_labels == 0))
+    tn_default = np.sum((preds_default == 0) & (all_labels == 0))
+    fn_default = np.sum((preds_default == 0) & (all_labels == 1))
+    
+    accuracy = (tp_default + tn_default) / len(all_labels) if len(all_labels) > 0 else 0.0
+    precision_default = tp_default / (tp_default + fp_default + 1e-8) if (tp_default + fp_default) > 0 else 0.0
+    recall_default = tp_default / (tp_default + fn_default + 1e-8) if (tp_default + fn_default) > 0 else 0.0
+    f1_default = 2 * precision_default * recall_default / (precision_default + recall_default + 1e-8) if (precision_default + recall_default) > 0 else 0.0
+    
+    logger.info("=" * 60)
+    logger.info(f"{split_name} Set Evaluation")
+    logger.info("=" * 60)
+    logger.info(f"Threshold=0.5: Accuracy={accuracy:.4f}, Precision={precision_default:.4f}, Recall={recall_default:.4f}, F1={f1_default:.4f}")
+    logger.info(f"Confusion Matrix: TP={tp_default}, FP={fp_default}, TN={tn_default}, FN={fn_default}")
+    logger.info("-" * 60)
+    logger.info(f"{split_name} Threshold Analysis (various thresholds for precision/recall):")
+    logger.info("-" * 60)
+    logger.info(f"{'Threshold':<12} {'Precision':<12} {'Recall':<12} {'F1':<12} {'TP':<8} {'FP':<8} {'FN':<8}")
+    logger.info("-" * 60)
+    
+    for thresh in thresholds:
+        preds = (all_probs >= thresh).astype(int)
+        tp = np.sum((preds == 1) & (all_labels == 1))
+        fp = np.sum((preds == 1) & (all_labels == 0))
+        fn = np.sum((preds == 0) & (all_labels == 1))
+        
+        precision = tp / (tp + fp + 1e-8) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn + 1e-8) if (tp + fn) > 0 else 0.0
+        f1 = 2 * precision * recall / (precision + recall + 1e-8) if (precision + recall) > 0 else 0.0
+        
+        logger.info(
+            f"{thresh:<12.2f} {precision:<12.4f} {recall:<12.4f} {f1:<12.4f} "
+            f"{tp:<8} {fp:<8} {fn:<8}"
+        )
+    logger.info("-" * 60)
+
+
+def debug_lstm_dataset_samples(
+    logger,
+    X,
+    y,
+    indices_to_check=None,
+    prefix: str = "[DEBUG][DATASET]",
+):
+    """
+    Debug utility for LSTM sequence datasets.
+    For the given X (N, window_size, feature_dim) and y (N,),
+    log labels and a few sequence values for selected indices,
+    and also log pairwise absolute differences.
+    Intended for use when debug_overfit == 2.
+    """
+    import torch
+
+    if indices_to_check is None:
+        indices_to_check = [0, 1, 2, 12]
+
+    X_t = torch.tensor(X) if not isinstance(X, torch.Tensor) else X
+    y_t = torch.tensor(y) if not isinstance(y, torch.Tensor) else y
+
+    logger.info(f"{prefix} X.shape={tuple(X_t.shape)}, y.shape={tuple(y_t.shape)}")
+
+    for idx in indices_to_check:
+        if idx < 0 or idx >= X_t.shape[0]:
+            logger.warning(f"{prefix} index {idx} out of range (0 ~ {X_t.shape[0] - 1})")
+            continue
+
+        x_i = X_t[idx]
+        y_i = y_t[idx].item()
+
+        ts_sample = x_i[:5, :8].detach().cpu().numpy()
+
+        logger.info(
+            f"{prefix} idx={idx}, label={y_i}, "
+            f"x_i.shape={tuple(x_i.shape)}, "
+            f"ts_sample(first_5_steps_first_8_features)={ts_sample}"
+        )
+
+    if len(indices_to_check) >= 2:
+        base_idx = indices_to_check[0]
+        if base_idx < 0 or base_idx >= X_t.shape[0]:
+            return
+        base_x = X_t[base_idx]
+
+        for other_idx in indices_to_check[1:]:
+            if other_idx < 0 or other_idx >= X_t.shape[0]:
+                logger.warning(
+                    f"{prefix} other_idx {other_idx} out of range (0 ~ {X_t.shape[0] - 1})"
+                )
+                continue
+
+            other_x = X_t[other_idx]
+            diff = (base_x - other_x).abs()
+            mean_diff = diff.mean().item()
+            std_diff = diff.std().item()
+            max_diff = diff.max().item()
+
+            logger.info(
+                f"{prefix}[DIFF] base_idx={base_idx} vs other_idx={other_idx} → "
+                f"mean_abs_diff={mean_diff:.8f}, std={std_diff:.8f}, max={max_diff:.8f}"
+            )
+
+
 def create_sequences(
     df: pd.DataFrame,
     window_size: int = 60,
@@ -125,6 +291,7 @@ def create_sequences(
     pos_threshold: float | None = None,
     neg_threshold: float | None = None,
     ignore_margin: float | None = None,
+    debug_inspect: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """
     Create sequences for LSTM training with improved label definition.
@@ -148,8 +315,13 @@ def create_sequences(
         neg_threshold: Negative return threshold for label=0 (default: from settings)
         ignore_margin: Margin for ambiguous zone (default: from settings)
 
+    Args:
+        debug_inspect: If True, log detailed stats and perform safety checks (used for debug overfit mode)
+
     Returns:
-        Tuple of (X: sequences, y: labels, feature_cols: feature column names)
+        Tuple of (X: sequences, y: labels, feature_cols: feature column names, meta: dict)
+        where meta contains:
+        - "future_returns": np.ndarray of shape (N,) with actual forward returns
     """
     # Settings에서 기본값 가져오기
     if horizon is None:
@@ -169,6 +341,22 @@ def create_sequences(
     logger.info(f"Label thresholds: pos={pos_threshold:.4f}, neg={neg_threshold:.4f}")
     logger.info(f"Ignore margin: {ignore_margin:.4f} (ambiguous zone: [-{ignore_margin:.4f}, +{ignore_margin:.4f}])")
     
+    if debug_inspect:
+        try:
+            logger.info("[DEBUG][RAW_DF] Before feature_df creation:")
+            logger.info(
+                "[DEBUG][RAW_DF] shape=%s, columns=%s",
+                str(df.shape),
+                list(df.columns),
+            )
+            logger.info("[DEBUG][RAW_DF] head(10):\n%s", df.head(10))
+            logger.info(
+                "[DEBUG][RAW_DF] describe():\n%s",
+                df.describe().to_string(),
+            )
+        except Exception as e:
+            logger.warning("[DEBUG][RAW_DF] failed to log raw df: %s", e)
+
     # Add indicators if not present
     if "ema_20" not in df.columns:
         df = add_basic_indicators(df)
@@ -176,11 +364,38 @@ def create_sequences(
     # Build features using existing function
     # NOTE: build_ml_dataset는 feature와 label을 반환하지만, 여기서는 feature만 사용
     # 라벨은 별도로 계산함 (threshold 기반)
+    # Extract symbol and timeframe from settings
+    symbol = getattr(settings, "BINANCE_SYMBOL", "BTC/USDT").replace("/", "").upper()
+    timeframe = getattr(settings, "THRESHOLD_TIMEFRAME", "1m")
+    
     X_features, _ = build_ml_dataset(
         df,
         horizon=horizon,
+        symbol=symbol,
+        timeframe=timeframe,
         use_events=settings.EVENTS_ENABLED,
+        debug_inspect=debug_inspect,
+        debug_logger=logger,
     )
+
+    # feature_df 생성 이후 상태 디버깅
+    if debug_inspect:
+        try:
+            logger.info(
+                "[DEBUG][SEQ][FEATURE_DF] shape=%s",
+                getattr(X_features, "shape", None),
+            )
+            logger.info(
+                "[DEBUG][SEQ][FEATURE_DF] dtypes:\n%s",
+                getattr(X_features, "dtypes", None),
+            )
+            logger.info("[DEBUG][SEQ][FEATURE_DF] head(10):\n%s", X_features.head(10))
+            logger.info(
+                "[DEBUG][SEQ][FEATURE_DF] describe():\n%s",
+                X_features.describe().to_string(),
+            )
+        except Exception as e:
+            logger.warning("[DEBUG][SEQ][FEATURE_DF] failed to log feature df: %s", e)
 
     # Get feature columns (순서가 중요함 - 예측 시점과 동일해야 함)
     feature_cols = X_features.columns.tolist()
@@ -191,6 +406,19 @@ def create_sequences(
     if settings.EVENTS_ENABLED:
         event_cols = [c for c in feature_cols if c.startswith("event_")]
         logger.info(f"  - Event features: {len(event_cols)} (sample: {event_cols[:3]})")
+    
+    # Feature columns detailed logging
+    logger.info("=" * 60)
+    logger.info("[LSTM Train] Feature Columns")
+    logger.info("=" * 60)
+    logger.info(f"[LSTM] Using {len(feature_cols)} feature columns:")
+    logger.info(f"[LSTM] FEATURE_COLS = {feature_cols}")
+    if settings.EVENTS_ENABLED:
+        event_cols = [c for c in feature_cols if c.startswith("event_")]
+        logger.info(f"[LSTM] Event features ({len(event_cols)}): {event_cols}")
+        basic_cols = [c for c in feature_cols if not c.startswith("event_")]
+        logger.info(f"[LSTM] Basic features ({len(basic_cols)}): {basic_cols}")
+    logger.info("=" * 60)
 
     # Calculate future return for label definition
     df = df.copy()
@@ -350,7 +578,66 @@ def create_sequences(
     logger.info(f"  feature_dim: {feature_dim}")
     logger.info("=" * 60)
 
-    return X, y, feature_cols
+    if debug_inspect:
+        try:
+            logger.info("[DEBUG][SEQ][FINAL] X.shape=%s, y.shape=%s", str(X.shape), str(y.shape))
+            sample_indices = [0, 1, 2, 12]
+            for idx in sample_indices:
+                if idx < 0 or idx >= len(X):
+                    logger.warning(
+                        "[DEBUG][SEQ][FINAL] index %s out of range (0 ~ %s)",
+                        idx,
+                        max(len(X) - 1, -1),
+                    )
+                    continue
+                sample = X[idx]
+                mean_abs = float(np.mean(np.abs(sample)))
+                max_abs = float(np.max(np.abs(sample)))
+                logger.info(
+                    "[DEBUG][SEQ][FINAL] idx=%d, label=%.3f, mean_abs=%.6f, max_abs=%.6f",
+                    idx,
+                    float(y[idx]),
+                    mean_abs,
+                    max_abs,
+                )
+                logger.info(
+                    "[DEBUG][SEQ][FINAL] idx=%d first_5_steps_first_8_features=\n%s",
+                    idx,
+                    sample[:5, :8],
+                )
+
+            if len(sample_indices) >= 2 and len(X) > 0:
+                base_idx = sample_indices[0]
+                if 0 <= base_idx < len(X):
+                    base_sample = X[base_idx]
+                    for other_idx in sample_indices[1:]:
+                        if other_idx < 0 or other_idx >= len(X):
+                            continue
+                        diff = np.abs(base_sample - X[other_idx])
+                        logger.info(
+                            "[DEBUG][SEQ][FINAL][DIFF] base_idx=%d vs other_idx=%d → mean_abs_diff=%.8f, max_abs_diff=%.8f",
+                            base_idx,
+                            other_idx,
+                            float(diff.mean()),
+                            float(diff.max()),
+                        )
+        except Exception as e:
+            logger.warning("[DEBUG][SEQ][FINAL] failed to log final sequences: %s", e)
+
+        if len(X) >= 2:
+            base = X[0]
+            other = X[1]
+            if np.allclose(base, 0) and np.allclose(other, 0) and np.allclose(base, other):
+                raise ValueError(
+                    "All LSTM input sequences appear to be identical or all zeros – please check feature creation and normalization."
+                )
+
+    # Create meta dictionary with future returns
+    meta = {
+        "future_returns": future_returns_arr,
+    }
+    
+    return X, y, feature_cols, meta
 
 
 def train_model(
@@ -425,13 +712,14 @@ def train_model(
     # Create sequences
     logger.info(f"Creating sequences (window_size={window_size}, horizon={horizon})...")
     logger.info("Event features enabled: %s", settings.EVENTS_ENABLED)
-    X, y, feature_cols = create_sequences(
+    X, y, feature_cols, meta = create_sequences(
         df,
         window_size=window_size,
         horizon=horizon,
         pos_threshold=pos_threshold,
         neg_threshold=neg_threshold,
         ignore_margin=ignore_margin,
+        debug_inspect=(debug_overfit_mode == "2"),
     )
     feature_dim = len(feature_cols)
 
@@ -440,18 +728,54 @@ def train_model(
         event_cols = [col for col in feature_cols if col.startswith("event_")]
         logger.info("이벤트 피처 수: %d (샘플: %s)", len(event_cols), event_cols[:5])
 
-    # Train/validation split (time-series aware: first 80% train, last 20% valid)
-    split_idx = int(len(X) * train_split)
-    X_train, X_valid = X[:split_idx], X[split_idx:]
-    y_train, y_valid = y[:split_idx], y[split_idx:]
+    # Train/validation/test split using time-series split utility
+    splits = make_time_series_splits(
+        X,
+        y,
+        train_ratio=0.7,
+        valid_ratio=0.15,
+        min_test_samples=200,
+        meta={"future_returns": meta["future_returns"]},
+    )
+
+    X_train = splits["data"]["X_train"]
+    y_train = splits["data"]["y_train"]
+    X_valid = splits["data"]["X_valid"]
+    y_valid = splits["data"]["y_valid"]
+    X_test = splits["data"]["X_test"]
+    y_test = splits["data"]["y_test"]
+
+    # Log split summary
+    log_split_summary(
+        y_train=y_train,
+        y_valid=y_valid,
+        y_test=y_test,
+        logger=logger,
+    )
 
     logger.info("-" * 60)
-    logger.info("Train/Validation Split:")
+    logger.info("Train/Validation/Test Split:")
     logger.info(f"  X_train shape: {X_train.shape}")
     logger.info(f"  X_valid shape: {X_valid.shape}")
-    logger.info(f"  y_train shape: {y_train.shape} (pos={y_train.mean():.3f})")
-    logger.info(f"  y_valid shape: {y_valid.shape} (pos={y_valid.mean():.3f})")
+    logger.info(f"  X_test shape: {X_test.shape}")
     logger.info("-" * 60)
+
+    if debug_overfit_mode == "2":
+        logger.info("[DEBUG][DATASET] debug_overfit==2 → inspecting train/valid sequences")
+        debug_lstm_dataset_samples(
+            logger=logger,
+            X=X_train,
+            y=y_train,
+            indices_to_check=[0, 1, 2, 12],
+            prefix="[DEBUG][DATASET][TRAIN]",
+        )
+        debug_lstm_dataset_samples(
+            logger=logger,
+            X=X_valid,
+            y=y_valid,
+            indices_to_check=[0, 1, 2, 12],
+            prefix="[DEBUG][DATASET][VALID]",
+        )
 
     # Calculate class weights for imbalanced data
     # pos_weight 계산: neg_count / pos_count
@@ -483,6 +807,13 @@ def train_model(
     logger.info(f"  input_size (feature_dim): {feature_dim}")
     logger.info(f"  hidden_size: {hidden_size}")
     logger.info(f"  num_layers: {num_layers}")
+    
+    # DEBUG-OVERFIT: disable dropout in debug-overfit mode
+    base_dropout = dropout
+    if debug_overfit_mode is not None:
+        logger.info(f"[DEBUG][INIT] debug_overfit mode → forcing dropout=0.0 (was {base_dropout})")
+        dropout = 0.0
+    
     logger.info(f"  dropout: {dropout}")
     logger.info(f"  device: {device}")
     logger.info("-" * 60)
@@ -494,7 +825,24 @@ def train_model(
         dropout=dropout,
     ).to(device)
     
-    # 모델 파라미터 수 로깅
+    # DEBUG-OVERFIT: unfreeze all parameters in debug-overfit mode
+    if debug_overfit_mode is not None:
+        logger.info("[DEBUG][INIT] debug_overfit mode detected → unfreezing ALL parameters")
+        unfrozen_count = 0
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                logger.info(f"[DEBUG][INIT] unfreeze param: {name}, shape={tuple(param.shape)}")
+                unfrozen_count += 1
+            param.requires_grad = True
+        
+        if unfrozen_count > 0:
+            logger.info(f"[DEBUG][INIT] Unfroze {unfrozen_count} parameter groups")
+        
+        # Verify dropout layers after model creation
+        dropout_ps = [m.p for m in model.modules() if isinstance(m, torch.nn.Dropout)]
+        logger.info(f"[DEBUG][INIT] Dropout ps after override (should be 0.0 in debug_overfit): {dropout_ps}")
+    
+    # 모델 파라미터 수 로깅 (unfreeze 후)
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"  Total parameters: {total_params:,}")
@@ -502,7 +850,11 @@ def train_model(
     
     # DEBUG: requires_grad 확인
     requires_grad_count = sum(1 for p in model.parameters() if p.requires_grad)
-    logger.info(f"  Parameters with requires_grad=True: {requires_grad_count}/{total_params}")
+    total_param_count = len(list(model.parameters()))
+    logger.info(f"  Parameters with requires_grad=True: {requires_grad_count}/{total_param_count}")
+    
+    if debug_overfit_mode is not None:
+        logger.info(f"[DEBUG][INIT] After unfreeze: trainable parameters={trainable_params}/{total_params}")
     
     # DEBUG: 마지막 레이어 초기 weight 확인
     if hasattr(model, 'fc_out'):
@@ -555,6 +907,14 @@ def train_model(
             pos_count,
         )
 
+    # DEBUG-OVERFIT: disable weight decay in debug-overfit mode
+    base_weight_decay = weight_decay
+    if debug_overfit_mode is not None:
+        logger.info(
+            f"[DEBUG][INIT] debug_overfit mode → forcing weight_decay=0.0 (was {base_weight_decay})"
+        )
+        weight_decay = 0.0
+    
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay
     )
@@ -576,6 +936,7 @@ def train_model(
     if debug_overfit_mode is not None:
         logger.info("=" * 60)
         logger.info("DEBUG OVERFIT MODE ENABLED")
+        logger.info(f"[DEBUG][INIT] debug_overfit mode enabled: {debug_overfit_mode}")
         logger.info("=" * 60)
         
         # Gradient flow 검사
@@ -970,63 +1331,27 @@ def train_model(
     else:
         logger.warning(f"Model file not found at expected path: {final_model_path.resolve()}")
     
-    # 4단계: Validation 셋 샘플 출력 및 다양한 threshold 분석 (디버깅용)
-    # 설정으로 제어 가능하도록 (기본값: True)
+    # Validation set evaluation using evaluate_split
     debug_inference_samples = getattr(settings, "DEBUG_LSTM_INFERENCE_SAMPLES", True)
-    
-    # 다양한 threshold에 대한 precision/recall 계산
     if debug_inference_samples:
-        logger.info("-" * 60)
-        logger.info("Threshold Analysis (various thresholds for precision/recall):")
-        logger.info("-" * 60)
+        evaluate_split(
+            model=model,
+            X=X_valid,
+            y=y_valid,
+            device=device,
+            split_name="Validation",
+            thresholds=[0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60],
+            batch_size=batch_size,
+            logger=logger,
+        )
         
-        model.eval()
-        all_probs_valid = []
-        all_labels_valid = []
-        
-        with torch.no_grad():
-            for X_batch, y_batch in valid_loader:
-                X_batch = X_batch.to(device)
-                y_batch = y_batch.to(device).unsqueeze(1)
-                
-                logits = model(X_batch)
-                probs = torch.sigmoid(logits)
-                
-                all_probs_valid.extend(probs.cpu().numpy().flatten().tolist())
-                all_labels_valid.extend(y_batch.cpu().numpy().flatten().tolist())
-        
-        all_probs_valid = np.array(all_probs_valid)
-        all_labels_valid = np.array(all_labels_valid)
-        
-        # 다양한 threshold 테스트 (확장된 범위)
-        test_thresholds = [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60]
-        logger.info(f"{'Threshold':<12} {'Precision':<12} {'Recall':<12} {'F1':<12} {'TP':<8} {'FP':<8} {'FN':<8}")
-        logger.info("-" * 60)
-        
-        for thresh in test_thresholds:
-            preds = (all_probs_valid >= thresh).astype(int)
-            tp = np.sum((preds == 1) & (all_labels_valid == 1))
-            fp = np.sum((preds == 1) & (all_labels_valid == 0))
-            fn = np.sum((preds == 0) & (all_labels_valid == 1))
-            
-            precision = tp / (tp + fp + 1e-8) if (tp + fp) > 0 else 0.0
-            recall = tp / (tp + fn + 1e-8) if (tp + fn) > 0 else 0.0
-            f1 = 2 * precision * recall / (precision + recall + 1e-8) if (precision + recall) > 0 else 0.0
-            
-            logger.info(
-                f"{thresh:<12.2f} {precision:<12.4f} {recall:<12.4f} {f1:<12.4f} "
-                f"{tp:<8} {fp:<8} {fn:<8}"
-            )
-        logger.info("-" * 60)
-    
-    if debug_inference_samples:
+        # Sample predictions for debugging
         logger.info("-" * 60)
         logger.info("Validation Set Sample Predictions (for debugging):")
         logger.info("-" * 60)
         
         model.eval()
         with torch.no_grad():
-            # 마지막 N개 샘플 출력 (또는 랜덤 샘플)
             sample_size = min(10, len(valid_dataset))
             sample_indices = list(range(len(valid_dataset) - sample_size, len(valid_dataset)))
             
@@ -1036,7 +1361,7 @@ def train_model(
             
             for idx in sample_indices:
                 X_sample, y_sample = valid_dataset[idx]
-                X_sample = X_sample.unsqueeze(0).to(device)  # Add batch dimension
+                X_sample = X_sample.unsqueeze(0).to(device)
                 y_sample = y_sample.item()
                 
                 logit = model(X_sample)
@@ -1049,6 +1374,40 @@ def train_model(
                 )
         
         logger.info("-" * 60)
+    
+    # Test set evaluation (unseen data)
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("Evaluating on Test Set (unseen data)")
+    logger.info("=" * 60)
+    
+    # Load best model
+    best_model_path = Path(settings.LSTM_ATTN_MODEL_PATH)
+    if best_model_path.exists():
+        best_model = LSTMAttentionModel(
+            input_size=feature_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+        ).to(device)
+        best_model.load_state_dict(torch.load(best_model_path, map_location=device))
+        best_model.eval()
+        logger.info(f"Loaded best model from {best_model_path.resolve()}")
+    else:
+        logger.warning(f"Best model not found at {best_model_path.resolve()}, using current model")
+        best_model = model
+    
+    # Evaluate on test set
+    evaluate_split(
+        model=best_model,
+        X=X_test,
+        y=y_test,
+        device=device,
+        split_name="Test",
+        thresholds=[0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60],
+        batch_size=batch_size,
+        logger=logger,
+    )
     
     # 최종 체크리스트 출력
     logger.info("=" * 60)
