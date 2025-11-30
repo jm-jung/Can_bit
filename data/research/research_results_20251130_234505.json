@@ -1,0 +1,342 @@
+{
+  "timestamp": "20251130_234505",
+  "strategy": "ml_xgb",
+  "symbol": "BTCUSDT",
+  "timeframe": "1m",
+  "use_optimized_threshold": true,
+  "experiments": [
+    {
+      "experiment": "cost_impact",
+      "params": {
+        "mode": "with_costs"
+      },
+      "results": {
+        "total_return": -0.39939338595139084,
+        "sharpe": -240.92159637197102,
+        "win_rate": 0.14202898550724638,
+        "trades": 345,
+        "long_trades": 158,
+        "short_trades": 187,
+        "max_drawdown": -0.3976855498544805
+      }
+    },
+    {
+      "experiment": "cost_impact",
+      "params": {
+        "mode": "no_costs"
+      },
+      "results": {
+        "total_return": 0.11578917768468067,
+        "sharpe": 53.97403264654106,
+        "win_rate": 0.5304347826086957,
+        "trades": 345,
+        "long_trades": 158,
+        "short_trades": 187,
+        "max_drawdown": -0.02330194479623466
+      }
+    },
+    {
+      "experiment": "long_short_only",
+      "params": {
+        "mode": "long_only",
+        "long_threshold": 0.7
+      },
+      "results": {
+        "total_return": -0.29616248933377276,
+        "sharpe": -576.0382177859218,
+        "win_rate": 0.10582010582010581,
+        "trades": 189,
+        "long_trades": 189,
+        "short_trades": 0,
+        "max_drawdown": -0.29958893823273086
+      }
+    },
+    {
+      "experiment": "long_short_only",
+      "params": {
+        "mode": "short_only",
+        "short_threshold": 0.5499999999999999
+      },
+      "results": {
+        "total_return": -0.2209088802891216,
+        "sharpe": -119.11463978401083,
+        "win_rate": 0.13761467889908258,
+        "trades": 218,
+        "long_trades": 0,
+        "short_trades": 218,
+        "max_drawdown": -0.2385137940237348
+      }
+    },
+    {
+      "experiment": "threshold_strengthening",
+      "params": {
+        "long_threshold": 0.85,
+        "short_threshold": 0.5499999999999999
+      },
+      "results": {
+        "total_return": -0.36617890750092974,
+        "sharpe": -170.07078209396877,
+        "win_rate": 0.12912912912912913,
+        "trades": 333,
+        "long_trades": 130,
+        "short_trades": 203,
+        "max_drawdown": -0.36437662541572874
+      }
+    },
+    {
+      "experiment": "threshold_strengthening",
+      "params": {
+        "long_threshold": 0.8,
+        "short_threshold": 0.5499999999999999
+      },
+      "results": {
+        "total_return": -0.37214199879646825,
+        "sharpe": -170.98071280751375,
+        "win_rate": 0.1286549707602339,
+        "trades": 342,
+        "long_trades": 144,
+        "short_trades": 198,
+        "max_drawdown": -0.3703566728724641
+      }
+    },
+    {
+      "experiment": "threshold_strengthening",
+      "params": {
+        "long_threshold": 0.75,
+        "short_threshold": 0.5499999999999999
+      },
+      "results": {
+        "total_return": -0.39637209459814693,
+        "sharpe": -239.82387938958198,
+        "win_rate": 0.1378299120234604,
+        "trades": 341,
+        "long_trades": 149,
+        "short_trades": 192,
+        "max_drawdown": -0.3946556674029842
+      }
+    },
+    {
+      "experiment": "threshold_strengthening",
+      "params": {
+        "long_threshold": 0.7,
+        "short_threshold": 0.5499999999999999
+      },
+      "results": {
+        "total_return": -0.39939338595139084,
+        "sharpe": -240.92159637197102,
+        "win_rate": 0.14202898550724638,
+        "trades": 345,
+        "long_trades": 158,
+        "short_trades": 187,
+        "max_drawdown": -0.3976855498544805
+      }
+    },
+    {
+      "experiment": "threshold_strengthening",
+      "params": {
+        "long_threshold": 0.75,
+        "short_threshold": 0.25
+      },
+      "results": {
+        "total_return": -0.4753844721667839,
+        "sharpe": -542.4262711069373,
+        "win_rate": 0.09192200557103064,
+        "trades": 359,
+        "long_trades": 171,
+        "short_trades": 188,
+        "max_drawdown": -0.4744260035656026
+      }
+    },
+    {
+      "experiment": "threshold_strengthening",
+      "params": {
+        "long_threshold": 0.7,
+        "short_threshold": 0.25
+      },
+      "results": {
+        "total_return": -0.4870375276915223,
+        "sharpe": -543.9056498526082,
+        "win_rate": 0.0921409214092141,
+        "trades": 369,
+        "long_trades": 183,
+        "short_trades": 186,
+        "max_drawdown": -0.48610034913464145
+      }
+    },
+    {
+      "experiment": "threshold_strengthening",
+      "params": {
+        "long_threshold": 0.8,
+        "short_threshold": 0.25
+      },
+      "results": {
+        "total_return": -0.46472200523782903,
+        "sharpe": -553.5380735481483,
+        "win_rate": 0.08333333333333333,
+        "trades": 348,
+        "long_trades": 159,
+        "short_trades": 189,
+        "max_drawdown": -0.46374405639021893
+      }
+    },
+    {
+      "experiment": "threshold_strengthening",
+      "params": {
+        "long_threshold": 0.85,
+        "short_threshold": 0.25
+      },
+      "results": {
+        "total_return": -0.45446571708102734,
+        "sharpe": -557.1415840517171,
+        "win_rate": 0.07878787878787878,
+        "trades": 330,
+        "long_trades": 138,
+        "short_trades": 192,
+        "max_drawdown": -0.4533347387177533
+      }
+    },
+    {
+      "experiment": "threshold_strengthening",
+      "params": {
+        "long_threshold": 0.75,
+        "short_threshold": 0.2
+      },
+      "results": {
+        "total_return": -0.47191926099267967,
+        "sharpe": -574.6455248653469,
+        "win_rate": 0.09116809116809117,
+        "trades": 351,
+        "long_trades": 172,
+        "short_trades": 179,
+        "max_drawdown": -0.4720489869564403
+      }
+    },
+    {
+      "experiment": "threshold_strengthening",
+      "params": {
+        "long_threshold": 0.7,
+        "short_threshold": 0.2
+      },
+      "results": {
+        "total_return": -0.4829695425660967,
+        "sharpe": -575.0251316186913,
+        "win_rate": 0.09166666666666666,
+        "trades": 360,
+        "long_trades": 184,
+        "short_trades": 176,
+        "max_drawdown": -0.48309655396687284
+      }
+    },
+    {
+      "experiment": "threshold_strengthening",
+      "params": {
+        "long_threshold": 0.8,
+        "short_threshold": 0.2
+      },
+      "results": {
+        "total_return": -0.4611088245541305,
+        "sharpe": -588.2720001557392,
+        "win_rate": 0.08529411764705883,
+        "trades": 340,
+        "long_trades": 160,
+        "short_trades": 180,
+        "max_drawdown": -0.46124120616158737
+      }
+    },
+    {
+      "experiment": "threshold_strengthening",
+      "params": {
+        "long_threshold": 0.85,
+        "short_threshold": 0.2
+      },
+      "results": {
+        "total_return": -0.4466422606005773,
+        "sharpe": -590.7870942560476,
+        "win_rate": 0.07861635220125786,
+        "trades": 318,
+        "long_trades": 138,
+        "short_trades": 180,
+        "max_drawdown": -0.4440718049321687
+      }
+    },
+    {
+      "experiment": "threshold_strengthening",
+      "params": {
+        "long_threshold": 0.75,
+        "short_threshold": 0.15
+      },
+      "results": {
+        "total_return": -0.45261781251158806,
+        "sharpe": -595.6999201473618,
+        "win_rate": 0.0963855421686747,
+        "trades": 332,
+        "long_trades": 172,
+        "short_trades": 160,
+        "max_drawdown": -0.4536772733729987
+      }
+    },
+    {
+      "experiment": "threshold_strengthening",
+      "params": {
+        "long_threshold": 0.7,
+        "short_threshold": 0.15
+      },
+      "results": {
+        "total_return": -0.4664927273563635,
+        "sharpe": -596.659701038934,
+        "win_rate": 0.09620991253644315,
+        "trades": 343,
+        "long_trades": 186,
+        "short_trades": 157,
+        "max_drawdown": -0.46752533325323664
+      }
+    },
+    {
+      "experiment": "threshold_strengthening",
+      "params": {
+        "long_threshold": 0.8,
+        "short_threshold": 0.15
+      },
+      "results": {
+        "total_return": -0.44002778175831925,
+        "sharpe": -611.1742400690074,
+        "win_rate": 0.090625,
+        "trades": 320,
+        "long_trades": 160,
+        "short_trades": 160,
+        "max_drawdown": -0.4411116106849171
+      }
+    },
+    {
+      "experiment": "threshold_strengthening",
+      "params": {
+        "long_threshold": 0.85,
+        "short_threshold": 0.15
+      },
+      "results": {
+        "total_return": -0.42499516266086645,
+        "sharpe": -614.8187570890223,
+        "win_rate": 0.08389261744966443,
+        "trades": 298,
+        "long_trades": 138,
+        "short_trades": 160,
+        "max_drawdown": -0.4233005769338162
+      }
+    },
+    {
+      "experiment": "event_features",
+      "params": {
+        "mode": "with_events"
+      },
+      "results": {
+        "total_return": -0.39939338595139084,
+        "sharpe": -240.92159637197102,
+        "win_rate": 0.14202898550724638,
+        "trades": 345,
+        "long_trades": 158,
+        "short_trades": 187,
+        "max_drawdown": -0.3976855498544805
+      }
+    }
+  ]
+}

@@ -118,6 +118,8 @@ def run_threshold_optimization_for_ml_strategy(
         ),
         strategy_name=strategy_name,
         use_overfit_aware=True,
+        symbol=symbol,
+        timeframe=timeframe,
     )
     
     # Save result if requested

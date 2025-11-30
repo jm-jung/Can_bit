@@ -340,13 +340,17 @@ def run_backtest_with_ml(
     long_threshold: float | None = None,
     short_threshold: float | None = None,
     *,
-    use_optimized_thresholds: bool | None = None,
+    use_optimized_threshold: bool = False,
     strategy_name: str = "ml_xgb",
     symbol: str | None = None,
     timeframe: str | None = None,
     proba_up_cache: np.ndarray | None = None,
     df_with_proba: pd.DataFrame | None = None,
     index_mask: np.ndarray | None = None,
+    commission_rate: float | None = None,
+    slippage_rate: float | None = None,
+    long_only: bool = False,
+    short_only: bool = False,
 ) -> BacktestResult:
     """
     Run backtest using a pluggable ML strategy.
@@ -354,34 +358,68 @@ def run_backtest_with_ml(
     Args:
         long_threshold: Probability threshold for LONG signal
         short_threshold: Probability threshold for SHORT signal
-        use_optimized_thresholds: Whether to use optimized thresholds from JSON
+        use_optimized_threshold: Whether to use optimized thresholds from JSON
         strategy_name: Strategy identifier (e.g., "ml_xgb", "ml_lstm_attn")
         symbol: Optional symbol override for threshold lookup
         timeframe: Optional timeframe override for threshold lookup
         proba_up_cache: Optional pre-computed probability array (for optimization)
         df_with_proba: Optional DataFrame aligned with proba_up_cache (for optimization)
         index_mask: Optional boolean mask to filter rows (for in-sample/out-of-sample splits)
+        commission_rate: Override commission rate (default: from settings)
+        slippage_rate: Override slippage rate (default: from settings)
+        long_only: If True, only execute LONG trades (ignore SHORT signals)
+        short_only: If True, only execute SHORT trades (ignore LONG signals)
     
     Returns:
         BacktestResult
     """
-    if use_optimized_thresholds is None:
-        use_optimized_thresholds = getattr(settings, "USE_OPTIMIZED_THRESHOLDS", False)
-
     adapter = _get_ml_adapter(strategy_name)
     
-    # Use cached predictions if provided, otherwise compute on-the-fly
-    use_cached = proba_up_cache is not None and df_with_proba is not None
-
-    long_threshold, short_threshold = resolve_ml_thresholds(
-        long_threshold=long_threshold,
-        short_threshold=short_threshold,
-        use_optimized_thresholds=use_optimized_thresholds,
-        strategy_name=adapter.strategy_name,
-        symbol=symbol,
-        timeframe=timeframe,
-        default_long=adapter.default_long,
-        default_short=adapter.default_short,
+    # Resolve symbol and timeframe for threshold lookup
+    resolved_symbol = symbol or getattr(settings, "BINANCE_SYMBOL", "BTC/USDT").replace("/", "").upper()
+    resolved_timeframe = timeframe or getattr(settings, "THRESHOLD_TIMEFRAME", "1m")
+    
+    # Load optimized thresholds if requested
+    if use_optimized_threshold:
+        from src.optimization.threshold_loader import load_optimized_thresholds
+        try:
+            opt_long, opt_short, threshold_path = load_optimized_thresholds(
+                strategy_name, resolved_symbol, resolved_timeframe
+            )
+            long_threshold = opt_long
+            short_threshold = opt_short
+            logger.info(
+                "[ML Backtest][XGBoost] Using optimized thresholds from %s: long=%.3f, short=%s",
+                threshold_path,
+                long_threshold,
+                "None" if short_threshold is None else f"{short_threshold:.3f}",
+            )
+        except Exception as e:
+            logger.warning(
+                "[ML Backtest][XGBoost] Failed to load optimized thresholds (%s). Falling back to defaults.",
+                str(e)
+            )
+            # Fall back to default thresholds
+            long_threshold = adapter.default_long
+            short_threshold = adapter.default_short
+    else:
+        # Use provided thresholds or defaults
+        if long_threshold is None:
+            long_threshold = adapter.default_long
+        if short_threshold is None:
+            short_threshold = adapter.default_short
+        
+        logger.info(
+            "[ML Backtest][XGBoost] Using default thresholds: long=%.3f, short=%s",
+            long_threshold,
+            "None" if short_threshold is None else f"{short_threshold:.3f}",
+        )
+    
+    # Log final thresholds before signal generation
+    logger.info(
+        "[ML Backtest][XGBoost] Final thresholds applied: long=%.3f, short=%s",
+        long_threshold,
+        "None" if short_threshold is None else f"{short_threshold:.3f}",
     )
     
     # Use cached predictions if provided, otherwise compute on-the-fly
@@ -428,9 +466,6 @@ def run_backtest_with_ml(
                 f"{adapter.name} model not loaded. Model path: {model_path}, exists={exists}"
             )
 
-        proba_values: list[float] = []
-        prediction_errors = 0
-
         logger.info(
             f"[ML Backtest][{adapter.name}] Computing predictions: "
             f"long_threshold={long_threshold}, short_threshold={short_threshold}, "
@@ -446,28 +481,99 @@ def run_backtest_with_ml(
             backtest_symbol = symbol or getattr(settings, "BINANCE_SYMBOL", "BTC/USDT").replace("/", "").upper()
             backtest_timeframe = timeframe or getattr(settings, "THRESHOLD_TIMEFRAME", "1m")
             
-            for i in range(start_idx, len(df)):
-                df_slice = df.iloc[: i + 1]
-                try:
-                    proba_up = float(model.predict_proba_latest(df_slice, symbol=backtest_symbol, timeframe=backtest_timeframe))
-                    proba_values.append(proba_up)
-                except Exception as exc:
-                    prediction_errors += 1
-                    if prediction_errors <= 5:
-                        logger.warning(
-                            f"[ML Backtest][{adapter.name}] Prediction failed at index {i}: "
-                            f"{type(exc).__name__}: {exc}"
-                        )
-                    continue
+            # 🔥 FIX: Generate features once for entire dataset to avoid repeated event feature calculation
+            # Extract features for the entire dataset (event features calculated once)
+            logger.info(
+                f"[ML Backtest][{adapter.name}] Extracting features for entire dataset "
+                f"(rows={len(df)}, start_idx={start_idx})..."
+            )
+            logger.debug(
+                f"[ML Backtest][{adapter.name}] This should trigger build_event_feature_frame only ONCE "
+                f"for the entire dataset, not per-row."
+            )
             
-            if not proba_values:
-                return _empty_result(
-                    f"[ML Backtest][{adapter.name}] No successful predictions!"
+            # Use model's _extract_features to get full feature frame (event features calculated once)
+            if hasattr(model, "_extract_features"):
+                full_features = model._extract_features(df, symbol=backtest_symbol, timeframe=backtest_timeframe)
+                
+                # Use batch prediction with full features
+                # For each prediction point, use features up to that point (sliding window)
+                # But event features are already calculated for the full dataset
+                proba_values: list[float] = []
+                prediction_errors = 0
+                
+                # Get model's expected feature names
+                if hasattr(model, "model") and hasattr(model.model, "get_booster"):
+                    model_feature_names = model.model.get_booster().feature_names
+                    if model_feature_names is None:
+                        model_feature_names = [f"f{i}" for i in range(len(model.model.feature_importances_))]
+                else:
+                    model_feature_names = None
+                
+                for i in range(start_idx, len(df)):
+                    # Use features up to index i (sliding window)
+                    features_slice = full_features.iloc[: i + 1]
+                    last_features = features_slice.iloc[[-1]].copy()
+                    
+                    # Align with model's expected feature order
+                    if model_feature_names:
+                        missing_features = set(model_feature_names) - set(last_features.columns)
+                        for feat in missing_features:
+                            last_features[feat] = 0.0
+                        last_features = last_features.reindex(columns=model_feature_names, fill_value=0.0)
+                    
+                    try:
+                        # Batch predict (single row)
+                        proba = model.model.predict_proba(last_features)[0]
+                        proba_up = float(proba[1])  # proba[1] = probability of class 1 (up)
+                        proba_values.append(proba_up)
+                    except Exception as exc:
+                        prediction_errors += 1
+                        if prediction_errors <= 5:
+                            logger.warning(
+                                f"[ML Backtest][{adapter.name}] Prediction failed at index {i}: "
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                        continue
+                
+                if not proba_values:
+                    return _empty_result(
+                        f"[ML Backtest][{adapter.name}] No successful predictions!"
+                    )
+                
+                proba_arr = np.array(proba_values, dtype=np.float32)
+                # Align df with proba_arr
+                df = df.iloc[start_idx:start_idx + len(proba_arr)].reset_index(drop=True)
+            else:
+                # Fallback: use predict_proba_latest for each slice (slower but compatible)
+                logger.warning(
+                    f"[ML Backtest][{adapter.name}] Model does not have _extract_features. "
+                    f"Using per-slice prediction (may be slower)."
                 )
-            
-            proba_arr = np.array(proba_values, dtype=np.float32)
-            # Align df with proba_arr (remove rows where prediction failed)
-            df = df.iloc[start_idx:start_idx + len(proba_arr)].reset_index(drop=True)
+                proba_values: list[float] = []
+                prediction_errors = 0
+                for i in range(start_idx, len(df)):
+                    df_slice = df.iloc[: i + 1]
+                    try:
+                        proba_up = float(model.predict_proba_latest(df_slice, symbol=backtest_symbol, timeframe=backtest_timeframe))
+                        proba_values.append(proba_up)
+                    except Exception as exc:
+                        prediction_errors += 1
+                        if prediction_errors <= 5:
+                            logger.warning(
+                                f"[ML Backtest][{adapter.name}] Prediction failed at index {i}: "
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                        continue
+                
+                if not proba_values:
+                    return _empty_result(
+                        f"[ML Backtest][{adapter.name}] No successful predictions!"
+                    )
+                
+                proba_arr = np.array(proba_values, dtype=np.float32)
+                df = df.iloc[start_idx:start_idx + len(proba_arr)].reset_index(drop=True)
+                
         except Exception as exc:
             return _empty_result(
                 f"[ML Backtest][{adapter.name}] Prediction loop failed: {type(exc).__name__}: {exc}"
@@ -495,11 +601,17 @@ def run_backtest_with_ml(
     for i in range(len(df)):
         proba_up = proba_arr[i]
         if proba_up >= long_threshold:
-            df.loc[df.index[i], "signal"] = "LONG"
-            signal_counts["LONG"] += 1
+            if not short_only:  # Allow LONG if not short_only mode
+                df.loc[df.index[i], "signal"] = "LONG"
+                signal_counts["LONG"] += 1
+            else:
+                signal_counts["HOLD"] += 1
         elif short_threshold is not None and proba_up <= short_threshold:
-            df.loc[df.index[i], "signal"] = "SHORT"
-            signal_counts["SHORT"] += 1
+            if not long_only:  # Allow SHORT if not long_only mode
+                df.loc[df.index[i], "signal"] = "SHORT"
+                signal_counts["SHORT"] += 1
+            else:
+                signal_counts["HOLD"] += 1
         else:
             signal_counts["HOLD"] += 1
     
@@ -558,14 +670,14 @@ def run_backtest_with_ml(
                 entry_price = position["entry_price"]
                 direction: Literal["LONG", "SHORT"] = position["side"]
 
-                # Apply commission and slippage
-                commission_rate = DEFAULT_COMMISSION_RATE
-                slippage_rate = DEFAULT_SLIPPAGE_RATE
+                # Apply commission and slippage (use override if provided)
+                effective_commission_rate = commission_rate if commission_rate is not None else DEFAULT_COMMISSION_RATE
+                effective_slippage_rate = slippage_rate if slippage_rate is not None else DEFAULT_SLIPPAGE_RATE
                 
                 # Entry: apply commission + slippage
-                entry_cost = entry_price * (commission_rate + slippage_rate)
+                entry_cost = entry_price * (effective_commission_rate + effective_slippage_rate)
                 # Exit: apply commission + slippage
-                exit_cost = exit_price * (commission_rate + slippage_rate)
+                exit_cost = exit_price * (effective_commission_rate + effective_slippage_rate)
                 
                 if direction == "LONG":
                     # Long: buy at entry_price + costs, sell at exit_price - costs

@@ -23,6 +23,7 @@ from typing import Any, Callable, Dict, List, Optional, Type
 
 import numpy as np
 
+from src.core.config import settings
 from src.backtest.metrics import get_metric_function
 
 logger = logging.getLogger(__name__)
@@ -143,6 +144,8 @@ def optimize_threshold_for_strategy(
     run_backtest_func: Optional[Callable[[float, Optional[float]], Any]] = None,
     strategy_name: str | None = None,
     use_overfit_aware: bool = True,
+    symbol: str | None = None,
+    timeframe: str | None = None,
 ) -> ThresholdOptimizerResult:
     """
     Optimize thresholds for a trading strategy using grid search.
@@ -188,6 +191,8 @@ def optimize_threshold_for_strategy(
             metric_fn=metric_fn,
             long_threshold_candidates=long_threshold_candidates,
             short_threshold_candidates=short_threshold_candidates,
+            symbol=symbol,
+            timeframe=timeframe,
         )
     
     # Legacy optimization (backward compatibility)
@@ -256,6 +261,8 @@ def _optimize_with_overfit_awareness(
     metric_fn: Callable[[Any], float],
     long_threshold_candidates: List[float],
     short_threshold_candidates: Optional[List[float]] = None,
+    symbol: str | None = None,
+    timeframe: str | None = None,
 ) -> ThresholdOptimizerResult:
     """
     Optimize thresholds with overfitting awareness using in-sample/out-of-sample splits.
@@ -277,9 +284,16 @@ def _optimize_with_overfit_awareness(
     logger.info("Step 1: Computing prediction probabilities (caching for reuse)")
     logger.info("=" * 60)
     
-    # Extract symbol and timeframe from settings
-    symbol = getattr(settings, "BINANCE_SYMBOL", "BTC/USDT").replace("/", "").upper()
-    timeframe = getattr(settings, "THRESHOLD_TIMEFRAME", "1m")
+    # Extract symbol and timeframe from parameters or settings
+    if symbol is None:
+        symbol = getattr(settings, "BINANCE_SYMBOL", "BTC/USDT").replace("/", "").upper()
+    else:
+        symbol = symbol.replace("/", "").upper() if "/" in symbol else symbol.upper()
+    
+    if timeframe is None:
+        timeframe = getattr(settings, "THRESHOLD_TIMEFRAME", "1m")
+    else:
+        timeframe = timeframe.lower()
     
     try:
         proba_arr, df_aligned = compute_ml_proba_cache(strategy_name, symbol=symbol, timeframe=timeframe)

@@ -13,6 +13,7 @@ from datetime import datetime
 from src.backtest.backtest_report import print_backtest_summary, save_backtest_report
 from src.backtest.engine import run_backtest_with_ml
 from src.core.config import settings
+from src.research.ml_strategy_research import run_all_experiments
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -69,12 +70,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--use-optimized-threshold",
         action="store_true",
-        help="Use optimized thresholds from JSON files",
+        help="Use optimized ML thresholds from data/thresholds folder",
     )
     parser.add_argument(
         "--no-save",
         action="store_true",
         help="Do not save backtest report to file",
+    )
+    parser.add_argument(
+        "--research-mode",
+        action="store_true",
+        default=False,
+        help="Run research experiments instead of normal backtest",
     )
     
     return parser.parse_args()
@@ -133,9 +140,28 @@ def main():
     logger.info(f"Symbol: {args.symbol}, Timeframe: {args.timeframe}")
     logger.info(f"Start date: {args.start_date or 'All available'}")
     logger.info(f"End date: {args.end_date or 'All available'}")
-    logger.info(f"Use optimized thresholds: {args.use_optimized_threshold}")
     logger.info("=" * 60)
     
+    # Log threshold usage flag
+    logger.info(
+        "[ML Backtest] use_optimized_threshold=%s",
+        args.use_optimized_threshold
+    )
+    
+    # Research mode: run experiments instead of normal backtest
+    if args.research_mode:
+        logger.info("[ML Backtest] Research mode enabled - running experiments...")
+        results = run_all_experiments(
+            strategy_name=args.strategy,
+            symbol=args.symbol,
+            timeframe=args.timeframe,
+            long_threshold=args.long_threshold,
+            short_threshold=args.short_threshold,
+            use_optimized_threshold=args.use_optimized_threshold,
+        )
+        return results
+    
+    # Normal backtest mode
     # Note: Date filtering would need to be implemented in the data loading layer
     # For now, we run backtest on all available data
     # TODO: Implement date filtering in load_ohlcv_df or get_df_with_indicators
@@ -144,7 +170,7 @@ def main():
     result = run_backtest_with_ml(
         long_threshold=args.long_threshold,
         short_threshold=args.short_threshold,
-        use_optimized_thresholds=args.use_optimized_threshold,
+        use_optimized_threshold=args.use_optimized_threshold,
         strategy_name=args.strategy,
         symbol=args.symbol,
         timeframe=args.timeframe,
