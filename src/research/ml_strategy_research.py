@@ -21,6 +21,7 @@ import pandas as pd
 
 from src.backtest.engine import run_backtest_with_ml
 from src.core.config import PROJECT_ROOT
+from src.features.ml_feature_config import MLFeatureConfig
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,11 @@ def experiment_cost_impact(
         timeframe=timeframe,
         commission_rate=None,  # Use default
         slippage_rate=None,  # Use default
+        signal_confirmation_bars=1,
+        use_trend_filter=False,
+        trend_ema_window=200,
+        take_profit_pct=None,
+        stop_loss_pct=None,
     )
     
     result_with_costs_dict = _extract_results(result_with_costs)
@@ -109,6 +115,11 @@ def experiment_cost_impact(
         timeframe=timeframe,
         commission_rate=0.0,
         slippage_rate=0.0,
+        signal_confirmation_bars=1,
+        use_trend_filter=False,
+        trend_ema_window=200,
+        take_profit_pct=None,
+        stop_loss_pct=None,
     )
     
     result_no_costs_dict = _extract_results(result_no_costs)
@@ -184,6 +195,11 @@ def experiment_long_short_only(
         symbol=symbol,
         timeframe=timeframe,
         long_only=True,
+        signal_confirmation_bars=1,
+        use_trend_filter=False,
+        trend_ema_window=200,
+        take_profit_pct=None,
+        stop_loss_pct=None,
     )
     
     result_long_dict = _extract_results(result_long_only)
@@ -205,6 +221,11 @@ def experiment_long_short_only(
             symbol=symbol,
             timeframe=timeframe,
             short_only=True,
+            signal_confirmation_bars=1,
+            use_trend_filter=False,
+            trend_ema_window=200,
+            take_profit_pct=None,
+            stop_loss_pct=None,
         )
         
         result_short_dict = _extract_results(result_short_only)
@@ -282,6 +303,11 @@ def experiment_threshold_strengthening(
                 strategy_name=strategy_name,
                 symbol=symbol,
                 timeframe=timeframe,
+                signal_confirmation_bars=1,
+                use_trend_filter=False,
+                trend_ema_window=200,
+                take_profit_pct=None,
+                stop_loss_pct=None,
             )
             
             result_dict = _extract_results(result)
@@ -344,6 +370,11 @@ def experiment_event_features_on_off(
         strategy_name=strategy_name,
         symbol=symbol,
         timeframe=timeframe,
+        signal_confirmation_bars=1,
+        use_trend_filter=False,
+        trend_ema_window=200,
+        take_profit_pct=None,
+        stop_loss_pct=None,
     )
     
     result_with_dict = _extract_results(result_with_events)
@@ -361,6 +392,124 @@ def experiment_event_features_on_off(
     logger.info("[Research] Event Features Comparison:")
     logger.info(f"  With events: return={result_with_dict['total_return']:.4f}, sharpe={result_with_dict['sharpe']:.4f}, trades={result_with_dict['trades']}")
     logger.warning("[Research]    Without events: Not implemented (requires model modification)")
+    
+    return results
+
+
+def experiment_feature_presets(
+    strategy_name: str = "ml_xgb",
+    symbol: str = "BTCUSDT",
+    timeframe: str = "1m",
+    long_threshold: float | None = None,
+    short_threshold: float | None = None,
+    use_optimized_threshold: bool = False,
+    model_paths: dict[str, str] | None = None,
+) -> List[Dict[str, Any]]:
+    """
+    Compare backtest results across different feature presets.
+    
+    This experiment requires pre-trained models for each preset.
+    If model_paths is not provided, it will attempt to use default paths
+    with preset suffixes.
+    
+    Args:
+        strategy_name: Strategy identifier
+        symbol: Trading symbol
+        timeframe: Timeframe
+        long_threshold: Optional long threshold override
+        short_threshold: Optional short threshold override
+        use_optimized_threshold: Whether to use optimized thresholds
+        model_paths: Dict mapping preset names to model file paths
+            Example: {"base": "data/models/ml_xgb_base.pkl", ...}
+            If None, will attempt to construct paths from default model path
+    
+    Returns:
+        List of experiment results
+    """
+    logger.info("=" * 60)
+    logger.info("[Research] Experiment: Feature Presets Comparison")
+    logger.info("=" * 60)
+    
+    if model_paths is None:
+        # Try to construct default paths
+        from src.core.config import settings
+        from pathlib import Path
+        
+        base_model_path = Path(settings.XGB_MODEL_PATH)
+        model_paths = {
+            "base": str(base_model_path),
+            "extended_safe": str(base_model_path.parent / f"{base_model_path.stem}_extended_safe{base_model_path.suffix}"),
+            "extended_full": str(base_model_path.parent / f"{base_model_path.stem}_extended_full{base_model_path.suffix}"),
+        }
+        logger.info(f"[Research] Using default model paths: {model_paths}")
+    
+    results = []
+    presets_to_test = ["base", "extended_safe", "extended_full"]
+    
+    for preset in presets_to_test:
+        if preset not in model_paths:
+            logger.warning(f"[Research] Model path not provided for preset '{preset}'. Skipping.")
+            continue
+        
+        model_path = model_paths[preset]
+        if not Path(model_path).exists():
+            logger.warning(f"[Research] Model file not found: {model_path}. Skipping preset '{preset}'.")
+            continue
+        
+        logger.info(f"[Research] Testing preset: {preset} (model: {model_path})")
+        
+        # Note: This experiment assumes models are already trained.
+        # For now, we'll run backtest with the existing model loading mechanism.
+        # In a full implementation, we might need to modify run_backtest_with_ml
+        # to accept a model_path parameter, or create a wrapper that loads the model
+        # before calling run_backtest_with_ml.
+        
+        # For now, log a note that this requires manual model switching
+        logger.warning(
+            f"[Research] ⚠️  Feature preset experiment requires model switching. "
+            f"Current implementation assumes models are pre-trained and available. "
+            f"To fully test this, you need to: "
+            f"1. Train models with each preset (--feature-preset flag)"
+            f"2. Modify run_backtest_with_ml to accept model_path parameter"
+            f"3. Or manually switch models between runs"
+        )
+        
+        # For now, we'll just run with base preset and log the structure
+        # A full implementation would require model path injection in run_backtest_with_ml
+        result = run_backtest_with_ml(
+            long_threshold=long_threshold,
+            short_threshold=short_threshold,
+            use_optimized_threshold=use_optimized_threshold,
+            strategy_name=strategy_name,
+            symbol=symbol,
+            timeframe=timeframe,
+            signal_confirmation_bars=1,
+            use_trend_filter=False,
+            trend_ema_window=200,
+            take_profit_pct=None,
+            stop_loss_pct=None,
+        )
+        
+        result_dict = _extract_results(result)
+        result_dict["sharpe"] = _calculate_sharpe(result["equity_curve"])
+        results.append({
+            "experiment": "feature_presets",
+            "params": {
+                "preset": preset,
+                "model_path": model_path,
+            },
+            "results": result_dict,
+        })
+    
+    # Summary table
+    if results:
+        logger.info("[Research] Feature Presets Summary:")
+        logger.info("  Preset         | Return   | Sharpe  | Trades | Win Rate")
+        logger.info("  " + "-" * 60)
+        for res in results:
+            preset = res["params"]["preset"]
+            r = res["results"]
+            logger.info(f"  {preset:14} | {r['total_return']:8.4f} | {r['sharpe']:7.4f} | {r['trades']:6} | {r['win_rate']:8.2%}")
     
     return results
 

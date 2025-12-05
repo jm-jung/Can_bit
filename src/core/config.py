@@ -175,6 +175,83 @@ class Settings(BaseSettings):
         default=0.0005,
         description="Slippage rate per trade side (0.0005 = 0.05% = 5 bps)"
     )
+    
+    # Phase E: ML Pipeline Structural Improvements
+    # Feature Scaling
+    ML_SCALER_TYPE: str = Field(
+        default="none",
+        description="Feature scaler type: 'standard', 'robust', 'minmax', or 'none'"
+    )
+    
+    # Labeling (Phase E defaults)
+    ML_LABEL_MODE: str = Field(
+        default="classification",
+        description="Label mode: 'classification' or 'regression'"
+    )
+    ML_LABEL_LONG_THRESHOLD: float = Field(
+        default=0.0030,
+        description="Long label threshold (0.0030 = 0.3%)"
+    )
+    ML_LABEL_SHORT_THRESHOLD: float = Field(
+        default=0.0030,
+        description="Short label threshold (0.0030 = 0.3%)"
+    )
+    ML_LABEL_HOLD_THRESHOLD: float = Field(
+        default=0.0010,
+        description="Hold label threshold (0.0010 = 0.1%)"
+    )
+    ML_LABEL_HORIZON: int = Field(
+        default=20,
+        description="Label horizon (number of periods ahead)"
+    )
+    ML_ENABLE_HOLD_LABELS: bool = Field(
+        default=False,
+        description="Enable HOLD labels and exclude them from training"
+    )
+    
+    # Volatility Regime
+    ML_REGIME_ATR_PERCENTILE: float = Field(
+        default=0.70,
+        description="ATR percentile threshold for HIGH_VOL classification"
+    )
+    ML_REGIME_HIGH_VOL_MULTIPLIER: float = Field(
+        default=1.3,
+        description="Threshold multiplier for HIGH_VOL regime"
+    )
+    ML_REGIME_LOW_VOL_MULTIPLIER: float = Field(
+        default=0.8,
+        description="Threshold multiplier for LOW_VOL regime"
+    )
+    
+    # Backtest Trading Logic (Phase E)
+    BACKTEST_MAX_HOLDING_BARS: int | None = Field(
+        default=None,
+        description="Maximum holding bars before auto-close (None = no limit)"
+    )
+    BACKTEST_TP_PERCENT: float | None = Field(
+        default=None,
+        description="Take profit percentage (e.g., 0.003 = 0.3%, None = disabled)"
+    )
+    BACKTEST_SL_PERCENT: float | None = Field(
+        default=None,
+        description="Stop loss percentage (e.g., 0.002 = 0.2%, None = disabled)"
+    )
+    BACKTEST_USE_CONFIDENCE_FILTER: bool = Field(
+        default=False,
+        description="Enable confidence-based entry filter"
+    )
+    BACKTEST_CONFIDENCE_QUANTILE: float = Field(
+        default=0.85,
+        description="Confidence quantile threshold (0.85 = top 15%)"
+    )
+    BACKTEST_CONFIDENCE_LOOKBACK: int = Field(
+        default=100,
+        description="Lookback window for confidence filter"
+    )
+    BACKTEST_DAILY_LOSS_LIMIT: float | None = Field(
+        default=None,
+        description="Daily loss limit (kill switch, None = disabled)"
+    )
 
 
 def load_config_yaml(config_path: str = "config.yaml") -> dict:

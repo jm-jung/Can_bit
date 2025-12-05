@@ -272,7 +272,7 @@ def generate_hyperparameter_grid(
 
 
 def tune_xgb_hyperparameters(
-    horizon: int = 5,
+    horizon: int = 30,
     n_folds: int = 3,
     metric: str = "roc_auc",
     use_events: bool | None = None,
@@ -284,7 +284,7 @@ def tune_xgb_hyperparameters(
     Tune XGBoost hyperparameters using time-series cross-validation.
     
     Args:
-        horizon: Number of periods ahead to predict
+        horizon: Number of periods ahead to predict (default: 30)
         n_folds: Number of CV folds
         metric: Metric to optimize ("roc_auc", "logloss", "accuracy")
         use_events: Whether to use event features (default: from settings)

@@ -80,13 +80,42 @@ def ml_xgb_strategy(
                 signal="HOLD",
             )
 
-        proba_up = model.predict_proba_latest(df)
+        # Check if model supports separate LONG/SHORT predictions
+        has_separate_models = getattr(model, "has_separate_models", lambda: False)()
+        
+        if has_separate_models:
+            # Use separate LONG/SHORT models
+            proba_long, proba_short = model.predict_proba_latest(
+                df, 
+                symbol=symbol, 
+                timeframe=timeframe,
+                return_both=True
+            )
+            proba_up = proba_long  # For backward compatibility in output
+        else:
+            # Single model (backward compatibility)
+            proba_up = model.predict_proba_latest(df, symbol=symbol, timeframe=timeframe)
+            proba_long = proba_up
+            proba_short = 1.0 - proba_up  # Approximate
+        
         last_row = df.iloc[-1]
 
-        # Determine signal based on probability thresholds
-        if proba_up >= long_threshold:
+        # Determine signal based on probability thresholds (using separate LONG/SHORT proba)
+        is_long = proba_long >= long_threshold if long_threshold is not None else False
+        is_short = proba_short >= short_threshold if short_threshold is not None else False
+        
+        # Conflict resolution: if both are true, choose the one with larger margin
+        if is_long and is_short:
+            margin_long = proba_long - long_threshold if long_threshold is not None else 0.0
+            margin_short = proba_short - short_threshold if short_threshold is not None else 0.0
+            if margin_long >= margin_short:
+                is_short = False  # Prefer LONG
+            else:
+                is_long = False  # Prefer SHORT
+        
+        if is_long:
             signal: Signal = "LONG"
-        elif short_threshold is not None and proba_up <= short_threshold:
+        elif is_short:
             signal = "SHORT"
         else:
             signal = "HOLD"
@@ -94,7 +123,7 @@ def ml_xgb_strategy(
         return MLStrategyOutput(
             timestamp=str(last_row["timestamp"]),
             close=float(last_row["close"]),
-            proba_up=proba_up,
+            proba_up=proba_up,  # For backward compatibility
             signal=signal,
         )
 

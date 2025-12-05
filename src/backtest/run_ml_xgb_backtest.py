@@ -83,6 +83,43 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Run research experiments instead of normal backtest",
     )
+    parser.add_argument(
+        "--signal-confirmation-bars",
+        type=int,
+        default=1,
+        help="Number of consecutive bars required to confirm signal (default: 1, no smoothing)",
+    )
+    parser.add_argument(
+        "--use-trend-filter",
+        action="store_true",
+        default=False,
+        help="Apply EMA-based trend filter (default: False)",
+    )
+    parser.add_argument(
+        "--trend-ema-window",
+        type=int,
+        default=200,
+        help="EMA window for trend filter (default: 200)",
+    )
+    parser.add_argument(
+        "--take-profit-pct",
+        type=float,
+        default=None,
+        help="Take profit percentage (e.g., 0.003 = 0.3%), None to disable (default: None)",
+    )
+    parser.add_argument(
+        "--stop-loss-pct",
+        type=float,
+        default=None,
+        help="Stop loss percentage (e.g., 0.002 = 0.2%), None to disable (default: None)",
+    )
+    parser.add_argument(
+        "--feature-preset",
+        type=str,
+        default="extended_safe",
+        choices=["base", "extended_safe", "extended_full"],
+        help="Feature preset for ml_xgb strategy (default: extended_safe)",
+    )
     
     return parser.parse_args()
 
@@ -138,6 +175,8 @@ def main():
     logger.info("=" * 60)
     logger.info(f"Strategy: {args.strategy}")
     logger.info(f"Symbol: {args.symbol}, Timeframe: {args.timeframe}")
+    if args.strategy == "ml_xgb":
+        logger.info(f"Feature preset: {args.feature_preset}")
     logger.info(f"Start date: {args.start_date or 'All available'}")
     logger.info(f"End date: {args.end_date or 'All available'}")
     logger.info("=" * 60)
@@ -174,6 +213,12 @@ def main():
         strategy_name=args.strategy,
         symbol=args.symbol,
         timeframe=args.timeframe,
+        feature_preset=args.feature_preset,
+        signal_confirmation_bars=args.signal_confirmation_bars,
+        use_trend_filter=args.use_trend_filter,
+        trend_ema_window=args.trend_ema_window,
+        take_profit_pct=args.take_profit_pct,
+        stop_loss_pct=args.stop_loss_pct,
     )
     
     # Print summary

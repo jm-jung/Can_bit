@@ -33,6 +33,7 @@ def run_threshold_optimization_for_ml_strategy(
     strategy_name: str = "ml_xgb",
     symbol: str = "BTCUSDT",
     timeframe: str = "1m",
+    feature_preset: str = "extended_safe",
     metric_name: str | None = None,
     long_threshold_min: float | None = None,
     long_threshold_max: float | None = None,
@@ -41,6 +42,8 @@ def run_threshold_optimization_for_ml_strategy(
     short_threshold_max: float | None = None,
     short_threshold_step: float | None = None,
     save_result: bool = True,
+    use_parallel: bool = True,
+    n_jobs: int = -1,
 ) -> ThresholdOptimizerResult:
     """
     Run threshold optimization for ML strategy.
@@ -90,10 +93,22 @@ def run_threshold_optimization_for_ml_strategy(
     logger.info("=" * 60)
     logger.info(f"Strategy: {strategy_name}")
     logger.info(f"Symbol: {symbol}, Timeframe: {timeframe}")
+    if strategy_name == "ml_xgb":
+        logger.info(f"Feature preset: {feature_preset}")
     logger.info(f"Metric: {metric_name}")
     logger.info(f"Long threshold range: [{long_min:.3f}, {long_max:.3f}] step={long_step:.3f}")
     logger.info(f"Short threshold range: [{short_min:.3f}, {short_max:.3f}] step={short_step:.3f}")
     logger.info(f"Total combinations: {len(long_candidates) * len(short_candidates)}")
+    logger.info(
+        "Running ML threshold optimization: strategy=%s, symbol=%s, timeframe=%s, "
+        "feature_preset=%s, use_parallel=%s, n_jobs=%s",
+        strategy_name,
+        symbol,
+        timeframe,
+        feature_preset,
+        use_parallel,
+        n_jobs,
+    )
     logger.info("=" * 60)
     
     # Data loader (closure with fixed params)
@@ -115,11 +130,15 @@ def run_threshold_optimization_for_ml_strategy(
             strategy_name=strategy_name,
             symbol=symbol,
             timeframe=timeframe,
+            feature_preset=feature_preset,
         ),
         strategy_name=strategy_name,
         use_overfit_aware=True,
         symbol=symbol,
         timeframe=timeframe,
+        feature_preset=feature_preset,
+        use_parallel=use_parallel,
+        n_jobs=n_jobs,
     )
     
     # Save result if requested
@@ -160,6 +179,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--strategy", type=str, default="ml_xgb", choices=list(STRATEGY_REGISTRY.keys()))
     parser.add_argument("--symbol", type=str, default="BTCUSDT")
     parser.add_argument("--timeframe", type=str, default="1m")
+    parser.add_argument("--feature-preset", type=str, default="extended_safe", 
+                       choices=["base", "extended_safe", "extended_full"],
+                       help="Feature preset for ml_xgb strategy (default: extended_safe)")
     parser.add_argument("--metric", type=str, default=None, help="Metric name (e.g., sharpe)")
     parser.add_argument("--long-min", type=float, default=None)
     parser.add_argument("--long-max", type=float, default=None)
@@ -168,6 +190,30 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--short-max", type=float, default=None)
     parser.add_argument("--short-step", type=float, default=None)
     parser.add_argument("--no-save", action="store_true", help="Do not save JSON result")
+    
+    # Parallel execution options
+    parallel_group = parser.add_mutually_exclusive_group()
+    parallel_group.add_argument(
+        "--use-parallel",
+        dest="use_parallel",
+        action="store_true",
+        help="Use parallel execution for threshold optimization (default).",
+    )
+    parallel_group.add_argument(
+        "--no-parallel",
+        dest="use_parallel",
+        action="store_false",
+        help="Disable parallel execution for threshold optimization.",
+    )
+    parser.set_defaults(use_parallel=True)
+    
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=-1,
+        help="Number of worker processes for parallel execution (default: -1 = use all CPUs).",
+    )
+    
     return parser.parse_args()
 
 
@@ -178,6 +224,7 @@ if __name__ == "__main__":
         strategy_name=args.strategy,
         symbol=args.symbol,
         timeframe=args.timeframe,
+        feature_preset=args.feature_preset,
         metric_name=args.metric,
         long_threshold_min=args.long_min,
         long_threshold_max=args.long_max,
@@ -186,5 +233,7 @@ if __name__ == "__main__":
         short_threshold_max=args.short_max,
         short_threshold_step=args.short_step,
         save_result=not args.no_save,
+        use_parallel=args.use_parallel,
+        n_jobs=args.n_jobs,
     )
 

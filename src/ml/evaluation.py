@@ -29,7 +29,8 @@ def evaluate_ml_split(
     split_name: str,
     thresholds: list[float] | None = None,
     logger_instance: logging.Logger | None = None,
-) -> None:
+    return_metrics: bool = False,
+) -> dict[str, Any] | None:
     """
     Evaluate ML model on a split (train/valid/test) and log metrics.
     
@@ -42,15 +43,48 @@ def evaluate_ml_split(
         split_name: Name of the split (e.g., "Train", "Validation", "Test")
         thresholds: List of probability thresholds to test (default: [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60])
         logger_instance: Logger instance (if None, uses module logger)
+        return_metrics: If True, return dict with metrics for each threshold
+    
+    Returns:
+        If return_metrics=True, returns dict with keys:
+        - "threshold_metrics": List of dicts with keys: threshold, precision, recall, f1, tp, fp, fn
+        - "default_metrics": Dict with default threshold=0.5 metrics
+        - "roc_auc": ROC-AUC score
+        Otherwise returns None
     """
     if logger_instance is None:
         logger_instance = logger
     
+    # Check for empty X
+    if X is None or len(X) == 0:
+        logger_instance.warning("[ML Eval] Split '%s' has empty X. Skipping evaluation.", split_name)
+        return None
+    
     if thresholds is None:
         thresholds = [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60]
     
-    # Get predictions
-    y_proba = model.predict_proba(X)[:, 1]  # Probability of positive class
+    # Get predictions with defensive checks
+    try:
+        proba = model.predict_proba(X)
+    except Exception as e:
+        logger_instance.error(
+            "[ML Eval] predict_proba failed for split '%s': %s. X shape=%s",
+            split_name, str(e), X.shape if hasattr(X, 'shape') else 'unknown'
+        )
+        raise
+    
+    # Check predict_proba shape
+    if proba.ndim != 2 or proba.shape[1] < 2:
+        logger_instance.error(
+            "[ML Eval] Unexpected predict_proba shape for split '%s': %s (expected (n_samples, 2)).",
+            split_name, proba.shape
+        )
+        raise ValueError(
+            f"Unexpected predict_proba shape: {proba.shape} (expected (n_samples, 2)). "
+            f"Split: {split_name}, X shape: {X.shape if hasattr(X, 'shape') else 'unknown'}"
+        )
+    
+    y_proba = proba[:, 1]  # Probability of positive class
     y_labels = np.array(y) if not isinstance(y, np.ndarray) else y
     
     # Calculate metrics at default threshold (0.5)
@@ -103,6 +137,9 @@ def evaluate_ml_split(
     )
     logger_instance.info("-" * 60)
     
+    # Store metrics for each threshold if return_metrics is True
+    threshold_metrics_list = []
+    
     for thresh in thresholds:
         y_pred = (y_proba >= thresh).astype(int)
         cm = confusion_matrix(y_labels, y_pred)
@@ -128,7 +165,39 @@ def evaluate_ml_split(
             f"{thresh:<12.2f} {precision:<12.4f} {recall:<12.4f} {f1:<12.4f} "
             f"{tp:<8} {fp:<8} {fn:<8}"
         )
+        
+        if return_metrics:
+            threshold_metrics_list.append({
+                "threshold": thresh,
+                "precision": float(precision),
+                "recall": float(recall),
+                "f1": float(f1),
+                "tp": int(tp),
+                "fp": int(fp),
+                "fn": int(fn),
+                "tn": int(tn),
+            })
+    
     logger_instance.info("-" * 60)
+    
+    if return_metrics:
+        return {
+            "threshold_metrics": threshold_metrics_list,
+            "default_metrics": {
+                "threshold": 0.5,
+                "accuracy": float(accuracy),
+                "precision": float(precision_default),
+                "recall": float(recall_default),
+                "f1": float(f1_default),
+                "roc_auc": float(roc_auc),
+                "tp": int(tp_default),
+                "fp": int(fp_default),
+                "fn": int(fn_default),
+                "tn": int(tn_default),
+            },
+            "roc_auc": float(roc_auc),
+        }
+    return None
 
 
 def log_label_distribution(

@@ -1,0 +1,32 @@
+{
+  "timestamp": "20251201_181439",
+  "strategy": "ml_xgb",
+  "symbol": "BTCUSDT",
+  "timeframe": "1m",
+  "feature_preset": "extended_safe",
+  "horizon": 30,
+  "label_threshold": 0.001,
+  "best_threshold": 0.4,
+  "best_validation_f1": 0.5748792226643563,
+  "train_metrics": {
+    "roc_auc": 0.8449748861296562,
+    "accuracy": 0.7841596130592503,
+    "precision": 0.713128038886335,
+    "recall": 0.7096774193433923,
+    "f1": 0.7113985398551403
+  },
+  "valid_metrics": {
+    "roc_auc": 0.5689900426742532,
+    "accuracy": 0.504225352112676,
+    "precision": 0.423487544468915,
+    "recall": 0.8947368420379896,
+    "f1": 0.5748792226643563
+  },
+  "test_metrics": {
+    "roc_auc": 0.5032984337759618,
+    "accuracy": 0.3183098591549296,
+    "precision": 0.2499999999918831,
+    "recall": 0.8749999999005682,
+    "f1": 0.3888888854124579
+  }
+}

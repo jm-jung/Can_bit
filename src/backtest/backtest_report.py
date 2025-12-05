@@ -153,6 +153,9 @@ def print_backtest_summary(result: BacktestResult, strategy_name: str = "ML Stra
     print(f"Win Rate: {result['win_rate']:.2%}")
     print(f"Max Drawdown: {result['max_drawdown']:.2%}")
     print(f"Total Trades: {result['total_trades']} (Long: {result['long_trades']}, Short: {result['short_trades']})")
+    # Note: HOLD count is logged separately in engine.py, not included in total_trades
+    if 'hold_count' in result:
+        print(f"HOLD Signals: {result['hold_count']} (not included in trades)")
     print(f"Avg Profit: {result['avg_profit']:.4%}")
     print(f"Avg Win: {result['avg_win']:.4%}")
     print(f"Avg Loss: {result['avg_loss']:.4%}")

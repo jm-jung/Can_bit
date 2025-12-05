@@ -1,0 +1,475 @@
+{
+  "timestamp": "20251203_141720",
+  "strategy": "ml_xgb",
+  "symbol": "BTCUSDT",
+  "timeframe": "1m",
+  "feature_preset": "extended_safe",
+  "long_model": {
+    "feature_importance": [
+      {
+        "feature": "low",
+        "gain": 34.20707702636719,
+        "rank": 1
+      },
+      {
+        "feature": "event_count_total",
+        "gain": 22.87163734436035,
+        "rank": 2
+      },
+      {
+        "feature": "event_time_since_last_min",
+        "gain": 20.812292098999023,
+        "rank": 3
+      },
+      {
+        "feature": "event_max_intensity",
+        "gain": 17.44745635986328,
+        "rank": 4
+      },
+      {
+        "feature": "close",
+        "gain": 15.988418579101562,
+        "rank": 5
+      },
+      {
+        "feature": "rolling_mean_20",
+        "gain": 15.864665985107422,
+        "rank": 6
+      },
+      {
+        "feature": "high",
+        "gain": 15.439200401306152,
+        "rank": 7
+      },
+      {
+        "feature": "feat_vol_atr_norm",
+        "gain": 15.146448135375977,
+        "rank": 8
+      },
+      {
+        "feature": "feat_trend_ema20_over_sma20",
+        "gain": 15.045775413513184,
+        "rank": 9
+      },
+      {
+        "feature": "feat_vol_atr_14",
+        "gain": 14.23257827758789,
+        "rank": 10
+      },
+      {
+        "feature": "sma_20",
+        "gain": 14.128730773925781,
+        "rank": 11
+      },
+      {
+        "feature": "feat_trend_dist_close_sma20",
+        "gain": 13.941418647766113,
+        "rank": 12
+      },
+      {
+        "feature": "rolling_std_20",
+        "gain": 12.447558403015137,
+        "rank": 13
+      },
+      {
+        "feature": "ema_20",
+        "gain": 11.633241653442383,
+        "rank": 14
+      },
+      {
+        "feature": "close_sma_ratio",
+        "gain": 11.609817504882812,
+        "rank": 15
+      },
+      {
+        "feature": "volume",
+        "gain": 11.400835990905762,
+        "rank": 16
+      },
+      {
+        "feature": "close_ema_ratio",
+        "gain": 10.406787872314453,
+        "rank": 17
+      },
+      {
+        "feature": "feat_vol_volatility_20",
+        "gain": 10.078728675842285,
+        "rank": 18
+      },
+      {
+        "feature": "rsi_14",
+        "gain": 9.360952377319336,
+        "rank": 19
+      },
+      {
+        "feature": "feat_trend_log_return_3",
+        "gain": 6.980220317840576,
+        "rank": 20
+      },
+      {
+        "feature": "feat_trend_slope_5",
+        "gain": 6.571173191070557,
+        "rank": 21
+      },
+      {
+        "feature": "feat_vol_range_norm",
+        "gain": 6.515469074249268,
+        "rank": 22
+      },
+      {
+        "feature": "feat_trend_log_return_5",
+        "gain": 5.103147506713867,
+        "rank": 23
+      },
+      {
+        "feature": "close_open_pct",
+        "gain": 4.892606735229492,
+        "rank": 24
+      },
+      {
+        "feature": "close_open",
+        "gain": 4.125174522399902,
+        "rank": 25
+      },
+      {
+        "feature": "high_low",
+        "gain": 3.432591676712036,
+        "rank": 26
+      },
+      {
+        "feature": "feat_trend_log_return_1",
+        "gain": 0.24847793579101562,
+        "rank": 27
+      },
+      {
+        "feature": "feat_trend_dist_close_ema20",
+        "gain": 0.0,
+        "rank": 28
+      },
+      {
+        "feature": "feat_trend_ema20_over_close",
+        "gain": 0.0,
+        "rank": 29
+      },
+      {
+        "feature": "feat_trend_sma20_over_close",
+        "gain": 0.0,
+        "rank": 30
+      },
+      {
+        "feature": "feat_vol_tr",
+        "gain": 0.0,
+        "rank": 31
+      },
+      {
+        "feature": "event_sentiment_mean",
+        "gain": 0.0,
+        "rank": 32
+      },
+      {
+        "feature": "event_sentiment_positive_mean",
+        "gain": 0.0,
+        "rank": 33
+      },
+      {
+        "feature": "event_sentiment_negative_mean",
+        "gain": 0.0,
+        "rank": 34
+      },
+      {
+        "feature": "event_count_influencer",
+        "gain": 0.0,
+        "rank": 35
+      },
+      {
+        "feature": "event_share_influencer",
+        "gain": 0.0,
+        "rank": 36
+      },
+      {
+        "feature": "event_count_institution",
+        "gain": 0.0,
+        "rank": 37
+      },
+      {
+        "feature": "event_share_institution",
+        "gain": 0.0,
+        "rank": 38
+      },
+      {
+        "feature": "event_count_macro_policy",
+        "gain": 0.0,
+        "rank": 39
+      },
+      {
+        "feature": "event_share_macro_policy",
+        "gain": 0.0,
+        "rank": 40
+      },
+      {
+        "feature": "event_count_regulation",
+        "gain": 0.0,
+        "rank": 41
+      },
+      {
+        "feature": "event_share_regulation",
+        "gain": 0.0,
+        "rank": 42
+      },
+      {
+        "feature": "event_count_geopolitical",
+        "gain": 0.0,
+        "rank": 43
+      },
+      {
+        "feature": "event_share_geopolitical",
+        "gain": 0.0,
+        "rank": 44
+      },
+      {
+        "feature": "event_count_market_structure",
+        "gain": 0.0,
+        "rank": 45
+      },
+      {
+        "feature": "event_share_market_structure",
+        "gain": 0.0,
+        "rank": 46
+      }
+    ]
+  },
+  "short_model": {
+    "feature_importance": [
+      {
+        "feature": "event_time_since_last_min",
+        "gain": 23.87691307067871,
+        "rank": 1
+      },
+      {
+        "feature": "ema_20",
+        "gain": 21.15639305114746,
+        "rank": 2
+      },
+      {
+        "feature": "sma_20",
+        "gain": 20.879491806030273,
+        "rank": 3
+      },
+      {
+        "feature": "feat_vol_atr_norm",
+        "gain": 14.449740409851074,
+        "rank": 4
+      },
+      {
+        "feature": "rolling_mean_20",
+        "gain": 14.446160316467285,
+        "rank": 5
+      },
+      {
+        "feature": "close",
+        "gain": 13.743912696838379,
+        "rank": 6
+      },
+      {
+        "feature": "high",
+        "gain": 13.26753044128418,
+        "rank": 7
+      },
+      {
+        "feature": "low",
+        "gain": 11.182936668395996,
+        "rank": 8
+      },
+      {
+        "feature": "volume",
+        "gain": 10.934502601623535,
+        "rank": 9
+      },
+      {
+        "feature": "feat_vol_atr_14",
+        "gain": 10.874581336975098,
+        "rank": 10
+      },
+      {
+        "feature": "event_sentiment_positive_mean",
+        "gain": 9.44764232635498,
+        "rank": 11
+      },
+      {
+        "feature": "feat_vol_volatility_20",
+        "gain": 8.343006134033203,
+        "rank": 12
+      },
+      {
+        "feature": "feat_trend_slope_5",
+        "gain": 7.990820407867432,
+        "rank": 13
+      },
+      {
+        "feature": "feat_trend_ema20_over_sma20",
+        "gain": 6.705365180969238,
+        "rank": 14
+      },
+      {
+        "feature": "event_share_geopolitical",
+        "gain": 6.635226726531982,
+        "rank": 15
+      },
+      {
+        "feature": "close_sma_ratio",
+        "gain": 5.842167377471924,
+        "rank": 16
+      },
+      {
+        "feature": "feat_vol_range_norm",
+        "gain": 5.740871429443359,
+        "rank": 17
+      },
+      {
+        "feature": "high_low",
+        "gain": 5.622382164001465,
+        "rank": 18
+      },
+      {
+        "feature": "feat_trend_sma20_over_close",
+        "gain": 5.138393402099609,
+        "rank": 19
+      },
+      {
+        "feature": "feat_trend_log_return_5",
+        "gain": 4.868863105773926,
+        "rank": 20
+      },
+      {
+        "feature": "rolling_std_20",
+        "gain": 3.4784798622131348,
+        "rank": 21
+      },
+      {
+        "feature": "close_open",
+        "gain": 3.3319883346557617,
+        "rank": 22
+      },
+      {
+        "feature": "feat_trend_dist_close_ema20",
+        "gain": 3.0642433166503906,
+        "rank": 23
+      },
+      {
+        "feature": "feat_trend_log_return_3",
+        "gain": 2.2277719974517822,
+        "rank": 24
+      },
+      {
+        "feature": "close_ema_ratio",
+        "gain": 2.1133716106414795,
+        "rank": 25
+      },
+      {
+        "feature": "rsi_14",
+        "gain": 0.2719125747680664,
+        "rank": 26
+      },
+      {
+        "feature": "close_open_pct",
+        "gain": 0.0,
+        "rank": 27
+      },
+      {
+        "feature": "feat_trend_log_return_1",
+        "gain": 0.0,
+        "rank": 28
+      },
+      {
+        "feature": "feat_trend_ema20_over_close",
+        "gain": 0.0,
+        "rank": 29
+      },
+      {
+        "feature": "feat_trend_dist_close_sma20",
+        "gain": 0.0,
+        "rank": 30
+      },
+      {
+        "feature": "feat_vol_tr",
+        "gain": 0.0,
+        "rank": 31
+      },
+      {
+        "feature": "event_count_total",
+        "gain": 0.0,
+        "rank": 32
+      },
+      {
+        "feature": "event_sentiment_mean",
+        "gain": 0.0,
+        "rank": 33
+      },
+      {
+        "feature": "event_sentiment_negative_mean",
+        "gain": 0.0,
+        "rank": 34
+      },
+      {
+        "feature": "event_max_intensity",
+        "gain": 0.0,
+        "rank": 35
+      },
+      {
+        "feature": "event_count_influencer",
+        "gain": 0.0,
+        "rank": 36
+      },
+      {
+        "feature": "event_share_influencer",
+        "gain": 0.0,
+        "rank": 37
+      },
+      {
+        "feature": "event_count_institution",
+        "gain": 0.0,
+        "rank": 38
+      },
+      {
+        "feature": "event_share_institution",
+        "gain": 0.0,
+        "rank": 39
+      },
+      {
+        "feature": "event_count_macro_policy",
+        "gain": 0.0,
+        "rank": 40
+      },
+      {
+        "feature": "event_share_macro_policy",
+        "gain": 0.0,
+        "rank": 41
+      },
+      {
+        "feature": "event_count_regulation",
+        "gain": 0.0,
+        "rank": 42
+      },
+      {
+        "feature": "event_share_regulation",
+        "gain": 0.0,
+        "rank": 43
+      },
+      {
+        "feature": "event_count_geopolitical",
+        "gain": 0.0,
+        "rank": 44
+      },
+      {
+        "feature": "event_count_market_structure",
+        "gain": 0.0,
+        "rank": 45
+      },
+      {
+        "feature": "event_share_market_structure",
+        "gain": 0.0,
+        "rank": 46
+      }
+    ]
+  }
+}

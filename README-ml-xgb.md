@@ -10,14 +10,15 @@
 
 **정의**:
 - 미래 수익률 계산: `r = (price_{t+horizon} / price_t - 1)`
-- 라벨: `y = 1` if `r > 0` (상승), `y = 0` otherwise (하락 또는 동일)
-- Horizon: 기본값 5 (1분봉 기준 5분 후 예측)
+- 라벨: `y = 1` if `r > 0.001` (0.1% 이상 상승), `y = 0` otherwise (하락 또는 동일)
+- Horizon: 기본값 30 (1분봉 기준 30분 후 예측)
+- Threshold: 0.001 (0.1%) - 노이즈 필터링 및 의미 있는 가격 변동만 학습
 - TP/SL: 라벨 생성 단계에서는 없음. 백테스트에서 threshold 기반 진입/청산
 
 **특징**:
 - 1분봉 특성상 짧은 horizon(5분)은 노이즈에 민감할 수 있음
-- 긴 horizon은 중간 변동을 놓칠 수 있음
-- 현재 설정(horizon=5)은 실용적인 균형점
+- horizon=30은 중기 트렌드를 포착하면서도 노이즈를 줄임
+- threshold=0.001은 작은 변동을 필터링하여 더 의미 있는 신호만 학습
 
 ## 1. XGB 학습
 
@@ -30,7 +31,7 @@ python -m src.ml.train_xgb
 또는 옵션 지정:
 
 ```bash
-python -m src.ml.train_xgb --horizon 5 --use-events
+python -m src.ml.train_xgb --horizon 30 --use-events
 ```
 
 ### 하이퍼파라미터 튜닝 + 학습
@@ -44,7 +45,7 @@ python -m src.ml.train_xgb --tune-xgb --cv-folds 3 --max-trials 30 --metric roc_
 - `--cv-folds 3`: Time-series CV 폴드 수 (기본: 3)
 - `--max-trials 30`: 최대 하이퍼파라미터 조합 수 (기본: 30)
 - `--metric roc_auc`: 최적화할 메트릭 (`roc_auc`, `logloss`, `accuracy`)
-- `--horizon 5`: 예측 horizon (기본: 5)
+- `--horizon 30`: 예측 horizon (기본: 30)
 - `--use-events`: 이벤트 피처 사용 (기본: settings.EVENTS_ENABLED)
 - `--no-events`: 이벤트 피처 비활성화
 
@@ -215,7 +216,7 @@ python test_ml_backtest_debug.py
 2. **시간 순서**: Time-series 데이터이므로 시간 순서 유지 필수
 3. **수수료/슬리피지**: 실전과 유사한 수준으로 설정 권장
 4. **과적합**: Train 성능이 Valid/Test보다 크게 높으면 재검토 필요
-5. **Horizon**: 1분봉 특성상 너무 짧거나 긴 horizon은 성능 저하 가능
+5. **Horizon**: 기본값 30분은 중기 트렌드를 포착하면서 노이즈를 줄임. threshold=0.001로 작은 변동 필터링
 
 ## 10. 문제 해결
 
