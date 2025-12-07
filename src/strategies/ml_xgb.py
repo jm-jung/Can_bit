@@ -12,6 +12,7 @@ from src.core.config import settings
 from src.indicators.basic import get_df_with_indicators
 from src.ml.xgb_model import get_xgb_model
 from src.strategies.ml_thresholds import resolve_ml_thresholds
+from src.strategies.strategy_mode import StrategyMode
 
 Signal = Literal["LONG", "SHORT", "HOLD"]
 
@@ -31,6 +32,7 @@ def ml_xgb_strategy(
     long_threshold: float | None = None,
     short_threshold: float | None = None,
     use_optimized_thresholds: bool = True,
+    strategy_mode: str | StrategyMode = "both",
     *,
     strategy_name: str = "ml_xgb",
     symbol: str | None = None,
@@ -43,6 +45,7 @@ def ml_xgb_strategy(
         long_threshold: Probability threshold for LONG signal (default: 0.5)
         short_threshold: Probability threshold for SHORT signal (default: None, disabled)
         use_optimized_thresholds: If True, try to load optimized thresholds from JSON file
+        strategy_mode: Strategy mode ("both", "long_only", "short_only") or StrategyMode enum
         strategy_name: Strategy identifier for threshold lookup
         symbol: Optional override for symbol when resolving optimized thresholds
         timeframe: Optional override for timeframe when resolving optimized thresholds
@@ -50,12 +53,21 @@ def ml_xgb_strategy(
     Rules:
     - proba_up >= long_threshold → LONG
     - proba_up <= short_threshold → SHORT (if short_threshold is not None)
+    - Strategy mode affects which signals are generated:
+      - "both": Both LONG and SHORT signals (conflict resolution applied)
+      - "long_only": Only LONG signals (short_threshold ignored)
+      - "short_only": Only SHORT signals (long_threshold ignored)
     - Otherwise → HOLD
     - Model or data failure → proba_up=None, signal="HOLD"
 
     Returns:
         MLStrategyOutput with prediction and signal
     """
+    # Convert strategy_mode to enum
+    if isinstance(strategy_mode, str):
+        mode = StrategyMode.from_string(strategy_mode)
+    else:
+        mode = strategy_mode
     long_threshold, short_threshold = resolve_ml_thresholds(
         long_threshold=long_threshold,
         short_threshold=short_threshold,
@@ -100,18 +112,29 @@ def ml_xgb_strategy(
         
         last_row = df.iloc[-1]
 
-        # Determine signal based on probability thresholds (using separate LONG/SHORT proba)
-        is_long = proba_long >= long_threshold if long_threshold is not None else False
-        is_short = proba_short >= short_threshold if short_threshold is not None else False
-        
-        # Conflict resolution: if both are true, choose the one with larger margin
-        if is_long and is_short:
-            margin_long = proba_long - long_threshold if long_threshold is not None else 0.0
-            margin_short = proba_short - short_threshold if short_threshold is not None else 0.0
-            if margin_long >= margin_short:
-                is_short = False  # Prefer LONG
-            else:
-                is_long = False  # Prefer SHORT
+        # Determine signal based on probability thresholds and strategy mode
+        # Strategy mode affects which conditions are checked
+        if mode == StrategyMode.LONG_ONLY:
+            # Only check long condition
+            is_long = proba_long >= long_threshold if long_threshold is not None else False
+            is_short = False  # Ignore short condition
+        elif mode == StrategyMode.SHORT_ONLY:
+            # Only check short condition
+            is_long = False  # Ignore long condition
+            is_short = proba_short >= short_threshold if short_threshold is not None else False
+        else:  # StrategyMode.BOTH
+            # Check both conditions
+            is_long = proba_long >= long_threshold if long_threshold is not None else False
+            is_short = proba_short >= short_threshold if short_threshold is not None else False
+            
+            # Conflict resolution: if both are true, choose the one with larger margin
+            if is_long and is_short:
+                margin_long = proba_long - long_threshold if long_threshold is not None else 0.0
+                margin_short = proba_short - short_threshold if short_threshold is not None else 0.0
+                if margin_long >= margin_short:
+                    is_short = False  # Prefer LONG
+                else:
+                    is_long = False  # Prefer SHORT
         
         if is_long:
             signal: Signal = "LONG"

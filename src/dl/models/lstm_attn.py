@@ -1,5 +1,10 @@
 """
 LSTM + Attention model for time series classification.
+
+This model supports 3-class classification (FLAT/LONG/SHORT):
+- Class 0: FLAT (ambiguous/neutral zone)
+- Class 1: LONG (strong upward movement expected)
+- Class 2: SHORT (strong downward movement expected)
 """
 from __future__ import annotations
 
@@ -10,15 +15,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.dl.data.labels import LstmClassIndex
+
 
 class LSTMAttentionModel(nn.Module):
     """
-    LSTM with Attention mechanism for binary classification.
+    LSTM with Attention mechanism for 3-class classification.
     
     Architecture:
     - 2-layer LSTM
     - Attention layer over LSTM outputs
-    - MLP for final classification
+    - MLP for final classification (3-class softmax)
+    
+    Output:
+    - Raw logits of shape (batch, 3) for CrossEntropyLoss
+    - Apply softmax during inference to get probabilities
     """
 
     def __init__(
@@ -67,13 +78,13 @@ class LSTMAttentionModel(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-        # MLP for final classification
+        # MLP for final classification (3-class)
         # BUGFIX: 마지막 레이어에 명시적 이름 부여하여 디버깅 용이하게
         self.classifier = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, 1),
+            nn.Linear(hidden_size // 2, 3),  # 3-class: FLAT, LONG, SHORT
         )
         # 마지막 Linear 레이어를 별도로 참조 가능하게 (디버깅용)
         self.fc_out = self.classifier[-1]
@@ -99,7 +110,8 @@ class LSTMAttentionModel(nn.Module):
             x: Input tensor of shape (batch, seq_len, feature_dim)
 
         Returns:
-            Raw logit tensor of shape (batch, 1) - sigmoid는 적용하지 않음
+            Raw logits tensor of shape (batch, 3) - softmax는 적용하지 않음
+            Logits correspond to [FLAT, LONG, SHORT] classes
         """
         # LSTM forward
         # BUGFIX: gradient가 제대로 흐르도록 detach나 no_grad 사용하지 않음
@@ -116,13 +128,14 @@ class LSTMAttentionModel(nn.Module):
         # BUGFIX: gradient가 attention_weights와 lstm_out 모두를 통해 흐르도록
         context = torch.sum(attention_weights * lstm_out, dim=1)  # (batch, hidden_size)
 
-        # Final classification
-        # BUGFIX: sigmoid를 적용하지 않고 raw logit 반환
-        logit = self.classifier(context)  # (batch, 1)
+        # Final classification (3-class)
+        # BUGFIX: softmax를 적용하지 않고 raw logits 반환
+        logits = self.classifier(context)  # (batch, 3)
 
-        # NOTE: 여기서는 sigmoid 안 씌우고 raw logit만 반환한다.
-        # 손실 계산은 BCEWithLogitsLoss가 내부에서 sigmoid까지 처리한다.
-        return logit
+        # NOTE: 여기서는 softmax 안 씌우고 raw logits만 반환한다.
+        # 손실 계산은 CrossEntropyLoss가 내부에서 softmax까지 처리한다.
+        # 추론 시점에는 F.softmax(logits, dim=-1)를 적용하여 확률을 얻는다.
+        return logits
 
     def save_model(self, path: str | Path) -> None:
         """

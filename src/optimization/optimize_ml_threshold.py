@@ -44,6 +44,14 @@ def run_threshold_optimization_for_ml_strategy(
     save_result: bool = True,
     use_parallel: bool = True,
     n_jobs: int = -1,
+    rebuild_proba_cache: bool = False,
+    nthread: int | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    strategy_mode: str | None = None,
+    min_trades_in: int | None = None,
+    min_trades_out: int | None = None,
+    min_sharpe_out: float | None = None,
 ) -> ThresholdOptimizerResult:
     """
     Run threshold optimization for ML strategy.
@@ -60,6 +68,14 @@ def run_threshold_optimization_for_ml_strategy(
         short_threshold_max: Maximum short threshold (default: from settings)
         short_threshold_step: Step size for short threshold (default: from settings)
         save_result: If True, save result to JSON file
+        rebuild_proba_cache: If True, force rebuild of prediction cache even if cache exists
+        nthread: Number of CPU threads for XGBoost prediction (default: auto-detected)
+        start_date: Filter OHLCV and predictions to samples at or after this date (YYYY-MM-DD format)
+        end_date: Filter OHLCV and predictions to samples at or before this date (YYYY-MM-DD format)
+        strategy_mode: Strategy mode ("both", "long_only", "short_only") or None for default
+        min_trades_in: Minimum trades in in-sample period (default: from config)
+        min_trades_out: Minimum trades in out-of-sample period (default: from config)
+        min_sharpe_out: Minimum acceptable out-of-sample Sharpe (default: from config)
     
     Returns:
         ThresholdOptimizerResult
@@ -95,10 +111,32 @@ def run_threshold_optimization_for_ml_strategy(
     logger.info(f"Symbol: {symbol}, Timeframe: {timeframe}")
     if strategy_name == "ml_xgb":
         logger.info(f"Feature preset: {feature_preset}")
+    if start_date or end_date:
+        logger.info(f"Date range filter: start_date={start_date}, end_date={end_date}")
     logger.info(f"Metric: {metric_name}")
+    
+    # Resolve strategy_mode and min requirements for logging
+    resolved_strategy_mode = strategy_mode if strategy_mode is not None else getattr(settings, "ML_STRATEGY_MODE_DEFAULT", "both")
+    resolved_min_trades_in = min_trades_in if min_trades_in is not None else getattr(settings, "MIN_TRADES_IN_DEFAULT", 500)
+    resolved_min_trades_out = min_trades_out if min_trades_out is not None else getattr(settings, "MIN_TRADES_OUT_DEFAULT", 50)
+    resolved_min_sharpe_out = min_sharpe_out if min_sharpe_out is not None else getattr(settings, "MIN_SHARPE_OUT_DEFAULT", 0.0)
+    
+    logger.info(f"Strategy mode: {resolved_strategy_mode}")
+    logger.info(f"Optimization constraints: min_trades_in={resolved_min_trades_in}, min_trades_out={resolved_min_trades_out}, min_sharpe_out={resolved_min_sharpe_out}")
     logger.info(f"Long threshold range: [{long_min:.3f}, {long_max:.3f}] step={long_step:.3f}")
     logger.info(f"Short threshold range: [{short_min:.3f}, {short_max:.3f}] step={short_step:.3f}")
     logger.info(f"Total combinations: {len(long_candidates) * len(short_candidates)}")
+    
+    # Resolve strategy_mode and min requirements
+    if strategy_mode is None:
+        strategy_mode = getattr(settings, "ML_STRATEGY_MODE_DEFAULT", "both")
+    if min_trades_in is None:
+        min_trades_in = getattr(settings, "MIN_TRADES_IN_DEFAULT", 500)
+    if min_trades_out is None:
+        min_trades_out = getattr(settings, "MIN_TRADES_OUT_DEFAULT", 50)
+    if min_sharpe_out is None:
+        min_sharpe_out = getattr(settings, "MIN_SHARPE_OUT_DEFAULT", 0.0)
+    
     logger.info(
         "Running ML threshold optimization: strategy=%s, symbol=%s, timeframe=%s, "
         "feature_preset=%s, use_parallel=%s, n_jobs=%s",
@@ -108,6 +146,13 @@ def run_threshold_optimization_for_ml_strategy(
         feature_preset,
         use_parallel,
         n_jobs,
+    )
+    logger.info(
+        "Strategy mode: %s, min_trades_in=%d, min_trades_out=%d, min_sharpe_out=%.3f",
+        strategy_mode,
+        min_trades_in,
+        min_trades_out,
+        min_sharpe_out,
     )
     logger.info("=" * 60)
     
@@ -139,6 +184,15 @@ def run_threshold_optimization_for_ml_strategy(
         feature_preset=feature_preset,
         use_parallel=use_parallel,
         n_jobs=n_jobs,
+        force_rebuild_proba_cache=rebuild_proba_cache,
+        nthread=nthread,
+        start_date=start_date,
+        end_date=end_date,
+        strategy_mode=strategy_mode,
+        min_trades_in=min_trades_in,
+        min_trades_out=min_trades_out,
+        min_sharpe_out=min_sharpe_out,
+        metric_name=metric_name,  # Pass original metric name for worker reconstruction
     )
     
     # Save result if requested
@@ -158,6 +212,9 @@ def run_threshold_optimization_for_ml_strategy(
     logger.info("=" * 60)
     logger.info("Optimization Complete - Final Summary")
     logger.info("=" * 60)
+    logger.info(f"Strategy: {strategy_name}, Symbol: {symbol}, Timeframe: {timeframe}")
+    if result.strategy_mode:
+        logger.info(f"Strategy mode: {result.strategy_mode}")
     logger.info(f"Best long threshold: {result.best_long_threshold:.3f}")
     logger.info(f"Best short threshold: {result.best_short_threshold}")
     logger.info(f"Best metric value (out-of-sample): {result.best_metric_value:.6f}")
@@ -168,6 +225,12 @@ def run_threshold_optimization_for_ml_strategy(
         logger.info(f"Gap (in - out): {result.gap_in_out:.6f}")
         logger.info(f"Score (overfit-adjusted): {result.score_overfit_adjusted:.6f}")
         logger.info(f"Total trades: in={result.total_trades_in}, out={result.total_trades_out}")
+    
+    if result.min_trades_in is not None or result.min_trades_out is not None or result.min_sharpe_out is not None:
+        logger.info(
+            f"Optimization constraints: min_trades_in={result.min_trades_in}, "
+            f"min_trades_out={result.min_trades_out}, min_sharpe_out={result.min_sharpe_out}"
+        )
     
     logger.info("=" * 60)
     
@@ -190,6 +253,33 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--short-max", type=float, default=None)
     parser.add_argument("--short-step", type=float, default=None)
     parser.add_argument("--no-save", action="store_true", help="Do not save JSON result")
+    
+    # Strategy mode and optimization constraints
+    parser.add_argument(
+        "--strategy-mode",
+        type=str,
+        default=None,
+        choices=["both", "long_only", "short_only"],
+        help="Strategy mode: 'both' (default), 'long_only', or 'short_only'"
+    )
+    parser.add_argument(
+        "--min-trades-in",
+        type=int,
+        default=None,
+        help="Minimum trades required in in-sample period (default: from config)"
+    )
+    parser.add_argument(
+        "--min-trades-out",
+        type=int,
+        default=None,
+        help="Minimum trades required in out-of-sample period (default: from config)"
+    )
+    parser.add_argument(
+        "--min-sharpe-out",
+        type=float,
+        default=None,
+        help="Minimum acceptable out-of-sample Sharpe ratio (default: from config)"
+    )
     
     # Parallel execution options
     parallel_group = parser.add_mutually_exclusive_group()
@@ -214,6 +304,33 @@ def _parse_args() -> argparse.Namespace:
         help="Number of worker processes for parallel execution (default: -1 = use all CPUs).",
     )
     
+    # Prediction cache and XGBoost thread options
+    parser.add_argument(
+        "--rebuild-proba-cache",
+        action="store_true",
+        help="Force rebuild of XGBoost probability cache even if cache file exists.",
+    )
+    parser.add_argument(
+        "--nthread",
+        type=int,
+        default=None,
+        help="Number of CPU threads for XGBoost; if omitted, it will be auto-detected.",
+    )
+    
+    # Date range filtering options
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        default=None,
+        help="Filter OHLCV and ML predictions to samples at or after this date (inclusive). Format: YYYY-MM-DD",
+    )
+    parser.add_argument(
+        "--end-date",
+        type=str,
+        default=None,
+        help="Filter OHLCV and ML predictions to samples at or before this date (inclusive). Format: YYYY-MM-DD",
+    )
+    
     return parser.parse_args()
 
 
@@ -235,5 +352,13 @@ if __name__ == "__main__":
         save_result=not args.no_save,
         use_parallel=args.use_parallel,
         n_jobs=args.n_jobs,
+        rebuild_proba_cache=args.rebuild_proba_cache,
+        nthread=args.nthread,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        strategy_mode=args.strategy_mode,
+        min_trades_in=args.min_trades_in,
+        min_trades_out=args.min_trades_out,
+        min_sharpe_out=args.min_sharpe_out,
     )
 

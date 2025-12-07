@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
+import multiprocessing
+import os
 
 import json
 import joblib
@@ -35,6 +37,7 @@ class XGBSignalModel:
         short_model_path: Optional[str | Path] = None,
         symbol: str | None = None,
         timeframe: str | None = None,
+        nthread: int | None = None,
     ):
         """
         Initialize XGBoost model(s).
@@ -47,12 +50,16 @@ class XGBSignalModel:
             short_model_path: Path to SHORT model file. If provided, loads separate SHORT model.
             symbol: Trading symbol (e.g., "BTCUSDT") for auto-detecting model paths
             timeframe: Timeframe (e.g., "1m") for auto-detecting model paths
+            nthread: Number of CPU threads for XGBoost prediction. If None, auto-detected.
         """
         self.model_path = Path(model_path) if model_path else None
         self.long_model_path = Path(long_model_path) if long_model_path else None
         self.short_model_path = Path(short_model_path) if short_model_path else None
         self.symbol = symbol
         self.timeframe = timeframe
+        
+        # Resolve nthread setting
+        self.nthread = self._resolve_nthread(nthread)
         
         self.model: Optional[XGBClassifier] = None  # For backward compatibility
         self.long_model: Optional[XGBClassifier] = None
@@ -86,7 +93,11 @@ class XGBSignalModel:
             if self.long_model_path and self.long_model_path.exists():
                 try:
                     self.long_model = joblib.load(self.long_model_path)
-                    logger.info(f"[XGB Model] Loaded LONG model from {self.long_model_path}")
+                    self._apply_nthread_to_model(self.long_model)
+                    logger.info(
+                        f"[XGB Model] Loaded LONG model from {self.long_model_path} "
+                        f"(nthread={self.nthread})"
+                    )
                 except Exception as e:
                     raise ValueError(f"Failed to load LONG model from {self.long_model_path}: {e}") from e
             else:
@@ -95,7 +106,11 @@ class XGBSignalModel:
             if self.short_model_path and self.short_model_path.exists():
                 try:
                     self.short_model = joblib.load(self.short_model_path)
-                    logger.info(f"[XGB Model] Loaded SHORT model from {self.short_model_path}")
+                    self._apply_nthread_to_model(self.short_model)
+                    logger.info(
+                        f"[XGB Model] Loaded SHORT model from {self.short_model_path} "
+                        f"(nthread={self.nthread})"
+                    )
                 except Exception as e:
                     raise ValueError(f"Failed to load SHORT model from {self.short_model_path}: {e}") from e
             else:
@@ -139,14 +154,67 @@ class XGBSignalModel:
             if self.model_path.exists():
                 try:
                     self.model = joblib.load(self.model_path)
+                    self._apply_nthread_to_model(self.model)
                     self.long_model = self.model  # For compatibility
-                    logger.info(f"[XGB Model] Loaded single model from {self.model_path}")
+                    logger.info(
+                        f"[XGB Model] Loaded single model from {self.model_path} "
+                        f"(nthread={self.nthread})"
+                    )
                 except Exception as e:
                     raise ValueError(f"Failed to load model from {model_path}: {e}") from e
             else:
                 self.model = None
                 logger.warning(f"[XGB Model] Model file not found: {model_path}")
 
+    def _resolve_nthread(self, nthread: int | None) -> int:
+        """
+        Resolve nthread value from parameter, environment variable, or auto-detect.
+        
+        Priority:
+        1. Explicitly passed nthread parameter
+        2. Environment variable ML_XGB_NTHREAD
+        3. Auto-detect from CPU count (capped at 8)
+        
+        Args:
+            nthread: Explicit nthread value or None
+            
+        Returns:
+            Resolved nthread value (at least 1)
+        """
+        if nthread is not None:
+            return max(1, nthread)
+        
+        env_val = os.getenv("ML_XGB_NTHREAD")
+        if env_val:
+            try:
+                return max(1, int(env_val))
+            except ValueError:
+                pass
+        
+        cpu_count = multiprocessing.cpu_count()
+        # Cap at 8 to avoid over-utilization on large servers
+        return min(cpu_count, 8)
+    
+    def _apply_nthread_to_model(self, model: XGBClassifier) -> None:
+        """
+        Apply nthread setting to a loaded XGBoost model.
+        
+        Args:
+            model: XGBoost model instance
+        """
+        try:
+            # Try nthread first (older XGBoost versions)
+            model.set_params(nthread=self.nthread)
+        except (ValueError, TypeError):
+            try:
+                # Fallback to n_jobs (newer XGBoost versions)
+                model.set_params(n_jobs=self.nthread)
+            except (ValueError, TypeError):
+                logger.warning(
+                    f"[XGB Model] Failed to set nthread={self.nthread} on model. "
+                    "Using default thread count."
+                )
+    
     def is_loaded(self) -> bool:
         """Check if model is loaded."""
         if self.long_model is not None and self.short_model is not None:
@@ -331,6 +399,7 @@ class MLXGBModel:
         symbol: str,
         timeframe: str,
         feature_preset: str = "extended_safe",
+        nthread: int | None = None,
     ):
         """
         Initialize ML XGBoost model loader.
@@ -340,11 +409,15 @@ class MLXGBModel:
             symbol: Trading symbol (e.g., "BTCUSDT")
             timeframe: Timeframe (e.g., "5m")
             feature_preset: Feature preset (e.g., "extended_safe", "base")
+            nthread: Number of CPU threads for XGBoost prediction. If None, auto-detected.
         """
         self.strategy = strategy
         self.symbol = symbol
         self.timeframe = timeframe
         self.feature_preset = feature_preset
+        
+        # Resolve nthread setting
+        self.nthread = self._resolve_nthread(nthread)
         
         # Build model paths
         model_dir = Path(settings.XGB_MODEL_PATH).parent
@@ -395,13 +468,21 @@ class MLXGBModel:
         
         try:
             self.long_model = joblib.load(self.long_model_path)
-            logger.info(f"[XGB Model] Loaded LONG model from {self.long_model_path}")
+            self._apply_nthread_to_model(self.long_model)
+            logger.info(
+                f"[XGB Model] Loaded LONG model from {self.long_model_path} "
+                f"(nthread={self.nthread})"
+            )
         except Exception as e:
             raise ValueError(f"Failed to load LONG model from {self.long_model_path}: {e}") from e
         
         try:
             self.short_model = joblib.load(self.short_model_path)
-            logger.info(f"[XGB Model] Loaded SHORT model from {self.short_model_path}")
+            self._apply_nthread_to_model(self.short_model)
+            logger.info(
+                f"[XGB Model] Loaded SHORT model from {self.short_model_path} "
+                f"(nthread={self.nthread})"
+            )
         except Exception as e:
             raise ValueError(f"Failed to load SHORT model from {self.short_model_path}: {e}") from e
         
@@ -422,8 +503,57 @@ class MLXGBModel:
             f"[XGB Model] Loaded ML models for {symbol}-{timeframe} (preset={feature_preset}): "
             f"long={self.long_model_path.name}, short={self.short_model_path.name}, "
             f"scaler={self.scaler_path.name if self.scaler_path and self.scaler_path.exists() else 'None'}, "
-            f"label_mode={self.label_mode}"
+            f"label_mode={self.label_mode}, nthread={self.nthread}"
         )
+    
+    def _resolve_nthread(self, nthread: int | None) -> int:
+        """
+        Resolve nthread value from parameter, environment variable, or auto-detect.
+        
+        Priority:
+        1. Explicitly passed nthread parameter
+        2. Environment variable ML_XGB_NTHREAD
+        3. Auto-detect from CPU count (capped at 8)
+        
+        Args:
+            nthread: Explicit nthread value or None
+            
+        Returns:
+            Resolved nthread value (at least 1)
+        """
+        if nthread is not None:
+            return max(1, nthread)
+        
+        env_val = os.getenv("ML_XGB_NTHREAD")
+        if env_val:
+            try:
+                return max(1, int(env_val))
+            except ValueError:
+                pass
+        
+        cpu_count = multiprocessing.cpu_count()
+        # Cap at 8 to avoid over-utilization on large servers
+        return min(cpu_count, 8)
+    
+    def _apply_nthread_to_model(self, model: XGBClassifier) -> None:
+        """
+        Apply nthread setting to a loaded XGBoost model.
+        
+        Args:
+            model: XGBoost model instance
+        """
+        try:
+            # Try nthread first (older XGBoost versions)
+            model.set_params(nthread=self.nthread)
+        except (ValueError, TypeError):
+            try:
+                # Fallback to n_jobs (newer XGBoost versions)
+                model.set_params(n_jobs=self.nthread)
+            except (ValueError, TypeError):
+                logger.warning(
+                    f"[XGB Model] Failed to set nthread={self.nthread} on model. "
+                    "Using default thread count."
+                )
     
     def is_loaded(self) -> bool:
         """Check if models are loaded."""

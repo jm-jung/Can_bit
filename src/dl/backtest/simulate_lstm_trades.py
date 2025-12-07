@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from src.core.config import settings
+from src.core.config import settings, get_lstm_attn_model_path
 from src.indicators.basic import add_basic_indicators
 from src.ml.features import build_ml_dataset
 from src.services.ohlcv_service import load_ohlcv_df
@@ -322,14 +322,25 @@ def main():
     
     logger.info(f"Test set: {len(X_test)} samples")
     
-    # Load best model
-    model_path = Path(settings.LSTM_ATTN_MODEL_PATH)
+    # Load best model using dynamic path (3-class, horizon, feature preset)
+    num_classes = 3  # 3-class: FLAT, LONG, SHORT
+    horizon = getattr(settings, "LSTM_RETURN_HORIZON", 5)
+    feature_preset = "events" if settings.EVENTS_ENABLED else "basic"
+    model_path = get_lstm_attn_model_path(
+        num_classes=num_classes,
+        horizon=horizon,
+        feature_preset=feature_preset,
+    )
+    
     if not model_path.exists():
         logger.error(f"Model not found at {model_path.resolve()}")
         logger.error("Please train the model first using: python -m src.dl.train.train_lstm_attn")
+        logger.error(f"Expected model path: {model_path.resolve()}")
+        logger.error(f"Configuration: {num_classes}-class, horizon={horizon}, features={feature_preset}")
         return
     
     logger.info(f"Loading model from {model_path.resolve()}")
+    logger.info(f"Model configuration: {num_classes}-class, horizon={horizon}, features={feature_preset}")
     
     # Model architecture (should match training)
     hidden_size = 128

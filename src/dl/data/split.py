@@ -133,49 +133,90 @@ def log_split_summary(
     """
     Log summary statistics for train/valid/test splits.
     
-    This function logs the number of samples and label distribution (positive/negative
-    ratio) for each split.
+    Supports both binary and 3-class classification:
+    - Binary: label_positive=1, label_negative=0
+    - 3-class: automatically detects if labels contain {0, 1, 2}
+    
+    This function logs the number of samples and label distribution for each split.
     
     Args:
         y_train: Training labels
         y_valid: Validation labels
         y_test: Test labels
         logger: Logger instance (if None, uses default logger)
-        label_positive: Label value for positive class (default: 1)
-        label_negative: Label value for negative class (default: 0)
+        label_positive: Label value for positive class (default: 1, for binary)
+        label_negative: Label value for negative class (default: 0, for binary)
     """
     if logger is None:
         logger = logging.getLogger(__name__)
     
-    # Calculate statistics for each split
-    def calc_stats(y: np.ndarray) -> tuple[int, int, int, float, float]:
-        n = len(y)
-        pos = int(np.sum(y == label_positive))
-        neg = int(np.sum(y == label_negative))
-        total = pos + neg
-        ratio_pos = pos / total if total > 0 else 0.0
-        ratio_neg = neg / total if total > 0 else 0.0
-        return n, pos, neg, ratio_pos, ratio_neg
+    # Detect if 3-class (check if labels contain 0, 1, 2)
+    all_labels = np.concatenate([y_train, y_valid, y_test])
+    unique_labels = np.unique(all_labels)
+    is_3class = len(unique_labels) == 3 and set(unique_labels) == {0, 1, 2}
     
-    n_train, pos_train, neg_train, ratio_train_pos, ratio_train_neg = calc_stats(y_train)
-    n_valid, pos_valid, neg_valid, ratio_valid_pos, ratio_valid_neg = calc_stats(y_valid)
-    n_test, pos_test, neg_test, ratio_test_pos, ratio_test_neg = calc_stats(y_test)
-    
-    # Log summary
-    logger.info("-" * 60)
-    logger.info("Time-series Split Summary:")
-    logger.info("-" * 60)
-    logger.info(
-        f"Train: n={n_train}, pos={pos_train} (p={ratio_train_pos:.3f}), "
-        f"neg={neg_train} (p={ratio_train_neg:.3f})"
-    )
-    logger.info(
-        f"Valid: n={n_valid}, pos={pos_valid} (p={ratio_valid_pos:.3f}), "
-        f"neg={neg_valid} (p={ratio_valid_neg:.3f})"
-    )
-    logger.info(
-        f"Test : n={n_test}, pos={pos_test} (p={ratio_test_pos:.3f}), "
-        f"neg={neg_test} (p={ratio_test_neg:.3f})"
-    )
-    logger.info("-" * 60)
+    if is_3class:
+        # 3-class summary
+        def calc_stats_3class(y: np.ndarray) -> tuple[int, int, int, int, float, float, float]:
+            n = len(y)
+            flat = int(np.sum(y == 0))
+            long = int(np.sum(y == 1))
+            short = int(np.sum(y == 2))
+            total = n
+            ratio_flat = flat / total if total > 0 else 0.0
+            ratio_long = long / total if total > 0 else 0.0
+            ratio_short = short / total if total > 0 else 0.0
+            return n, flat, long, short, ratio_flat, ratio_long, ratio_short
+        
+        n_train, flat_train, long_train, short_train, r_flat_train, r_long_train, r_short_train = calc_stats_3class(y_train)
+        n_valid, flat_valid, long_valid, short_valid, r_flat_valid, r_long_valid, r_short_valid = calc_stats_3class(y_valid)
+        n_test, flat_test, long_test, short_test, r_flat_test, r_long_test, r_short_test = calc_stats_3class(y_test)
+        
+        logger.info("-" * 60)
+        logger.info("Time-series Split Summary (3-class):")
+        logger.info("-" * 60)
+        logger.info(
+            f"Train: n={n_train}, FLAT={flat_train} ({r_flat_train:.3f}), "
+            f"LONG={long_train} ({r_long_train:.3f}), SHORT={short_train} ({r_short_train:.3f})"
+        )
+        logger.info(
+            f"Valid: n={n_valid}, FLAT={flat_valid} ({r_flat_valid:.3f}), "
+            f"LONG={long_valid} ({r_long_valid:.3f}), SHORT={short_valid} ({r_short_valid:.3f})"
+        )
+        logger.info(
+            f"Test : n={n_test}, FLAT={flat_test} ({r_flat_test:.3f}), "
+            f"LONG={long_test} ({r_long_test:.3f}), SHORT={short_test} ({r_short_test:.3f})"
+        )
+        logger.info("-" * 60)
+    else:
+        # Binary summary (backward compatibility)
+        def calc_stats(y: np.ndarray) -> tuple[int, int, int, float, float]:
+            n = len(y)
+            pos = int(np.sum(y == label_positive))
+            neg = int(np.sum(y == label_negative))
+            total = pos + neg
+            ratio_pos = pos / total if total > 0 else 0.0
+            ratio_neg = neg / total if total > 0 else 0.0
+            return n, pos, neg, ratio_pos, ratio_neg
+        
+        n_train, pos_train, neg_train, ratio_train_pos, ratio_train_neg = calc_stats(y_train)
+        n_valid, pos_valid, neg_valid, ratio_valid_pos, ratio_valid_neg = calc_stats(y_valid)
+        n_test, pos_test, neg_test, ratio_test_pos, ratio_test_neg = calc_stats(y_test)
+        
+        logger.info("-" * 60)
+        logger.info("Time-series Split Summary (binary):")
+        logger.info("-" * 60)
+        logger.info(
+            f"Train: n={n_train}, pos={pos_train} (p={ratio_train_pos:.3f}), "
+            f"neg={neg_train} (p={ratio_train_neg:.3f})"
+        )
+        logger.info(
+            f"Valid: n={n_valid}, pos={pos_valid} (p={ratio_valid_pos:.3f}), "
+            f"neg={neg_valid} (p={ratio_valid_neg:.3f})"
+        )
+        logger.info(
+            f"Test : n={n_test}, pos={pos_test} (p={ratio_test_pos:.3f}), "
+            f"neg={neg_test} (p={ratio_test_neg:.3f})"
+        )
+        logger.info("-" * 60)
 

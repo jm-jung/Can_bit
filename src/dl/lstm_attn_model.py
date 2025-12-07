@@ -11,10 +11,11 @@ import numpy as np
 import pandas as pd
 import torch
 
-from src.core.config import settings
+from src.core.config import settings, get_lstm_attn_model_path
 from src.dl.models.lstm_attn import LSTMAttentionModel
 from src.indicators.basic import add_basic_indicators
 from src.ml.features import build_feature_frame, build_ml_dataset
+from src.dl.data.labels import LstmClassIndex
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +42,15 @@ class LSTMAttnSignalModel:
             dropout: Dropout rate (must match training)
         """
         if model_path is None:
-            model_path = settings.LSTM_ATTN_MODEL_PATH
+            # Generate dynamic model path based on configuration (3-class, horizon, feature preset)
+            num_classes = 3  # 3-class: FLAT, LONG, SHORT
+            horizon = getattr(settings, "LSTM_RETURN_HORIZON", 5)
+            feature_preset = "events" if settings.EVENTS_ENABLED else "basic"
+            model_path = get_lstm_attn_model_path(
+                num_classes=num_classes,
+                horizon=horizon,
+                feature_preset=feature_preset,
+            )
 
         self.model_path = Path(model_path)
         self.window_size = window_size
@@ -280,6 +289,9 @@ class LSTMAttnSignalModel:
     def predict_proba_latest(self, df: pd.DataFrame, symbol: str | None = None, timeframe: str | None = None) -> float:
         """
         Predict probability of price going up (next horizon periods).
+        
+        This method maintains backward compatibility by returning proba_long
+        from 3-class softmax output.
 
         Args:
             df: DataFrame with OHLCV + indicators (must be sorted by timestamp)
@@ -287,7 +299,7 @@ class LSTMAttnSignalModel:
             timeframe: Timeframe (default: from settings)
 
         Returns:
-            Probability of price going up (0.0 to 1.0)
+            Probability of LONG class (0.0 to 1.0) from 3-class softmax
         """
         if not self.is_loaded():
             raise ValueError("Model not loaded. Train model first or check model path.")
@@ -304,16 +316,22 @@ class LSTMAttnSignalModel:
             f"feature_dim={seq_tensor.shape[2] if len(seq_tensor.shape) >= 3 else 'N/A'}"
         )
 
-        # Predict
+        # Predict (3-class)
         self.model.eval()
         with torch.no_grad():
-            logits = self.model(seq_tensor)  # (1, 1), raw logit
-            prob = torch.sigmoid(logits)  # (1, 1), 0~1
-            prob_up = float(prob.cpu().item())
+            logits = self.model(seq_tensor)  # (1, 3), raw logits
+            probs = torch.nn.functional.softmax(logits, dim=-1)  # (1, 3), probabilities
+            prob_long = float(probs[0, LstmClassIndex.LONG].cpu().item())
             
-            logger.debug(f"predict_proba_latest: logit={logits.item():.4f}, prob_up={prob_up:.4f}")
+            logger.debug(
+                f"predict_proba_latest: logits={logits.cpu().numpy().flatten()}, "
+                f"probs=[FLAT={probs[0, LstmClassIndex.FLAT]:.4f}, "
+                f"LONG={probs[0, LstmClassIndex.LONG]:.4f}, "
+                f"SHORT={probs[0, LstmClassIndex.SHORT]:.4f}], "
+                f"proba_long={prob_long:.4f}"
+            )
 
-        return prob_up
+        return prob_long
 
     def predict_label_latest(
         self,
@@ -349,6 +367,136 @@ class LSTMAttnSignalModel:
             return "SHORT"
         else:
             return "HOLD"
+
+    def predict_proba_batch(
+        self,
+        features: pd.DataFrame,
+        symbol: str | None = None,
+        timeframe: str | None = None,
+        batch_size: int = 512,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Batch prediction for multiple sequences (optimized for backtest/cache generation).
+        
+        This function is optimized for computing predictions for many timesteps at once.
+        It extracts features once, creates all sequences, and processes them in batches.
+        
+        The model outputs 3-class softmax probabilities, which are mapped to:
+        - proba_long: probability of LONG class (class 1)
+        - proba_short: probability of SHORT class (class 2)
+        
+        Args:
+            features: DataFrame with extracted features (already normalized if needed)
+                     Shape: (N, feature_dim) where N >= window_size
+            symbol: Trading symbol (default: from settings)
+            timeframe: Timeframe (default: from settings)
+            batch_size: Batch size for model forward passes (default: 512)
+        
+        Returns:
+            Tuple of (proba_long: np.ndarray, proba_short: np.ndarray)
+            Shape: (N - window_size + 1,) where N is the number of feature rows
+            proba_long and proba_short are extracted from 3-class softmax output
+            The first prediction corresponds to features[window_size-1], 
+            and the last prediction corresponds to features[N-1]
+        """
+        if not self.is_loaded():
+            raise ValueError("Model not loaded. Train model first or check model path.")
+        
+        if len(features) < self.window_size:
+            raise ValueError(
+                f"Not enough features: need at least {self.window_size} rows, got {len(features)}"
+            )
+        
+        # Ensure feature columns match
+        if self.feature_cols is None:
+            self.feature_cols = features.columns.tolist()
+        else:
+            features = features.reindex(columns=self.feature_cols, fill_value=0.0)
+        
+        num_sequences = len(features) - self.window_size + 1
+        feature_dim = len(self.feature_cols)
+        
+        logger.info(
+            f"[LSTM Proba][Batch] total_rows={len(features)}, window_size={self.window_size}, "
+            f"num_sequences={num_sequences}, batch_size={batch_size}"
+        )
+        
+        # Create all sequences with rolling normalization
+        # Each sequence i uses features[i:i+window_size] normalized by rolling stats
+        # We create sequences starting from index (window_size - 1) to match training
+        sequences: list[torch.Tensor] = []
+        
+        # Pre-compute rolling statistics for all features
+        rolling_mean = features.rolling(window=self.window_size, min_periods=1).mean()
+        rolling_std = features.rolling(window=self.window_size, min_periods=1).std()
+        rolling_std = rolling_std.replace(0, 1)  # Avoid division by zero
+        
+        # Create normalized sequences
+        # Sequence at position i uses features[i-window_size+1:i+1] normalized by stats at i
+        # This matches training: each sequence is normalized by rolling stats at the end of the window
+        for i in range(self.window_size - 1, len(features)):
+            # Get sequence window: from (i - window_size + 1) to i (inclusive)
+            seq_start = i - self.window_size + 1
+            seq_end = i + 1
+            seq_features = features.iloc[seq_start:seq_end].copy()
+            
+            # Normalize using rolling statistics at the end of the window (index i)
+            # This matches the training normalization: each row is normalized by
+            # the rolling stats computed up to that row
+            mean_at_end = rolling_mean.iloc[i]
+            std_at_end = rolling_std.iloc[i]
+            
+            # Normalize sequence
+            seq_normalized = (seq_features - mean_at_end) / std_at_end
+            
+            # Convert to tensor
+            seq_array = seq_normalized.values.astype(np.float32)
+            seq_tensor = torch.FloatTensor(seq_array).unsqueeze(0)  # (1, window_size, feature_dim)
+            sequences.append(seq_tensor)
+        
+        # Concatenate all sequences into a single tensor
+        if sequences:
+            all_sequences = torch.cat(sequences, dim=0)  # (num_sequences, window_size, feature_dim)
+        else:
+            # Edge case: no sequences
+            all_sequences = torch.empty((0, self.window_size, feature_dim), dtype=torch.float32)
+        
+        # Move to device
+        all_sequences = all_sequences.to(self.device)
+        
+        # Batch forward passes
+        self.model.eval()
+        all_proba_long: list[float] = []
+        all_proba_short: list[float] = []
+        forward_calls = 0
+        
+        with torch.no_grad():
+            for batch_start in range(0, num_sequences, batch_size):
+                batch_end = min(batch_start + batch_size, num_sequences)
+                batch_sequences = all_sequences[batch_start:batch_end]
+                
+                # Forward pass (3-class)
+                logits = self.model(batch_sequences)  # (batch_size, 3)
+                probs = torch.nn.functional.softmax(logits, dim=-1)  # (batch_size, 3)
+                
+                # Extract LONG and SHORT probabilities
+                proba_long_batch = probs[:, LstmClassIndex.LONG].cpu().numpy()
+                proba_short_batch = probs[:, LstmClassIndex.SHORT].cpu().numpy()
+                
+                all_proba_long.extend(proba_long_batch.tolist())
+                all_proba_short.extend(proba_short_batch.tolist())
+                forward_calls += 1
+        
+        proba_long_arr = np.array(all_proba_long, dtype=np.float32)
+        proba_short_arr = np.array(all_proba_short, dtype=np.float32)
+        
+        logger.info(
+            f"[LSTM Proba][Batch] forward_calls={forward_calls}, "
+            f"mean_proba_long={proba_long_arr.mean():.4f}, std={proba_long_arr.std():.4f}, "
+            f"mean_proba_short={proba_short_arr.mean():.4f}, std={proba_short_arr.std():.4f}"
+        )
+        
+        return proba_long_arr, proba_short_arr
 
 
 # Global model instance

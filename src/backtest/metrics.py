@@ -77,6 +77,7 @@ def get_metric_function(metric_name: str) -> Callable[[Any], float]:
         "total_return": total_return_metric,
         "sharpe": sharpe_ratio_metric,
         "sharpe_ratio": sharpe_ratio_metric,
+        "sharpe_ratio_metric": sharpe_ratio_metric,  # alias for backward compatibility
     }
     
     if metric_name.lower() not in metric_map:

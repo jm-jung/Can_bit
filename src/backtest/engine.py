@@ -17,6 +17,7 @@ from src.dl.lstm_attn_model import get_lstm_attn_model
 from src.strategies.ml_thresholds import resolve_ml_thresholds
 from src.services.ohlcv_service import load_ohlcv_df
 from src.ml.features import build_feature_frame
+from src.dl.data.labels import LstmClassIndex
 
 logger = logging.getLogger(__name__)
 
@@ -829,7 +830,8 @@ def run_backtest_with_ml(
             )
 
     # Generate signals from probabilities (using separate LONG/SHORT proba)
-    # OPTIMIZATION: Vectorized signal generation (10-50x faster than loop-based)
+    # For ml_lstm_attn: Use 3-class information (direction_class = argmax) + thresholds
+    # For other strategies: Use simple threshold checks
     n = len(df)
     signals = np.full(n, "HOLD", dtype=object)
     
@@ -845,25 +847,45 @@ def run_backtest_with_ml(
     else:
         proba_short_padded = proba_short_arr[:n]
     
-    # Vectorized threshold checks
-    is_long_mask = (
-        (proba_long_padded >= long_threshold) if long_threshold is not None
-        else np.zeros(n, dtype=bool)
-    )
-    is_short_mask = (
-        (proba_short_padded >= short_threshold) if short_threshold is not None
-        else np.zeros(n, dtype=bool)
-    )
-    
-    # Conflict resolution: if both are true, choose the one with larger margin
-    conflict_mask = is_long_mask & is_short_mask
-    if np.any(conflict_mask):
-        margin_long = proba_long_padded[conflict_mask] - long_threshold
-        margin_short = proba_short_padded[conflict_mask] - short_threshold
-        # Prefer LONG if margin_long >= margin_short, else prefer SHORT
-        prefer_short = margin_short > margin_long
-        is_long_mask[conflict_mask] = ~prefer_short
-        is_short_mask[conflict_mask] = prefer_short
+    # For ml_lstm_attn: Use 3-class direction_class information
+    if strategy_name == "ml_lstm_attn":
+        # Compute proba_flat from proba_long and proba_short (3-class softmax)
+        proba_flat_padded = 1.0 - proba_long_padded - proba_short_padded
+        proba_flat_padded = np.clip(proba_flat_padded, 0.0, 1.0)  # Ensure valid probability range
+        
+        # Determine direction_class using argmax
+        proba_stack = np.stack([proba_flat_padded, proba_long_padded, proba_short_padded], axis=1)  # (n, 3)
+        direction_classes = np.argmax(proba_stack, axis=1)  # (n,) with values {0: FLAT, 1: LONG, 2: SHORT}
+        
+        # Apply thresholds with direction_class constraint
+        is_long_mask = (
+            (direction_classes == LstmClassIndex.LONG) &
+            (proba_long_padded >= long_threshold if long_threshold is not None else np.ones(n, dtype=bool))
+        )
+        is_short_mask = (
+            (direction_classes == LstmClassIndex.SHORT) &
+            (proba_short_padded >= short_threshold if short_threshold is not None else np.ones(n, dtype=bool))
+        )
+    else:
+        # For other strategies (e.g., ml_xgb): Use simple threshold checks
+        is_long_mask = (
+            (proba_long_padded >= long_threshold) if long_threshold is not None
+            else np.zeros(n, dtype=bool)
+        )
+        is_short_mask = (
+            (proba_short_padded >= short_threshold) if short_threshold is not None
+            else np.zeros(n, dtype=bool)
+        )
+        
+        # Conflict resolution: if both are true, choose the one with larger margin
+        conflict_mask = is_long_mask & is_short_mask
+        if np.any(conflict_mask):
+            margin_long = proba_long_padded[conflict_mask] - long_threshold
+            margin_short = proba_short_padded[conflict_mask] - short_threshold
+            # Prefer LONG if margin_long >= margin_short, else prefer SHORT
+            prefer_short = margin_short > margin_long
+            is_long_mask[conflict_mask] = ~prefer_short
+            is_short_mask[conflict_mask] = prefer_short
     
     # Apply long_only / short_only filters
     if long_only:

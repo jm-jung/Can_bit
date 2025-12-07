@@ -39,7 +39,8 @@ class Settings(BaseSettings):
     MODEL_DIR: str = "./models"
     XGB_MODEL_PATH: str = str(PROJECT_ROOT / "models" / "xgb_model.pkl")
     LSTM_MODEL_PATH: str = str(PROJECT_ROOT / "models" / "lstm_model.h5")
-    # LSTM + Attention 모델 경로 (프로젝트 루트 기준)
+    # LSTM + Attention 모델 경로 (DEPRECATED: Use get_lstm_attn_model_path() instead)
+    # This is kept for backward compatibility but should not be used for 3-class models
     LSTM_ATTN_MODEL_PATH: str = str(PROJECT_ROOT / "models" / "lstm_attn_v1.pt")
 
     # DL LSTM + Attention strategy thresholds
@@ -80,25 +81,25 @@ class Settings(BaseSettings):
         description="True이면 gradient norm과 weight 변화를 로깅"
     )
     
-    # LSTM Label Generation settings
+    # LSTM Label Generation settings (3-class)
     LSTM_RETURN_HORIZON: int = Field(
         default=5,  # was 10, now 5 to get more local signal
         description="LSTM 라벨 생성 시 미래 수익률을 계산할 horizon (몇 개의 캔들 후를 볼지)"
     )
     
     LSTM_LABEL_POS_THRESHOLD: float = Field(
-        default=0.0015,  # was 0.003, now 0.0015 to get more samples
-        description="미래 수익률이 이 값 이상이면 label=1 (강한 상승으로 간주)"
+        default=0.001,  # 3-class: r > pos_threshold → LONG (class 1)
+        description="미래 수익률이 이 값보다 크면 LONG 클래스 (class 1)"
     )
     
     LSTM_LABEL_NEG_THRESHOLD: float = Field(
-        default=-0.0015,  # was -0.003, now -0.0015 to get more samples
-        description="미래 수익률이 이 값 이하이면 label=0 (강한 하락으로 간주)"
+        default=-0.001,  # 3-class: r < neg_threshold → SHORT (class 2)
+        description="미래 수익률이 이 값보다 작으면 SHORT 클래스 (class 2)"
     )
     
     LSTM_LABEL_IGNORE_MARGIN: float = Field(
-        default=0.0,  # was 0.0005, now 0.0 to remove ignore zone and get more samples
-        description="미래 수익률이 (-margin, +margin) 안에 있으면 ambiguous zone으로 보고 학습에서 제외"
+        default=0.0,  # 3-class에서는 사용하지 않음 (FLAT 클래스가 ambiguous zone 역할)
+        description="[DEPRECATED] 3-class에서는 사용하지 않음. FLAT 클래스가 ambiguous zone 역할을 함"
     )
     
     # LSTM Loss function settings
@@ -252,6 +253,68 @@ class Settings(BaseSettings):
         default=None,
         description="Daily loss limit (kill switch, None = disabled)"
     )
+    
+    # ======================================================================
+    # Strategy Mode and Threshold Optimization Settings
+    # ======================================================================
+    
+    # Strategy mode: "both", "long_only", or "short_only"
+    ML_STRATEGY_MODE_DEFAULT: str = Field(
+        default="both",
+        description="Default strategy mode: 'both', 'long_only', or 'short_only'"
+    )
+    
+    # Threshold optimization minimum trade requirements
+    MIN_TRADES_IN_DEFAULT: int = Field(
+        default=500,
+        description="Minimum trades required in in-sample period for threshold optimization"
+    )
+    MIN_TRADES_OUT_DEFAULT: int = Field(
+        default=50,
+        description="Minimum trades required in out-of-sample period for threshold optimization"
+    )
+    MIN_SHARPE_OUT_DEFAULT: float = Field(
+        default=0.0,
+        description="Minimum acceptable out-of-sample Sharpe ratio for threshold optimization"
+    )
+    
+    # LSTM-Attention timeframe settings
+    # NOTE: LSTM-Attn model is trained on 1m data, but strategy/backtest may use 5m
+    # This separation allows for future 1m-specific strategy development
+    LSTM_ATTN_INPUT_TIMEFRAME: str = Field(
+        default="1m",
+        description="Timeframe used for LSTM-Attn model input/feature extraction (training: 1m)"
+    )
+    LSTM_ATTN_STRATEGY_TIMEFRAME: str = Field(
+        default="5m",
+        description="Timeframe used for LSTM-Attn strategy execution/backtest (current: 5m)"
+    )
+    
+    # XGBoost default threshold grid settings (can be overridden via CLI)
+    XGB_LONG_MIN_DEFAULT: float = Field(
+        default=0.40,
+        description="Default minimum long threshold for XGBoost grid search"
+    )
+    XGB_LONG_MAX_DEFAULT: float = Field(
+        default=0.70,
+        description="Default maximum long threshold for XGBoost grid search"
+    )
+    XGB_LONG_STEP_DEFAULT: float = Field(
+        default=0.05,
+        description="Default step size for XGBoost long threshold grid search"
+    )
+    XGB_SHORT_MIN_DEFAULT: float = Field(
+        default=0.30,
+        description="Default minimum short threshold for XGBoost grid search"
+    )
+    XGB_SHORT_MAX_DEFAULT: float = Field(
+        default=0.50,
+        description="Default maximum short threshold for XGBoost grid search"
+    )
+    XGB_SHORT_STEP_DEFAULT: float = Field(
+        default=0.05,
+        description="Default step size for XGBoost short threshold grid search"
+    )
 
 
 def load_config_yaml(config_path: str = "config.yaml") -> dict:
@@ -280,3 +343,36 @@ _filtered_yaml = {k: v for k, v in _yaml_config.items() if k in Settings.model_f
 
 # ✅ 환경변수 + YAML override를 합쳐서 Settings 생성
 settings = Settings(**_filtered_yaml)
+
+
+def get_lstm_attn_model_path(
+    num_classes: int = 3,
+    horizon: int | None = None,
+    feature_preset: str | None = None,
+) -> Path:
+    """
+    Generate dynamic LSTM + Attention model path based on configuration.
+    
+    This function generates model paths that include num_classes, horizon, and feature preset
+    to avoid conflicts between different model configurations (e.g., 1-class vs 3-class).
+    
+    Args:
+        num_classes: Number of output classes (default: 3 for FLAT/LONG/SHORT)
+        horizon: Prediction horizon (default: from settings.LSTM_RETURN_HORIZON)
+        feature_preset: Feature preset name ("events" or "basic", default: based on EVENTS_ENABLED)
+    
+    Returns:
+        Path to the model checkpoint file
+        
+    Example:
+        >>> path = get_lstm_attn_model_path(num_classes=3, horizon=5, feature_preset="events")
+        >>> # Returns: Path("models/lstm_attn_v1_3class_h5_events.pt")
+    """
+    if horizon is None:
+        horizon = settings.LSTM_RETURN_HORIZON
+    
+    if feature_preset is None:
+        feature_preset = "events" if settings.EVENTS_ENABLED else "basic"
+    
+    model_name = f"lstm_attn_v1_{num_classes}class_h{horizon}_{feature_preset}.pt"
+    return PROJECT_ROOT / "models" / model_name
