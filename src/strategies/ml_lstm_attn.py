@@ -188,11 +188,17 @@ def ml_lstm_attn_strategy_enhanced(
             signals = np.full(len(df), "HOLD", dtype=object)
             return signals, df
         
-        # For single prediction, use predict_proba_latest
-        # Note: This is not optimal for batch, but maintains compatibility
-        proba_up = model.predict_proba_latest(df, symbol=symbol, timeframe=timeframe)
-        proba_long_arr = np.array([proba_up])
-        proba_short_arr = np.array([1.0 - proba_up])
+        # For single prediction, use predict_proba_latest with return_both=True
+        # IMPORTANT: Use return_both=True to get correct proba_short from 3-class softmax
+        # Do NOT use proba_short = 1.0 - proba_long (this is incorrect for 3-class)
+        proba_long_val, proba_short_val = model.predict_proba_latest(
+            df, 
+            symbol=symbol, 
+            timeframe=timeframe,
+            return_both=True
+        )
+        proba_long_arr = np.array([proba_long_val])
+        proba_short_arr = np.array([proba_short_val])
         # Truncate df to match
         df = df.iloc[-1:].reset_index(drop=True)
     

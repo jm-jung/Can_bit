@@ -375,6 +375,8 @@ def _evaluate_single_threshold_combination(
     idx_in: np.ndarray,
     idx_out: np.ndarray,
     preset_to_use: str,
+    symbol: str,
+    timeframe: str,
     strategy_mode: str | None = None,
 ) -> Dict[str, Any]:
     """
@@ -386,7 +388,7 @@ def _evaluate_single_threshold_combination(
     Returns:
         Dictionary with results or error information
     """
-    from src.backtest.engine import run_backtest_with_ml
+    from src.backtest.ml_backtest_engine_impl import get_ml_backtest_engine
     from src.strategies.strategy_mode import StrategyMode as StrategyModeEnum
     
     # Convert strategy_mode to long_only/short_only flags
@@ -394,37 +396,47 @@ def _evaluate_single_threshold_combination(
     long_only = mode == StrategyModeEnum.LONG_ONLY
     short_only = mode == StrategyModeEnum.SHORT_ONLY
     
+    # Get engine
+    engine = get_ml_backtest_engine(
+        strategy_name=strategy_name,
+        symbol=symbol,
+        timeframe=timeframe,
+        feature_preset=preset_to_use if strategy_name == "ml_xgb" else "base",
+    )
+    
     try:
         # Run in-sample backtest
-        result_in = run_backtest_with_ml(
+        result_in = engine.run_backtest(
             long_threshold=long_thr,
             short_threshold=short_thr,
             use_optimized_threshold=False,
-            strategy_name=strategy_name,
             proba_long_cache=proba_long_arr,
             proba_short_cache=proba_short_arr,
             df_with_proba=df_aligned,
             index_mask=idx_in,
-            feature_preset=preset_to_use if strategy_name == "ml_xgb" else "base",
             long_only=long_only,
             short_only=short_only,
+            flat_threshold=None,
+            confidence_margin=0.0,
+            min_proba_dominance=0.0,
         )
         metric_in = metric_fn(result_in)
         trades_in = result_in["total_trades"]
         
         # Run out-of-sample backtest
-        result_out = run_backtest_with_ml(
+        result_out = engine.run_backtest(
             long_threshold=long_thr,
             short_threshold=short_thr,
             use_optimized_threshold=False,
-            strategy_name=strategy_name,
             proba_long_cache=proba_long_arr,
             proba_short_cache=proba_short_arr,
             df_with_proba=df_aligned,
             index_mask=idx_out,
-            feature_preset=preset_to_use if strategy_name == "ml_xgb" else "base",
             long_only=long_only,
             short_only=short_only,
+            flat_threshold=None,
+            confidence_margin=0.0,
+            min_proba_dominance=0.0,
         )
         metric_out = metric_fn(result_out)
         trades_out = result_out["total_trades"]
@@ -474,6 +486,8 @@ def _worker_evaluate_threshold(
         np.ndarray,  # idx_in
         np.ndarray,  # idx_out
         str,  # preset_to_use
+        str,  # symbol
+        str,  # timeframe
         str | None,  # strategy_mode
     ],
 ) -> Dict[str, Any]:
@@ -500,6 +514,8 @@ def _worker_evaluate_threshold(
         idx_in,
         idx_out,
         preset_to_use,
+        symbol,
+        timeframe,
         strategy_mode,
     ) = args
     
@@ -520,6 +536,8 @@ def _worker_evaluate_threshold(
         idx_in=idx_in,
         idx_out=idx_out,
         preset_to_use=preset_to_use,
+        symbol=symbol,
+        timeframe=timeframe,
         strategy_mode=strategy_mode,
     )
 
@@ -612,6 +630,16 @@ def _optimize_with_overfit_awareness(
         # Use get_or_build_predictions for file caching support
         from src.optimization.ml_proba_cache import get_or_build_predictions
         
+        # Log 3-class model information for ml_lstm_attn
+        if strategy_name == "ml_lstm_attn":
+            from src.dl.data.labels import LstmClassIndex
+            logger.info(
+                f"[ThresholdOptimizer][{strategy_name}] Using 3-class LSTM-Attention model. "
+                f"proba_long/proba_short are derived from class indices: "
+                f"LONG={LstmClassIndex.LONG}, SHORT={LstmClassIndex.SHORT}, FLAT={LstmClassIndex.FLAT}. "
+                f"Probabilities are extracted from 3-class softmax output, not binary probabilities."
+            )
+        
         proba_long_arr, proba_short_arr, df_aligned = get_or_build_predictions(
             strategy_name=strategy_name,
             symbol=symbol,
@@ -629,6 +657,39 @@ def _optimize_with_overfit_awareness(
             f"strategy={strategy_name}, symbol={symbol}, timeframe={timeframe}, "
             f"feature_preset={preset_to_log}"
         )
+        
+        # Log probability statistics for ml_lstm_attn
+        if strategy_name == "ml_lstm_attn":
+            import numpy as np
+            from src.dl.data.labels import LstmClassIndex
+            
+            # Compute proba_flat for statistics (3-class: p_flat + p_long + p_short = 1)
+            proba_flat_arr = 1.0 - proba_long_arr - proba_short_arr
+            proba_flat_arr = np.clip(proba_flat_arr, 0.0, 1.0)
+            
+            # Compute argmax distribution (predicted class distribution)
+            proba_stack = np.stack([proba_flat_arr, proba_long_arr, proba_short_arr], axis=1)  # (N, 3)
+            predicted_classes = np.argmax(proba_stack, axis=1)  # (N,) with values {0: FLAT, 1: LONG, 2: SHORT}
+            
+            flat_count = int(np.sum(predicted_classes == LstmClassIndex.FLAT))
+            long_count = int(np.sum(predicted_classes == LstmClassIndex.LONG))
+            short_count = int(np.sum(predicted_classes == LstmClassIndex.SHORT))
+            total_count = len(predicted_classes)
+            
+            logger.info(
+                f"[ThresholdOptimizer][{strategy_name}] Probability statistics: "
+                f"mean_proba_long={proba_long_arr.mean():.4f}, "
+                f"mean_proba_short={proba_short_arr.mean():.4f}, "
+                f"mean_proba_flat={proba_flat_arr.mean():.4f}, "
+                f"std_proba_long={proba_long_arr.std():.4f}, "
+                f"std_proba_short={proba_short_arr.std():.4f}"
+            )
+            logger.info(
+                f"[ThresholdOptimizer][{strategy_name}] Predicted class distribution (argmax): "
+                f"FLAT={flat_count} ({100*flat_count/total_count:.1f}%), "
+                f"LONG={long_count} ({100*long_count/total_count:.1f}%), "
+                f"SHORT={short_count} ({100*short_count/total_count:.1f}%)"
+            )
     except Exception as e:
         logger.error(f"Failed to compute prediction cache: {e}")
         raise
@@ -648,7 +709,66 @@ def _optimize_with_overfit_awareness(
     
     # Step 3: Grid search with overfitting penalty
     total_combinations = len(long_threshold_candidates) * len(short_threshold_candidates)
-    logger.info(f"Step 3: Testing {total_combinations} threshold combinations")
+    logger.info("=" * 60)
+    logger.info("Step 3: Testing threshold combinations")
+    logger.info("=" * 60)
+    logger.info(f"Total combinations: {total_combinations}")
+    
+    # Format long threshold range strings (avoid f-string format specifier with conditionals)
+    long_min_str = f"{long_threshold_candidates[0]:.3f}" if len(long_threshold_candidates) > 0 else "N/A"
+    long_max_str = f"{long_threshold_candidates[-1]:.3f}" if len(long_threshold_candidates) > 0 else "N/A"
+    long_step_str = (
+        f"{(long_threshold_candidates[1] - long_threshold_candidates[0]):.3f}"
+        if len(long_threshold_candidates) > 1
+        else "N/A"
+    )
+    
+    logger.info(
+        "Long threshold range: [%s, %s], step=%s, count=%d",
+        long_min_str,
+        long_max_str,
+        long_step_str,
+        len(long_threshold_candidates),
+    )
+    
+    # Format short threshold range strings (avoid f-string format specifier with conditionals)
+    short_min_str = (
+        f"{short_threshold_candidates[0]:.3f}"
+        if short_threshold_candidates[0] is not None
+        else "None"
+    )
+    short_max_str = (
+        f"{short_threshold_candidates[-1]:.3f}"
+        if short_threshold_candidates[-1] is not None
+        else "None"
+    )
+    
+    # Check if None is included and log reason
+    short_has_none = None in short_threshold_candidates
+    short_none_count = sum(1 for x in short_threshold_candidates if x is None)
+    short_numeric_count = len(short_threshold_candidates) - short_none_count
+    
+    logger.info(
+        "Short threshold range: [%s, %s], count=%d (numeric=%d, None=%d)",
+        short_min_str,
+        short_max_str,
+        len(short_threshold_candidates),
+        short_numeric_count,
+        short_none_count,
+    )
+    
+    if short_has_none:
+        logger.info(
+            "[ThresholdOptimizer] Short grid includes None (for long-only mode testing). "
+            "This is the default behavior when user does not explicitly provide short range."
+        )
+    if strategy_name == "ml_lstm_attn":
+        from src.dl.data.labels import LstmClassIndex
+        logger.info(
+            f"[ThresholdOptimizer][{strategy_name}] Note: Thresholds are applied to "
+            f"proba_long (from class {LstmClassIndex.LONG}) and proba_short (from class {LstmClassIndex.SHORT}) "
+            f"of the 3-class softmax output. FLAT class (index {LstmClassIndex.FLAT}) is not used for thresholding."
+        )
     
     # Performance optimization: parallel execution
     if use_parallel and total_combinations > 1:
@@ -740,6 +860,8 @@ def _optimize_with_overfit_awareness(
                 idx_in,  # numpy array - pickleable
                 idx_out,  # numpy array - pickleable
                 preset_to_use,
+                symbol,  # symbol as string
+                timeframe,  # timeframe as string
                 mode.value,  # strategy_mode as string
             )
             for long_thr, short_thr in threshold_combinations
@@ -882,6 +1004,8 @@ def _optimize_with_overfit_awareness(
                     idx_in=idx_in,
                     idx_out=idx_out,
                     preset_to_use=preset_to_use,
+                    symbol=symbol,
+                    timeframe=timeframe,
                     strategy_mode=mode.value,
                 )
                 
@@ -1310,4 +1434,32 @@ def load_threshold_result_for(
             exc,
         )
         return None
+
+
+def main():
+    """
+    CLI entry point for threshold optimizer.
+    
+    This function delegates to optimize_ml_threshold.py for ML-based strategies.
+    """
+    import sys
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s:%(name)s:%(message)s"
+    )
+    
+    logger.info(
+        "[ThresholdOptimizer] This module delegates to optimize_ml_threshold for ML strategies. "
+        "Redirecting to optimize_ml_threshold module..."
+    )
+    
+    # Import and call the actual CLI
+    from src.optimization.optimize_ml_threshold import main as optimize_main
+    optimize_main()
+
+
+if __name__ == "__main__":
+    main()
 

@@ -20,6 +20,495 @@ from src.dl.data.labels import LstmClassIndex
 logger = logging.getLogger(__name__)
 
 
+def build_normalized_lstm_sequences_full(
+    features_df: pd.DataFrame,
+    window_size: int,
+    feature_cols: list[str],
+    logger: logging.Logger | None = None,
+) -> np.ndarray:
+    """
+    Build the full 3D LSTM input tensor for all valid time indices using a shared normalization + sanitization.
+    
+    This function normalizes the entire DataFrame ONCE, then extracts all sequences via sliding windows.
+    Time complexity: O(N × window_size) instead of O(N^2).
+    
+    This is the SHARED helper used by both batch and legacy prediction paths to ensure
+    mathematical identity in feature extraction, normalization, sanitization, and window indexing.
+    
+    Window indexing rule (matching training):
+    - For sequence index i (0-based), the corresponding time index is idx = i + window_size
+    - Sequence uses rows [idx - window_size, idx) = [i, i + window_size)
+    - This corresponds to `features_df.iloc[i : i + window_size]`
+    
+    Steps:
+    1. Normalize the entire DataFrame using rolling statistics (vectorized, executed ONCE)
+    2. Apply NaN/Inf sanitization ONCE on the normalized DataFrame
+    3. Extract all sequences via sliding windows
+    4. Return 3D array of shape (num_sequences, window_size, feature_dim)
+    
+    Args:
+        features_df: Full features DataFrame (must have at least window_size rows)
+        window_size: Sequence length (number of timesteps)
+        feature_cols: List of feature column names in the correct order
+        logger: Optional logger instance (uses module logger if None)
+    
+    Returns:
+        sequences: np.ndarray of shape (num_sequences, window_size, feature_dim), dtype float32
+        where num_sequences = len(features_df) - window_size
+        All values are guaranteed to be finite (no NaN/Inf)
+    
+    Raises:
+        ValueError: If len(features_df) < window_size
+        ValueError: If sanitization fails (non-finite values remain)
+    """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+    
+    import numpy as np
+    import pandas as pd
+    
+    # Validate input
+    if len(features_df) < window_size:
+        raise ValueError(
+            f"Not enough rows: need at least {window_size}, got {len(features_df)}"
+        )
+    
+    # Ensure feature columns are in the correct order
+    features_df = features_df.reindex(columns=feature_cols, fill_value=0.0)
+    
+    N = len(features_df)
+    num_sequences = N - window_size
+    feature_dim = len(feature_cols)
+    
+    logger.info(
+        f"[LSTM Normalize] Building {num_sequences} sequences from {N} feature rows "
+        f"(window_size={window_size}, feature_dim={feature_dim})"
+    )
+    
+    # Step 1: Normalize the entire DataFrame ONCE (vectorized, O(N))
+    # Each row i is normalized by rolling stats at i: [i - window_size + 1, ..., i] inclusive
+    # This matches the training pipeline: normalize entire DataFrame, then extract sequences
+    features_normalized = features_df.copy()
+    
+    for col in feature_cols:
+        # Rolling statistics: window=window_size, min_periods=1 (same as training)
+        rolling_mean = features_normalized[col].rolling(window=window_size, min_periods=1).mean()
+        rolling_std = features_normalized[col].rolling(window=window_size, min_periods=1).std()
+        rolling_std = rolling_std.replace(0, 1)  # Avoid division by zero
+        
+        # Z-score normalization: (X - mean) / std
+        features_normalized[col] = (features_normalized[col] - rolling_mean) / rolling_std
+    
+    # Convert to float32
+    for col in feature_cols:
+        features_normalized[col] = features_normalized[col].astype(np.float32)
+    
+    # Step 2: Sanitize NaN/Inf ONCE on the normalized DataFrame
+    features_bad = np.isnan(features_normalized.values).any() or np.isinf(features_normalized.values).any()
+    if features_bad:
+        # Count issues before sanitization (summarized logging)
+        nan_cols = []
+        total_nan_count = 0
+        for col in feature_cols:
+            col_values = features_normalized[col].values
+            nan_count = np.isnan(col_values).sum()
+            inf_count = np.isinf(col_values).sum()
+            if nan_count > 0 or inf_count > 0:
+                nan_cols.append(col)
+                total_nan_count += nan_count + inf_count
+        
+        logger.warning(
+            f"[LSTM Normalize] Found NaN/Inf in features_normalized DataFrame. "
+            f"Sanitizing: {len(nan_cols)} columns affected, {total_nan_count} total NaN/Inf values. "
+            f"Replacing with 0.0 (neutral z-score value)."
+        )
+        
+        # Replace +/-Inf with NaN first (explicit reassignment)
+        features_normalized = features_normalized.replace([np.inf, -np.inf], np.nan)
+        
+        # Fill NaNs with 0.0 column-by-column (explicit reassignment)
+        for col in feature_cols:
+            if features_normalized[col].isna().sum() > 0:
+                features_normalized[col] = features_normalized[col].fillna(0.0)
+        
+        # Final validation: ensure all values are now finite
+        if not np.isfinite(features_normalized.to_numpy()).all():
+            logger.error(
+                "[LSTM Normalize] After sanitization, still found NaN/Inf in features_normalized. "
+                "This indicates a bug in the sanitization logic."
+            )
+            raise ValueError("Non-finite values remain after sanitization in features_normalized.")
+        
+        logger.info(
+            f"[LSTM Normalize] Sanitization complete. All NaN/Inf in features_normalized replaced with 0.0."
+        )
+    
+    # Step 3: Extract all sequences via sliding windows (O(N × window_size))
+    # Preallocate sequences array
+    sequences_array = np.empty((num_sequences, window_size, feature_dim), dtype=np.float32)
+    
+    # Extract sequences: for sequence index i, use rows [i, i + window_size)
+    # This matches training: for i in range(window_size, len), seq = iloc[i - window_size : i]
+    # But we index sequences from 0, so for seq_i=0, we use rows [0, window_size)
+    # For seq_i=1, we use rows [1, window_size+1), etc.
+    # The corresponding time index for seq_i is idx = seq_i + window_size
+    # So seq_i uses rows [idx - window_size, idx) = [seq_i, seq_i + window_size)
+    for seq_i in range(num_sequences):
+        seq_start = seq_i
+        seq_end = seq_i + window_size
+        window_slice = features_normalized.iloc[seq_start:seq_end]
+        sequences_array[seq_i] = window_slice[feature_cols].values.astype(np.float32)
+    
+    # Final validation: ensure all sequences are finite
+    if not np.isfinite(sequences_array).all():
+        bad_mask = ~np.isfinite(sequences_array)
+        bad_count = bad_mask.sum()
+        total_elements = sequences_array.size
+        
+        logger.error(
+            f"[LSTM Normalize] CRITICAL: Found NaN/Inf in sequences_array after all processing: "
+            f"bad_count={bad_count}, total_elements={total_elements}, "
+            f"bad_ratio={bad_count/total_elements:.6f}"
+        )
+        raise ValueError("Non-finite values in sequences_array after normalization and sanitization.")
+    
+    logger.info(
+        f"[LSTM Normalize] Successfully built {num_sequences} sequences "
+        f"(shape={sequences_array.shape}, dtype={sequences_array.dtype})"
+    )
+    
+    return sequences_array
+
+
+def build_normalized_lstm_sequence(
+    features_df: pd.DataFrame,
+    idx: int,
+    window_size: int,
+    feature_cols: list[str],
+    logger: logging.Logger | None = None,
+) -> np.ndarray:
+    """
+    Build a single normalized LSTM input sequence for time index `idx` using a lookback window.
+    
+    This is the SHARED helper used by both batch and legacy prediction paths to ensure
+    mathematical identity in feature extraction, normalization, sanitization, and window indexing.
+    
+    Window indexing rule:
+    - For time index `idx`, the sequence uses rows [idx - window_size + 1, ..., idx]
+    - This corresponds to `features_df.iloc[idx - window_size + 1 : idx + 1]` (inclusive end)
+    - Or equivalently: `features_df.iloc[idx - window_size : idx]` if using exclusive end (matching training)
+    
+    Steps:
+    1. Extract the window slice from features_df
+    2. Normalize the window using rolling statistics computed at each row
+    3. Apply NaN/Inf sanitization (replace +/-Inf with NaN, then NaN with 0.0)
+    4. Preserve the column ordering of feature_cols
+    5. Return a float32 numpy array of shape (window_size, feature_dim)
+    
+    Args:
+        features_df: Full features DataFrame (must have at least idx+1 rows)
+        idx: Target time index (0-based). Sequence will use [idx - window_size + 1, ..., idx]
+        window_size: Sequence length (number of timesteps)
+        feature_cols: List of feature column names in the correct order
+        logger: Optional logger instance (uses module logger if None)
+    
+    Returns:
+        Normalized sequence array of shape (window_size, len(feature_cols)), dtype float32
+        All values are guaranteed to be finite (no NaN/Inf)
+    
+    Raises:
+        ValueError: If idx < window_size - 1 (not enough history)
+        ValueError: If sanitization fails (non-finite values remain)
+    """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+    
+    import numpy as np
+    import pandas as pd
+    
+    # Validate index
+    if idx < window_size - 1:
+        raise ValueError(
+            f"Index {idx} is too small for window_size {window_size}. "
+            f"Need at least {window_size} rows before index {idx}."
+        )
+    
+    if len(features_df) <= idx:
+        raise ValueError(
+            f"Index {idx} is out of bounds. DataFrame has {len(features_df)} rows."
+        )
+    
+    # Ensure feature columns are in the correct order
+    features_df = features_df.reindex(columns=feature_cols, fill_value=0.0)
+    
+    # Step 1: Extract window slice
+    # Training rule: seq = X_normalized.iloc[i - window_size : i] (exclusive end)
+    # For index idx, we want [idx - window_size + 1, ..., idx] inclusive
+    # This is equivalent to iloc[idx - window_size : idx] if we use 0-based indexing
+    # But to match training exactly: for i in range(window_size, len), seq = iloc[i - window_size : i]
+    # So for idx, we use: iloc[idx - window_size : idx] (exclusive end, matching training)
+    seq_start = idx - window_size
+    seq_end = idx
+    window_slice = features_df.iloc[seq_start : seq_end].copy()
+    
+    if len(window_slice) != window_size:
+        raise ValueError(
+            f"Window slice has incorrect length: expected {window_size}, got {len(window_slice)}. "
+            f"seq_start={seq_start}, seq_end={seq_end}, features_df_len={len(features_df)}"
+        )
+    
+    # Step 2: Normalize using rolling statistics (same as training)
+    # IMPORTANT: We normalize the entire features_df up to idx, then extract the window
+    # This matches the training pipeline: normalize entire DataFrame, then extract sequences
+    # Each row i is normalized by rolling stats at i: [i - window_size + 1, ..., i] inclusive
+    
+    # Normalize features_df up to idx (we only need up to idx for this sequence)
+    features_normalized = features_df.iloc[:idx+1].copy()
+    
+    for col in feature_cols:
+        # Rolling statistics: window=window_size, min_periods=1 (same as training)
+        rolling_mean = features_normalized[col].rolling(window=window_size, min_periods=1).mean()
+        rolling_std = features_normalized[col].rolling(window=window_size, min_periods=1).std()
+        rolling_std = rolling_std.replace(0, 1)  # Avoid division by zero
+        
+        # Z-score normalization: (X - mean) / std
+        features_normalized[col] = (features_normalized[col] - rolling_mean) / rolling_std
+    
+    # Convert to float32
+    for col in feature_cols:
+        features_normalized[col] = features_normalized[col].astype(np.float32)
+    
+    # Extract the window from normalized features
+    window_normalized = features_normalized.iloc[seq_start:seq_end].copy()
+    
+    # Step 3: Sanitize NaN/Inf (inference-time robustness)
+    # Replace +/-Inf with NaN first, then fill NaN with 0.0
+    has_nan_inf = not np.isfinite(window_normalized.values).all()
+    if has_nan_inf:
+        # Count issues before sanitization (minimal logging to avoid spam)
+        nan_cols = []
+        for col in feature_cols:
+            if window_normalized[col].isna().any() or np.isinf(window_normalized[col].values).any():
+                nan_cols.append(col)
+        
+        if len(nan_cols) > 0 and logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"[LSTM Sequence] Sanitizing {len(nan_cols)} columns with NaN/Inf at idx={idx}: "
+                f"{nan_cols[:5]}{'...' if len(nan_cols) > 5 else ''}"
+            )
+        
+        # Replace +/-Inf with NaN
+        window_normalized = window_normalized.replace([np.inf, -np.inf], np.nan)
+        
+        # Fill NaN with 0.0 column-by-column
+        for col in feature_cols:
+            if window_normalized[col].isna().sum() > 0:
+                window_normalized[col] = window_normalized[col].fillna(0.0)
+        
+        # Final validation
+        if not np.isfinite(window_normalized.values).all():
+            logger.error(
+                f"[LSTM Sequence] After sanitization, still found NaN/Inf at idx={idx}. "
+                f"This indicates a bug in the sanitization logic."
+            )
+            raise ValueError(f"Non-finite values remain after sanitization at idx={idx}.")
+    
+    # Step 4: Convert to numpy array with correct ordering
+    sequence_array = window_normalized[feature_cols].values.astype(np.float32)
+    
+    # Final shape check
+    if sequence_array.shape != (window_size, len(feature_cols)):
+        raise ValueError(
+            f"Sequence array has incorrect shape: expected ({window_size}, {len(feature_cols)}), "
+            f"got {sequence_array.shape}"
+        )
+    
+    # Final finite check
+    if not np.isfinite(sequence_array).all():
+        logger.error(
+            f"[LSTM Sequence] CRITICAL: Sequence array at idx={idx} contains NaN/Inf after all sanitization."
+        )
+        raise ValueError(f"Non-finite values in sequence array at idx={idx}.")
+    
+    return sequence_array
+
+
+def normalize_and_make_sequences_for_lstm(
+    features: pd.DataFrame,
+    window_size: int,
+    *,
+    horizon: int | None = None,
+    for_inference: bool = False,
+) -> tuple[pd.DataFrame, np.ndarray]:
+    """
+    학습 시 사용한 것과 동일한 방식으로 정규화 및 시퀀스 생성.
+    
+    이 함수는 train_lstm_attn.py의 create_sequences 함수와 완전히 동일한
+    정규화/시퀀스 생성 로직을 사용합니다.
+    
+    Args:
+        features: DataFrame with extracted features (shape: (N, feature_dim))
+        window_size: Sequence length (number of timesteps)
+        horizon: Number of periods ahead (for training, used to limit sequence range)
+                If None and for_inference=False, uses default from settings
+        for_inference: If True, creates sequences for all valid indices (no horizon limit)
+    
+    Returns:
+        Tuple of:
+        - features_normalized: Normalized DataFrame (same shape as input)
+        - sequences_array: numpy array of shape (num_sequences, window_size, feature_dim)
+    
+    정규화 방식 (학습 시와 동일):
+        - 각 행 i에 대해 [i-window_size+1:i+1] 구간의 평균/표준편차로 z-score 정규화
+        - rolling(window=window_size, min_periods=1) 사용
+        - std == 0인 경우 1로 치환 (division by zero 방지)
+        - float32로 변환 (메모리 최적화)
+    
+    시퀀스 생성 방식 (학습 시와 동일):
+        - Training: for i in range(window_size, len(X_normalized) - horizon + 1):
+        - Inference: for i in range(window_size, len(features)):
+        - Sequence: X_normalized.iloc[i - window_size : i]  # [i-window_size, i) exclusive
+    """
+    import numpy as np
+    import pandas as pd
+    
+    # Step 1: Normalize features row-by-row (same as training)
+    # 학습 코드: train_lstm_attn.py lines 627-632
+    features_normalized = features.copy()
+    feature_cols = features.columns.tolist()
+    
+    for col in feature_cols:
+        # Rolling statistics: window=window_size, min_periods=1 (학습 시와 동일)
+        mean = features_normalized[col].rolling(window=window_size, min_periods=1).mean()
+        std = features_normalized[col].rolling(window=window_size, min_periods=1).std()
+        # std == 0인 경우 1로 치환 (학습 시와 동일)
+        std = std.replace(0, 1)  # Avoid division by zero
+        
+        # Z-score normalization: (X - mean) / std
+        features_normalized[col] = (features_normalized[col] - mean) / std
+    
+    # Convert to float32 (학습 시와 동일한 메모리 최적화)
+    for col in feature_cols:
+        features_normalized[col] = features_normalized[col].astype(np.float32)
+    
+    # Step 2: Sanitize NaN/Inf in features_normalized (inference-time robustness)
+    # Replace +/- Inf with NaN first, then fill all NaNs with 0.0 (neutral z-score value)
+    features_bad = np.isnan(features_normalized.values).any() or np.isinf(features_normalized.values).any()
+    if features_bad:
+        logger.warning(
+            f"[LSTM Normalize] Found NaN/Inf in features_normalized DataFrame. "
+            f"Sanitizing by replacing with 0.0 (neutral z-score value)."
+        )
+        
+        # Replace +/- Inf with NaN first (explicit reassignment - OPTION A)
+        features_normalized = features_normalized.replace([np.inf, -np.inf], np.nan)
+        
+        # Log which columns have issues before sanitization
+        for col in feature_cols:
+            nan_count = features_normalized[col].isna().sum()
+            if nan_count > 0:
+                logger.warning(
+                    f"[LSTM Normalize] Column '{col}' has {nan_count} NaN values (will be filled with 0.0)"
+                )
+        
+        # Fill NaNs with 0.0 column-by-column (explicit reassignment - OPTION A)
+        # This ensures each column is properly sanitized
+        for col in feature_cols:
+            if features_normalized[col].isna().sum() > 0:
+                features_normalized[col] = features_normalized[col].fillna(0.0)
+        
+        # Final validation: ensure all values are now finite
+        if not np.isfinite(features_normalized.to_numpy()).all():
+            logger.error(
+                "[LSTM Normalize] After sanitization, still found NaN/Inf in features_normalized. "
+                "This indicates a bug in the sanitization logic."
+            )
+            raise ValueError("Non-finite values remain after sanitization in features_normalized.")
+        
+        logger.info(
+            f"[LSTM Normalize] Sanitization complete. All NaN/Inf in features_normalized replaced with 0.0."
+        )
+    
+    # Step 3: Create sequences (same as training)
+    # 학습 코드: train_lstm_attn.py lines 662-664
+    sequences_list: list[np.ndarray] = []
+    
+    if for_inference:
+        # Inference: use all valid indices (no horizon constraint)
+        sequence_range = range(window_size, len(features_normalized))
+    else:
+        # Training: limit by horizon
+        if horizon is None:
+            from src.core.config import settings
+            horizon = getattr(settings, "LSTM_RETURN_HORIZON", 5)
+        sequence_range = range(window_size, len(features_normalized) - horizon + 1)
+    
+    for i in sequence_range:
+        # Extract sequence: [i - window_size, i) exclusive (학습 시와 동일)
+        seq = features_normalized.iloc[i - window_size : i][feature_cols].values
+        sequences_list.append(seq)
+    
+    # Step 4: Convert to numpy array (학습 시와 동일)
+    # 학습 코드: train_lstm_attn.py line 698
+    if sequences_list:
+        sequences_array = np.array(sequences_list, dtype=np.float32)  # (num_sequences, window_size, feature_dim)
+    else:
+        sequences_array = np.empty((0, window_size, len(feature_cols)), dtype=np.float32)
+    
+    # Step 5: Sanitize NaN/Inf in sequences_array (inference-time robustness)
+    # After sanitizing features_normalized, sequences_array should be clean, but check anyway
+    if not np.isfinite(sequences_array).all():
+        bad_mask = ~np.isfinite(sequences_array)
+        bad_count = bad_mask.sum()
+        total_elements = sequences_array.size
+        
+        logger.warning(
+            f"[LSTM Normalize] Found NaN/Inf in sequences_array after sanitization: "
+            f"bad_count={bad_count}, total_elements={total_elements}, "
+            f"bad_ratio={bad_count/total_elements:.6f}. "
+            f"Sanitizing by replacing with 0.0."
+        )
+        
+        # Find problematic sequences for logging
+        bad_sequences = bad_mask.any(axis=(1, 2))  # (num_sequences,)
+        if bad_sequences.any():
+            bad_seq_indices = np.where(bad_sequences)[0]
+            logger.warning(
+                f"[LSTM Normalize] Bad sequences at indices: {bad_seq_indices[:10]} "
+                f"(showing first 10 of {len(bad_seq_indices)} total)"
+            )
+            
+            # Log example bad sequence
+            if len(bad_seq_indices) > 0:
+                example_idx = bad_seq_indices[0]
+                example_seq = sequences_array[example_idx]
+                nan_count = np.isnan(example_seq).sum()
+                inf_count = np.isinf(example_seq).sum()
+                logger.warning(
+                    f"[LSTM Normalize] Example bad sequence[{example_idx}]: "
+                    f"shape={example_seq.shape}, NaN={nan_count}, Inf={inf_count}, "
+                    f"min={np.nanmin(example_seq):.6f}, max={np.nanmax(example_seq):.6f}"
+                )
+        
+        # Replace NaN/Inf with 0.0 (deterministic, training-compatible fallback)
+        # Direct assignment to numpy array (this modifies in-place)
+        sequences_array[~np.isfinite(sequences_array)] = 0.0
+        
+        # Final validation: ensure all values are now finite
+        if not np.isfinite(sequences_array).all():
+            logger.error(
+                "[LSTM Normalize] After sanitization, still found NaN/Inf in sequences_array. "
+                "This indicates a bug in the sanitization logic."
+            )
+            raise ValueError("Non-finite values remain after sanitization in sequences_array.")
+        
+        logger.info(
+            f"[LSTM Normalize] Sanitization complete. All NaN/Inf in sequences_array replaced with 0.0."
+        )
+    
+    return features_normalized, sequences_array
+
+
 class LSTMAttnSignalModel:
     """LSTM + Attention model wrapper for BTC price direction prediction."""
 
@@ -60,6 +549,13 @@ class LSTMAttnSignalModel:
         self.model: Optional[LSTMAttentionModel] = None
         self.device: Optional[torch.device] = None
         self.feature_cols: Optional[list[str]] = None
+        
+        # Cache for sequences to avoid repeated normalization (O(N^2) -> O(N × window_size))
+        # Cache key: (id(features_df), window_size, tuple(feature_cols))
+        self._cached_features_df_id: int | None = None
+        self._cached_sequences_full: np.ndarray | None = None
+        self._cached_window_size: int | None = None
+        self._cached_feature_cols: list[str] | None = None
 
         # Initialize device (always set, even if model file doesn't exist)
         try:
@@ -214,13 +710,69 @@ class LSTMAttnSignalModel:
         features = features.reindex(columns=self.feature_cols, fill_value=0.0)
         return features
 
+    def _get_or_build_sequences_full(
+        self,
+        features_df: pd.DataFrame,
+        window_size: int,
+        feature_cols: list[str],
+        logger: logging.Logger,
+    ) -> np.ndarray:
+        """
+        Return a cached full 3D sequence tensor if possible; otherwise build it once
+        using build_normalized_lstm_sequences_full(), cache it, and return it.
+        
+        This ensures build_normalized_lstm_sequences_full() is called at most once
+        per features_df + window_size + feature_cols configuration.
+        
+        Args:
+            features_df: Full features DataFrame
+            window_size: Sequence length
+            feature_cols: List of feature column names
+            logger: Logger instance
+        
+        Returns:
+            sequences: np.ndarray of shape (num_sequences, window_size, feature_dim), dtype float32
+        """
+        # Cache key: use id() to check if it's the same DataFrame object
+        features_df_id = id(features_df)
+        
+        # Check cache
+        if (self._cached_features_df_id == features_df_id and
+            self._cached_window_size == window_size and
+            self._cached_feature_cols == feature_cols):
+            logger.debug(
+                f"[LSTM Cache] Cache HIT: reusing {self._cached_sequences_full.shape[0]} sequences "
+                f"for features_df (id={features_df_id}, len={len(features_df)})"
+            )
+            return self._cached_sequences_full
+        
+        # Cache miss: build sequences
+        logger.debug(
+            f"[LSTM Cache] Cache MISS: building sequences for features_df "
+            f"(id={features_df_id}, len={len(features_df)}, window_size={window_size})"
+        )
+        
+        sequences = build_normalized_lstm_sequences_full(
+            features_df=features_df,
+            window_size=window_size,
+            feature_cols=feature_cols,
+            logger=logger,
+        )
+        
+        # Update cache
+        self._cached_features_df_id = features_df_id
+        self._cached_window_size = window_size
+        self._cached_feature_cols = list(feature_cols)  # Make a copy
+        self._cached_sequences_full = sequences
+        
+        return sequences
+
     def _prepare_sequence(self, df: pd.DataFrame, symbol: str | None = None, timeframe: str | None = None) -> torch.Tensor:
         """
-        Prepare sequence for LSTM model.
+        Prepare sequence for LSTM model (legacy single-step prediction).
         
-        IMPORTANT: 이 함수는 학습 시점의 정규화 방식과 완전히 동일해야 함.
-        - 학습 시: 각 시퀀스마다 rolling(window=window_size)로 정규화
-        - 예측 시: 동일한 방식으로 정규화 (현재 시점 기준 rolling window)
+        IMPORTANT: This function now uses the shared build_normalized_lstm_sequence() helper
+        to ensure mathematical identity with the batch prediction path.
 
         Args:
             df: DataFrame with OHLCV + indicators (must be sorted by timestamp)
@@ -238,35 +790,37 @@ class LSTMAttnSignalModel:
                 f"Not enough data: need at least {self.window_size} rows, got {len(features)}"
             )
 
-        # Get last window_size rows
-        seq_features = features.iloc[-self.window_size :].copy()
+        # Ensure feature columns match
+        if self.feature_cols is None:
+            self.feature_cols = features.columns.tolist()
+        else:
+            features = features.reindex(columns=self.feature_cols, fill_value=0.0)
 
-        # Normalize features (using rolling statistics, same as training)
-        # IMPORTANT: 학습 시점과 동일한 방식으로 정규화
-        #
-        # 정규화 방식 (학습 시점과 동일):
-        # - 학습 시: 각 행 i에 대해 [i-window_size+1:i+1] 구간의 평균/표준편차로 정규화
-        # - 예측 시: 마지막 시퀀스의 마지막 행에서 [len-window_size:len] 구간의 평균/표준편차 사용
-        #
-        # 예: window_size=60, 전체 데이터가 1000행일 때
-        #   - 학습 시: 행 60은 [0:61] 구간의 통계로 정규화
-        #   - 예측 시: 행 999는 [939:1000] 구간의 통계로 정규화
-        #
-        # 이렇게 하면 학습 시점과 예측 시점의 정규화 방식이 일치함
-        for col in seq_features.columns:
-            # Calculate mean and std from the full feature history
-            # 마지막 시퀀스의 마지막 행에서 rolling window의 마지막 값 사용
-            mean = features[col].rolling(window=self.window_size, min_periods=1).mean().iloc[-1]
-            std = features[col].rolling(window=self.window_size, min_periods=1).std().iloc[-1]
-            if std == 0:
-                std = 1  # Avoid division by zero
-            seq_features[col] = (seq_features[col] - mean) / std
-
-        # Convert to numpy and then tensor
-        seq_array = seq_features.values.astype(np.float32)
-        seq_tensor = torch.FloatTensor(seq_array).unsqueeze(0)  # Add batch dimension
+        # IMPORTANT: Use cached sequences to ensure mathematical identity with batch path
+        # This uses the same cached sequences as batch prediction, avoiding repeated normalization
+        sequences_array = self._get_or_build_sequences_full(
+            features_df=features,
+            window_size=self.window_size,
+            feature_cols=self.feature_cols,
+            logger=logger,
+        )
         
-        # Feature dimension 검증 로깅 (디버깅용)
+        # Extract the last sequence (corresponds to the latest time index)
+        # The last sequence is at index len(sequences_array) - 1
+        # This corresponds to time index: (len(sequences_array) - 1) + window_size = len(features) - 1
+        latest_sequence = sequences_array[-1]  # shape: (window_size, feature_dim)
+        
+        # Defensive assertions
+        assert latest_sequence.ndim == 2, f"Expected 2D sequence, got {latest_sequence.ndim}D"
+        assert latest_sequence.shape[0] == self.window_size, \
+            f"Expected window_size={self.window_size}, got {latest_sequence.shape[0]}"
+        assert latest_sequence.shape[1] == len(self.feature_cols), \
+            f"Expected feature_dim={len(self.feature_cols)}, got {latest_sequence.shape[1]}"
+        
+        # Convert to tensor: (1, window_size, feature_dim)
+        seq_tensor = torch.from_numpy(latest_sequence).unsqueeze(0)
+        
+        # Feature dimension validation
         actual_feature_dim = seq_tensor.shape[2]
         if self.model is not None and hasattr(self.model, 'input_size'):
             expected_feature_dim = self.model.input_size
@@ -286,20 +840,30 @@ class LSTMAttnSignalModel:
 
         return seq_tensor
 
-    def predict_proba_latest(self, df: pd.DataFrame, symbol: str | None = None, timeframe: str | None = None) -> float:
+    def predict_proba_latest(
+        self, 
+        df: pd.DataFrame, 
+        symbol: str | None = None, 
+        timeframe: str | None = None,
+        return_both: bool = False,
+    ) -> float | tuple[float, float]:
         """
         Predict probability of price going up (next horizon periods).
         
         This method maintains backward compatibility by returning proba_long
-        from 3-class softmax output.
+        from 3-class softmax output. When return_both=True, returns both
+        proba_long and proba_short from 3-class softmax.
 
         Args:
             df: DataFrame with OHLCV + indicators (must be sorted by timestamp)
             symbol: Trading symbol (default: from settings)
             timeframe: Timeframe (default: from settings)
+            return_both: If True, returns (proba_long, proba_short) tuple.
+                        If False, returns only proba_long (backward compatible).
 
         Returns:
-            Probability of LONG class (0.0 to 1.0) from 3-class softmax
+            If return_both=True: Tuple of (proba_long: float, proba_short: float)
+            If return_both=False: Probability of LONG class (0.0 to 1.0) from 3-class softmax
         """
         if not self.is_loaded():
             raise ValueError("Model not loaded. Train model first or check model path.")
@@ -320,18 +884,52 @@ class LSTMAttnSignalModel:
         self.model.eval()
         with torch.no_grad():
             logits = self.model(seq_tensor)  # (1, 3), raw logits
+            
+            # Check for NaN/Inf in logits
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                logger.error(
+                    "[LSTM Proba][Legacy] Found NaN/Inf in logits. "
+                    "This indicates a problem in model forward pass or input sequence."
+                )
+                raise ValueError("NaN/Inf detected in model logits during legacy forward pass.")
+            
             probs = torch.nn.functional.softmax(logits, dim=-1)  # (1, 3), probabilities
+            
+            # Check for NaN/Inf in probabilities
+            if torch.isnan(probs).any() or torch.isinf(probs).any():
+                logger.error(
+                    "[LSTM Proba][Legacy] Found NaN/Inf in probabilities. "
+                    "This indicates a problem in softmax computation."
+                )
+                raise ValueError("NaN/Inf detected in model probabilities after softmax.")
+            
             prob_long = float(probs[0, LstmClassIndex.LONG].cpu().item())
+            prob_short = float(probs[0, LstmClassIndex.SHORT].cpu().item())
+            
+            # Final check on extracted probabilities
+            if np.isnan(prob_long) or np.isinf(prob_long):
+                logger.error(
+                    f"[LSTM Proba][Legacy] Found NaN/Inf in prob_long: {prob_long}"
+                )
+                raise ValueError("NaN/Inf detected in prob_long after extraction.")
+            if np.isnan(prob_short) or np.isinf(prob_short):
+                logger.error(
+                    f"[LSTM Proba][Legacy] Found NaN/Inf in prob_short: {prob_short}"
+                )
+                raise ValueError("NaN/Inf detected in prob_short after extraction.")
             
             logger.debug(
                 f"predict_proba_latest: logits={logits.cpu().numpy().flatten()}, "
                 f"probs=[FLAT={probs[0, LstmClassIndex.FLAT]:.4f}, "
                 f"LONG={probs[0, LstmClassIndex.LONG]:.4f}, "
                 f"SHORT={probs[0, LstmClassIndex.SHORT]:.4f}], "
-                f"proba_long={prob_long:.4f}"
+                f"proba_long={prob_long:.4f}, proba_short={prob_short:.4f}"
             )
 
-        return prob_long
+        if return_both:
+            return prob_long, prob_short
+        else:
+            return prob_long
 
     def predict_label_latest(
         self,
@@ -413,53 +1011,39 @@ class LSTMAttnSignalModel:
         else:
             features = features.reindex(columns=self.feature_cols, fill_value=0.0)
         
-        num_sequences = len(features) - self.window_size + 1
         feature_dim = len(self.feature_cols)
         
         logger.info(
             f"[LSTM Proba][Batch] total_rows={len(features)}, window_size={self.window_size}, "
-            f"num_sequences={num_sequences}, batch_size={batch_size}"
+            f"batch_size={batch_size}"
         )
         
-        # Create all sequences with rolling normalization
-        # Each sequence i uses features[i:i+window_size] normalized by rolling stats
-        # We create sequences starting from index (window_size - 1) to match training
-        sequences: list[torch.Tensor] = []
+        # IMPORTANT: Use cached sequences for O(N × window_size) complexity
+        # This normalizes the entire DataFrame ONCE, then extracts all sequences via sliding windows
+        # Both batch and legacy paths use this same cached sequences to ensure mathematical identity
+        sequences_array = self._get_or_build_sequences_full(
+            features_df=features,
+            window_size=self.window_size,
+            feature_cols=self.feature_cols,
+            logger=logger,
+        )
         
-        # Pre-compute rolling statistics for all features
-        rolling_mean = features.rolling(window=self.window_size, min_periods=1).mean()
-        rolling_std = features.rolling(window=self.window_size, min_periods=1).std()
-        rolling_std = rolling_std.replace(0, 1)  # Avoid division by zero
+        num_sequences = sequences_array.shape[0]
         
-        # Create normalized sequences
-        # Sequence at position i uses features[i-window_size+1:i+1] normalized by stats at i
-        # This matches training: each sequence is normalized by rolling stats at the end of the window
-        for i in range(self.window_size - 1, len(features)):
-            # Get sequence window: from (i - window_size + 1) to i (inclusive)
-            seq_start = i - self.window_size + 1
-            seq_end = i + 1
-            seq_features = features.iloc[seq_start:seq_end].copy()
-            
-            # Normalize using rolling statistics at the end of the window (index i)
-            # This matches the training normalization: each row is normalized by
-            # the rolling stats computed up to that row
-            mean_at_end = rolling_mean.iloc[i]
-            std_at_end = rolling_std.iloc[i]
-            
-            # Normalize sequence
-            seq_normalized = (seq_features - mean_at_end) / std_at_end
-            
-            # Convert to tensor
-            seq_array = seq_normalized.values.astype(np.float32)
-            seq_tensor = torch.FloatTensor(seq_array).unsqueeze(0)  # (1, window_size, feature_dim)
-            sequences.append(seq_tensor)
+        # Defensive assertions
+        assert sequences_array.ndim == 3, f"Expected 3D sequences array, got {sequences_array.ndim}D"
+        assert sequences_array.shape[1] == self.window_size, \
+            f"Expected window_size={self.window_size}, got {sequences_array.shape[1]}"
+        assert sequences_array.shape[2] == len(self.feature_cols), \
+            f"Expected feature_dim={len(self.feature_cols)}, got {sequences_array.shape[2]}"
         
-        # Concatenate all sequences into a single tensor
-        if sequences:
-            all_sequences = torch.cat(sequences, dim=0)  # (num_sequences, window_size, feature_dim)
-        else:
-            # Edge case: no sequences
-            all_sequences = torch.empty((0, self.window_size, feature_dim), dtype=torch.float32)
+        logger.info(
+            f"[LSTM Proba][Batch] Using {num_sequences} sequences from {len(features)} feature rows "
+            f"(from cache or newly built)"
+        )
+        
+        # Convert to tensor
+        all_sequences = torch.from_numpy(sequences_array)  # (num_sequences, window_size, feature_dim)
         
         # Move to device
         all_sequences = all_sequences.to(self.device)
@@ -477,11 +1061,54 @@ class LSTMAttnSignalModel:
                 
                 # Forward pass (3-class)
                 logits = self.model(batch_sequences)  # (batch_size, 3)
+                
+                # Check for NaN/Inf in logits
+                if torch.isnan(logits).any() or torch.isinf(logits).any():
+                    logger.error(
+                        f"[LSTM Proba][Batch] Found NaN/Inf in logits at batch_start={batch_start}. "
+                        f"This indicates a problem in model forward pass or input sequences."
+                    )
+                    bad_mask = torch.isnan(logits) | torch.isinf(logits)
+                    bad_count = bad_mask.sum().item()
+                    logger.error(
+                        f"[LSTM Proba][Batch] Bad logits count = {bad_count}, "
+                        f"batch_size = {batch_sequences.shape[0]}, "
+                        f"logits shape = {logits.shape}"
+                    )
+                    raise ValueError("NaN/Inf detected in model logits during batch forward pass.")
+                
                 probs = torch.nn.functional.softmax(logits, dim=-1)  # (batch_size, 3)
+                
+                # Check for NaN/Inf in probabilities
+                if torch.isnan(probs).any() or torch.isinf(probs).any():
+                    logger.error(
+                        f"[LSTM Proba][Batch] Found NaN/Inf in probabilities at batch_start={batch_start}. "
+                        f"This indicates a problem in softmax computation."
+                    )
+                    bad_mask = torch.isnan(probs) | torch.isinf(probs)
+                    bad_count = bad_mask.sum().item()
+                    logger.error(
+                        f"[LSTM Proba][Batch] Bad probs count = {bad_count}, "
+                        f"batch_size = {batch_sequences.shape[0]}, "
+                        f"probs shape = {probs.shape}"
+                    )
+                    raise ValueError("NaN/Inf detected in model probabilities after softmax.")
                 
                 # Extract LONG and SHORT probabilities
                 proba_long_batch = probs[:, LstmClassIndex.LONG].cpu().numpy()
                 proba_short_batch = probs[:, LstmClassIndex.SHORT].cpu().numpy()
+                
+                # Final check on extracted probabilities
+                if np.isnan(proba_long_batch).any() or np.isinf(proba_long_batch).any():
+                    logger.error(
+                        f"[LSTM Proba][Batch] Found NaN/Inf in proba_long_batch at batch_start={batch_start}"
+                    )
+                    raise ValueError("NaN/Inf detected in proba_long_batch after extraction.")
+                if np.isnan(proba_short_batch).any() or np.isinf(proba_short_batch).any():
+                    logger.error(
+                        f"[LSTM Proba][Batch] Found NaN/Inf in proba_short_batch at batch_start={batch_start}"
+                    )
+                    raise ValueError("NaN/Inf detected in proba_short_batch after extraction.")
                 
                 all_proba_long.extend(proba_long_batch.tolist())
                 all_proba_short.extend(proba_short_batch.tolist())
@@ -489,6 +1116,31 @@ class LSTMAttnSignalModel:
         
         proba_long_arr = np.array(all_proba_long, dtype=np.float32)
         proba_short_arr = np.array(all_proba_short, dtype=np.float32)
+        
+        # Final NaN/Inf check on output arrays
+        if np.isnan(proba_long_arr).any() or np.isinf(proba_long_arr).any():
+            logger.error(
+                "[LSTM Proba][Batch] Found NaN/Inf in final proba_long_arr. "
+                "This should have been caught earlier."
+            )
+            bad_count = (np.isnan(proba_long_arr) | np.isinf(proba_long_arr)).sum()
+            logger.error(
+                f"[LSTM Proba][Batch] Bad proba_long count = {bad_count}, "
+                f"total = {len(proba_long_arr)}"
+            )
+            raise ValueError("NaN/Inf detected in final proba_long_arr.")
+        
+        if np.isnan(proba_short_arr).any() or np.isinf(proba_short_arr).any():
+            logger.error(
+                "[LSTM Proba][Batch] Found NaN/Inf in final proba_short_arr. "
+                "This should have been caught earlier."
+            )
+            bad_count = (np.isnan(proba_short_arr) | np.isinf(proba_short_arr)).sum()
+            logger.error(
+                f"[LSTM Proba][Batch] Bad proba_short count = {bad_count}, "
+                f"total = {len(proba_short_arr)}"
+            )
+            raise ValueError("NaN/Inf detected in final proba_short_arr.")
         
         logger.info(
             f"[LSTM Proba][Batch] forward_calls={forward_calls}, "

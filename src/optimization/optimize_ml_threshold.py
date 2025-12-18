@@ -41,6 +41,17 @@ def run_threshold_optimization_for_ml_strategy(
     short_threshold_min: float | None = None,
     short_threshold_max: float | None = None,
     short_threshold_step: float | None = None,
+    user_provided_short_range: bool = False,  # True if user explicitly provided --short-min/--short-max/--short-step
+    # Signal filter parameters (for LSTM 3-class model)
+    flat_threshold_min: float | None = None,
+    flat_threshold_max: float | None = None,
+    flat_threshold_step: float | None = None,
+    confidence_margin_min: float | None = None,
+    confidence_margin_max: float | None = None,
+    confidence_margin_step: float | None = None,
+    min_proba_dominance_min: float | None = None,
+    min_proba_dominance_max: float | None = None,
+    min_proba_dominance_step: float | None = None,
     save_result: bool = True,
     use_parallel: bool = True,
     n_jobs: int = -1,
@@ -101,8 +112,52 @@ def run_threshold_optimization_for_ml_strategy(
     # Generate threshold candidates
     long_candidates = list(np.arange(long_min, long_max + long_step, long_step))
     short_candidates = list(np.arange(short_min, short_max + short_step, short_step))
+    
     # Add None to short_candidates to test long-only mode
-    short_candidates.append(None)
+    # BUT: If user explicitly provided short range (--short-min/--short-max/--short-step),
+    #      do NOT add None (user wants numeric thresholds only)
+    if not user_provided_short_range:
+        short_candidates.append(None)
+        logger.info(
+            "[ThresholdOptimizer] Short threshold range not explicitly provided by user. "
+            "Adding None to short_candidates to test long-only mode."
+        )
+    else:
+        logger.info(
+            "[ThresholdOptimizer] Short threshold range explicitly provided by user. "
+            "NOT adding None to short_candidates (numeric thresholds only)."
+        )
+    
+    # Generate signal filter candidates (for LSTM 3-class model)
+    # flat_threshold: None (disabled) + optional range
+    flat_threshold_candidates = [None]  # Always include None (disabled)
+    if flat_threshold_min is not None and flat_threshold_max is not None and flat_threshold_step is not None:
+        flat_range = list(np.arange(flat_threshold_min, flat_threshold_max + flat_threshold_step, flat_threshold_step))
+        flat_threshold_candidates.extend(flat_range)
+        logger.info(
+            f"[ThresholdOptimizer] FLAT threshold candidates: {len(flat_threshold_candidates)} "
+            f"(None + range [{flat_threshold_min:.3f}, {flat_threshold_max:.3f}], step={flat_threshold_step:.3f})"
+        )
+    
+    # confidence_margin: 0.0 (disabled) + optional range
+    confidence_margin_candidates = [0.0]  # Always include 0.0 (disabled)
+    if confidence_margin_min is not None and confidence_margin_max is not None and confidence_margin_step is not None:
+        conf_range = list(np.arange(confidence_margin_min, confidence_margin_max + confidence_margin_step, confidence_margin_step))
+        confidence_margin_candidates.extend(conf_range)
+        logger.info(
+            f"[ThresholdOptimizer] Confidence margin candidates: {len(confidence_margin_candidates)} "
+            f"(0.0 + range [{confidence_margin_min:.3f}, {confidence_margin_max:.3f}], step={confidence_margin_step:.3f})"
+        )
+    
+    # min_proba_dominance: 0.0 (disabled) + optional range
+    min_proba_dominance_candidates = [0.0]  # Always include 0.0 (disabled)
+    if min_proba_dominance_min is not None and min_proba_dominance_max is not None and min_proba_dominance_step is not None:
+        dom_range = list(np.arange(min_proba_dominance_min, min_proba_dominance_max + min_proba_dominance_step, min_proba_dominance_step))
+        min_proba_dominance_candidates.extend(dom_range)
+        logger.info(
+            f"[ThresholdOptimizer] Min proba dominance candidates: {len(min_proba_dominance_candidates)} "
+            f"(0.0 + range [{min_proba_dominance_min:.3f}, {min_proba_dominance_max:.3f}], step={min_proba_dominance_step:.3f})"
+        )
     
     logger.info("=" * 60)
     logger.info("ML Threshold Optimization")
@@ -111,6 +166,8 @@ def run_threshold_optimization_for_ml_strategy(
     logger.info(f"Symbol: {symbol}, Timeframe: {timeframe}")
     if strategy_name == "ml_xgb":
         logger.info(f"Feature preset: {feature_preset}")
+    elif strategy_name == "ml_lstm_attn":
+        logger.info(f"LSTM-Attention strategy: using cached probabilities from ml_proba_cache")
     if start_date or end_date:
         logger.info(f"Date range filter: start_date={start_date}, end_date={end_date}")
     logger.info(f"Metric: {metric_name}")
@@ -125,7 +182,42 @@ def run_threshold_optimization_for_ml_strategy(
     logger.info(f"Optimization constraints: min_trades_in={resolved_min_trades_in}, min_trades_out={resolved_min_trades_out}, min_sharpe_out={resolved_min_sharpe_out}")
     logger.info(f"Long threshold range: [{long_min:.3f}, {long_max:.3f}] step={long_step:.3f}")
     logger.info(f"Short threshold range: [{short_min:.3f}, {short_max:.3f}] step={short_step:.3f}")
-    logger.info(f"Total combinations: {len(long_candidates) * len(short_candidates)}")
+    
+    # Log short grid details including None inclusion
+    short_has_none = None in short_candidates
+    short_none_reason = (
+        "user did not provide short range (default behavior)"
+        if short_has_none and not user_provided_short_range
+        else "N/A (None not included)"
+    )
+    logger.info(
+        f"Short threshold grid: count={len(short_candidates)}, "
+        f"includes_None={short_has_none}, reason={short_none_reason}, "
+        f"user_provided_short_range={user_provided_short_range}"
+    )
+    
+    # Calculate total combinations (including signal filters if provided)
+    base_combinations = len(long_candidates) * len(short_candidates)
+    filter_multiplier = (
+        len(flat_threshold_candidates) *
+        len(confidence_margin_candidates) *
+        len(min_proba_dominance_candidates)
+    )
+    total_combinations = base_combinations * filter_multiplier
+    
+    logger.info(
+        f"Total combinations: {total_combinations} "
+        f"(base: {base_combinations} threshold combinations × "
+        f"{filter_multiplier} filter combinations)"
+    )
+    
+    if filter_multiplier > 1:
+        logger.info(
+            f"Signal filter grids: "
+            f"flat_th={len(flat_threshold_candidates)}, "
+            f"conf_margin={len(confidence_margin_candidates)}, "
+            f"min_dominance={len(min_proba_dominance_candidates)}"
+        )
     
     # Resolve strategy_mode and min requirements
     if strategy_mode is None:
@@ -136,6 +228,30 @@ def run_threshold_optimization_for_ml_strategy(
         min_trades_out = getattr(settings, "MIN_TRADES_OUT_DEFAULT", 50)
     if min_sharpe_out is None:
         min_sharpe_out = getattr(settings, "MIN_SHARPE_OUT_DEFAULT", 0.0)
+    
+    # For LSTM strategy, default to serial execution to avoid MemoryError
+    # User can still override with --use-parallel
+    if strategy_name == "ml_lstm_attn":
+        # For LSTM, be more conservative with parallel execution
+        # If use_parallel is True and n_jobs is -1 (defaults), assume it wasn't explicitly set
+        # and default to False for LSTM to avoid MemoryError
+        if use_parallel and n_jobs == -1:
+            # Likely using defaults - change to serial for LSTM
+            use_parallel = False
+            logger.info(
+                "[ThresholdOptimizer] ml_lstm_attn: Defaulting to serial execution to avoid MemoryError. "
+                "Use --use-parallel to enable parallel mode (n_jobs will be limited to 4 for memory safety)."
+            )
+        elif use_parallel:
+            # User explicitly enabled parallel - limit n_jobs for safety
+            import os
+            max_safe_jobs = min(4, os.cpu_count() or 1)
+            if n_jobs == -1 or n_jobs > max_safe_jobs:
+                n_jobs = max_safe_jobs
+                logger.info(
+                    f"[ThresholdOptimizer] ml_lstm_attn: Limiting n_jobs to {n_jobs} for memory safety "
+                    "(LSTM backtests use more memory than XGBoost)"
+                )
     
     logger.info(
         "Running ML threshold optimization: strategy=%s, symbol=%s, timeframe=%s, "
@@ -154,6 +270,21 @@ def run_threshold_optimization_for_ml_strategy(
         min_trades_out,
         min_sharpe_out,
     )
+    # Check if signal filter parameters are provided (for future grid-search integration)
+    has_signal_filters = (
+        flat_threshold_min is not None or
+        confidence_margin_min is not None or
+        min_proba_dominance_min is not None
+    )
+    
+    if has_signal_filters:
+        logger.warning(
+            "[ThresholdOptimizer] Extra signal-filter params provided "
+            "(flat_threshold, confidence_margin, min_proba_dominance) "
+            "but grid-search integration is not enabled yet; running with long/short only. "
+            "These parameters will be ignored for now."
+        )
+    
     logger.info("=" * 60)
     
     # Data loader (closure with fixed params)
@@ -238,13 +369,28 @@ def run_threshold_optimization_for_ml_strategy(
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Optimize ML strategy thresholds.")
-    parser.add_argument("--strategy", type=str, default="ml_xgb", choices=list(STRATEGY_REGISTRY.keys()))
-    parser.add_argument("--symbol", type=str, default="BTCUSDT")
-    parser.add_argument("--timeframe", type=str, default="1m")
-    parser.add_argument("--feature-preset", type=str, default="extended_safe", 
-                       choices=["base", "extended_safe", "extended_full"],
-                       help="Feature preset for ml_xgb strategy (default: extended_safe)")
+    parser = argparse.ArgumentParser(
+        description="Optimize ML strategy thresholds. "
+        "Supports ml_xgb (XGBoost) and ml_lstm_attn (LSTM-Attention) strategies."
+    )
+    parser.add_argument(
+        "--strategy",
+        type=str,
+        default="ml_xgb",
+        choices=list(STRATEGY_REGISTRY.keys()),
+        help="Strategy name: 'ml_xgb' (XGBoost) or 'ml_lstm_attn' (LSTM-Attention). "
+        "ml_lstm_attn uses cached probabilities from ml_proba_cache."
+    )
+    parser.add_argument("--symbol", type=str, default="BTCUSDT", help="Trading symbol (default: BTCUSDT)")
+    parser.add_argument("--timeframe", type=str, default="1m", help="Timeframe (default: 1m)")
+    parser.add_argument(
+        "--feature-preset",
+        type=str,
+        default="extended_safe",
+        choices=["base", "extended_safe", "extended_full"],
+        help="Feature preset for ml_xgb strategy only (default: extended_safe). "
+        "Ignored for ml_lstm_attn (uses its own feature extraction)."
+    )
     parser.add_argument("--metric", type=str, default=None, help="Metric name (e.g., sharpe)")
     parser.add_argument("--long-min", type=float, default=None)
     parser.add_argument("--long-max", type=float, default=None)
@@ -252,6 +398,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--short-min", type=float, default=None)
     parser.add_argument("--short-max", type=float, default=None)
     parser.add_argument("--short-step", type=float, default=None)
+    
+    # Signal filter parameters (for LSTM 3-class model)
+    parser.add_argument("--flat-th-min", type=float, default=None, help="FLAT threshold minimum (None = disabled)")
+    parser.add_argument("--flat-th-max", type=float, default=None, help="FLAT threshold maximum")
+    parser.add_argument("--flat-th-step", type=float, default=None, help="FLAT threshold step")
+    parser.add_argument("--conf-margin-min", type=float, default=None, help="Confidence margin minimum (0.0 = disabled)")
+    parser.add_argument("--conf-margin-max", type=float, default=None, help="Confidence margin maximum")
+    parser.add_argument("--conf-margin-step", type=float, default=None, help="Confidence margin step")
+    parser.add_argument("--min-dominance-min", type=float, default=None, help="Min proba dominance minimum (0.0 = disabled)")
+    parser.add_argument("--min-dominance-max", type=float, default=None, help="Min proba dominance maximum")
+    parser.add_argument("--min-dominance-step", type=float, default=None, help="Min proba dominance step")
+    
     parser.add_argument("--no-save", action="store_true", help="Do not save JSON result")
     
     # Strategy mode and optimization constraints
@@ -295,6 +453,8 @@ def _parse_args() -> argparse.Namespace:
         action="store_false",
         help="Disable parallel execution for threshold optimization.",
     )
+    # Default depends on strategy: LSTM defaults to False, XGBoost defaults to True
+    # We'll set default to True here, but override for LSTM in run_threshold_optimization_for_ml_strategy
     parser.set_defaults(use_parallel=True)
     
     parser.add_argument(
@@ -334,31 +494,102 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    args = _parse_args()
-    run_threshold_optimization_for_ml_strategy(
-        strategy_name=args.strategy,
-        symbol=args.symbol,
-        timeframe=args.timeframe,
-        feature_preset=args.feature_preset,
-        metric_name=args.metric,
-        long_threshold_min=args.long_min,
-        long_threshold_max=args.long_max,
-        long_threshold_step=args.long_step,
-        short_threshold_min=args.short_min,
-        short_threshold_max=args.short_max,
-        short_threshold_step=args.short_step,
-        save_result=not args.no_save,
-        use_parallel=args.use_parallel,
-        n_jobs=args.n_jobs,
-        rebuild_proba_cache=args.rebuild_proba_cache,
-        nthread=args.nthread,
-        start_date=args.start_date,
-        end_date=args.end_date,
-        strategy_mode=args.strategy_mode,
-        min_trades_in=args.min_trades_in,
-        min_trades_out=args.min_trades_out,
-        min_sharpe_out=args.min_sharpe_out,
+def main():
+    """
+    Main CLI entry point for ML threshold optimization.
+    """
+    # Configure logging at the start
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s:%(name)s:%(message)s"
     )
+    
+    logger.info("=" * 60)
+    logger.info("ML Threshold Optimizer CLI")
+    logger.info("=" * 60)
+    
+    try:
+        args = _parse_args()
+        
+        # Log parsed arguments for debugging
+        logger.info(f"[ThresholdOptimizer] Starting with args: strategy={args.strategy}, "
+                   f"symbol={args.symbol}, timeframe={args.timeframe}, "
+                   f"feature_preset={args.feature_preset}, metric={args.metric}")
+        
+        # Validate strategy is supported
+        if args.strategy not in STRATEGY_REGISTRY:
+            logger.error(
+                f"[ThresholdOptimizer] Unsupported strategy '{args.strategy}'. "
+                f"Available strategies: {list(STRATEGY_REGISTRY.keys())}"
+            )
+            raise ValueError(
+                f"Unsupported strategy '{args.strategy}'. "
+                f"Available: {list(STRATEGY_REGISTRY.keys())}"
+            )
+        
+        # Detect if user explicitly provided short range
+        # User is considered to have provided short range if ANY of --short-min/--short-max/--short-step is set
+        user_provided_short_range = (
+            args.short_min is not None or
+            args.short_max is not None or
+            args.short_step is not None
+        )
+        
+        if user_provided_short_range:
+            logger.info(
+                "[ThresholdOptimizer] User explicitly provided short threshold range. "
+                "None will NOT be added to short_candidates."
+            )
+        
+        # Run optimization
+        result = run_threshold_optimization_for_ml_strategy(
+            strategy_name=args.strategy,
+            symbol=args.symbol,
+            timeframe=args.timeframe,
+            feature_preset=args.feature_preset,
+            metric_name=args.metric,
+            long_threshold_min=args.long_min,
+            long_threshold_max=args.long_max,
+            long_threshold_step=args.long_step,
+            short_threshold_min=args.short_min,
+            short_threshold_max=args.short_max,
+            short_threshold_step=args.short_step,
+            user_provided_short_range=user_provided_short_range,
+            flat_threshold_min=args.flat_th_min,
+            flat_threshold_max=args.flat_th_max,
+            flat_threshold_step=args.flat_th_step,
+            confidence_margin_min=args.conf_margin_min,
+            confidence_margin_max=args.conf_margin_max,
+            confidence_margin_step=args.conf_margin_step,
+            min_proba_dominance_min=args.min_dominance_min,
+            min_proba_dominance_max=args.min_dominance_max,
+            min_proba_dominance_step=args.min_dominance_step,
+            save_result=not args.no_save,
+            use_parallel=args.use_parallel,
+            n_jobs=args.n_jobs,
+            rebuild_proba_cache=args.rebuild_proba_cache,
+            nthread=args.nthread,
+            start_date=args.start_date,
+            end_date=args.end_date,
+            strategy_mode=args.strategy_mode,
+            min_trades_in=args.min_trades_in,
+            min_trades_out=args.min_trades_out,
+            min_sharpe_out=args.min_sharpe_out,
+        )
+        
+        logger.info("[ThresholdOptimizer] Optimization completed successfully.")
+        return result
+        
+    except KeyboardInterrupt:
+        logger.warning("[ThresholdOptimizer] Interrupted by user.")
+        raise
+    except Exception as e:
+        logger.exception(
+            f"[ThresholdOptimizer] Fatal error during optimization: {type(e).__name__}: {e}"
+        )
+        raise
+
+
+if __name__ == "__main__":
+    main()
 

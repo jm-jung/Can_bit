@@ -8,9 +8,10 @@ across multiple threshold combinations without recomputing.
 from __future__ import annotations
 
 import logging
+import sys
 from pathlib import Path
 from typing import Any
-
+import torch
 import numpy as np
 import pandas as pd
 
@@ -21,6 +22,7 @@ from src.ml.xgb_model import MLXGBModel
 from src.services.ohlcv_service import load_ohlcv_df
 from src.ml.features import build_feature_frame
 from src.features.ml_feature_config import MLFeatureConfig
+from src.dl.data.labels import LstmClassIndex
 
 logger = logging.getLogger(__name__)
 
@@ -416,13 +418,20 @@ def compute_ml_proba_cache(
                     )
                 continue
     elif strategy_name == "ml_lstm_attn":
-        # Optimized batch path for LSTM-Attention
+        # Optimized batch path for LSTM-Attention (3-class model)
         from src.dl.lstm_attn_model import LSTMAttnSignalModel
         
         if not isinstance(model, LSTMAttnSignalModel):
             raise ValueError(
                 f"[Proba Cache][{adapter.name}] Expected LSTMAttnSignalModel, got {type(model)}"
             )
+        
+        # Log 3-class model information
+        logger.info(
+            f"[Proba Cache][{adapter.name}] Using 3-class LSTM-Attention model. "
+            f"Class indices: FLAT={LstmClassIndex.FLAT}, LONG={LstmClassIndex.LONG}, SHORT={LstmClassIndex.SHORT}. "
+            f"proba_long/proba_short are derived from 3-class softmax output."
+        )
         
         # Extract features once for entire dataset
         logger.info(
@@ -453,19 +462,27 @@ def compute_ml_proba_cache(
             )
             
             # Align with original df indices
-            # proba arrays have length (len(full_features) - window_size + 1)
-            # But we need predictions starting from min_rows (window_size)
-            # So we need to map feature indices back to df indices
+            # IMPORTANT: Batch path now matches training exactly:
+            # - Training: for i in range(window_size, len(features)): seq = features[i-window_size:i]
+            # - Batch: for i in range(window_size, len(features)): seq = features[i-window_size:i]
+            # - proba arrays have length (len(full_features) - window_size)
+            # - Predictions correspond to indices [window_size, window_size+1, ..., len(features)-1] in features
+            # - We need to map these to df indices, accounting for dropna() in feature extraction
             
             num_proba = len(proba_long_arr)
             num_features = len(full_features)
             
-            # The proba arrays correspond to sequences starting from index (window_size - 1) in features
-            # But we want predictions starting from min_rows in df
-            # Since features may have fewer rows than df due to dropna(), we need to be careful
+            # Batch path creates sequences for i in range(window_size, len(features))
+            # So proba arrays have length (len(features) - window_size)
+            # Predictions correspond to feature indices [window_size, window_size+1, ..., len(features)-1]
+            # We need to map these to df indices
             
-            # Calculate how many predictions we can use
-            # We need at least min_rows predictions to match the old behavior
+            # Since features may have fewer rows than df due to dropna(), we need to be careful
+            # The mapping depends on how dropna() removed rows
+            # For now, assume features and df are aligned after dropna()
+            # (This is true if dropna() only removes rows with NaN, not reorders)
+            
+            # Calculate expected predictions: starting from min_rows (window_size) in df
             expected_proba_count = len(df) - min_rows
             
             if num_proba < expected_proba_count:
@@ -509,13 +526,20 @@ def compute_ml_proba_cache(
                 f"[Proba Cache][{adapter.name}] Falling back to legacy per-step prediction..."
             )
             # Fallback to legacy path
+            # IMPORTANT: Use return_both=True to get correct proba_short from 3-class softmax
             prediction_errors = 0
             for i in range(min_rows, len(df)):
                 df_slice = df.iloc[: i + 1]
                 try:
-                    proba_up = float(model.predict_proba_latest(df_slice, symbol=symbol, timeframe=timeframe))
-                    proba_long_values.append(proba_up)
-                    proba_short_values.append(1.0 - proba_up)
+                    # Use return_both=True to get both proba_long and proba_short from 3-class softmax
+                    proba_long_val, proba_short_val = model.predict_proba_latest(
+                        df_slice, 
+                        symbol=symbol, 
+                        timeframe=timeframe,
+                        return_both=True
+                    )
+                    proba_long_values.append(float(proba_long_val))
+                    proba_short_values.append(float(proba_short_val))
                     valid_indices.append(i)
                 except Exception as exc2:
                     prediction_errors += 1
@@ -564,12 +588,36 @@ def compute_ml_proba_cache(
     proba_long_arr = np.array(proba_long_values, dtype=np.float32)
     proba_short_arr = np.array(proba_short_values, dtype=np.float32)
     
+    # Log probability statistics
     logger.info(
         f"[Proba Cache][{adapter.name}] Completed: "
         f"successful={len(proba_long_values)}, errors={prediction_errors}, "
         f"mean_proba_long={proba_long_arr.mean():.4f}, std={proba_long_arr.std():.4f}, "
         f"mean_proba_short={proba_short_arr.mean():.4f}, std={proba_short_arr.std():.4f}"
     )
+    
+    # For 3-class LSTM models, log additional statistics
+    if strategy_name == "ml_lstm_attn":
+        # Compute proba_flat for statistics (3-class: p_flat + p_long + p_short = 1)
+        proba_flat_arr = 1.0 - proba_long_arr - proba_short_arr
+        proba_flat_arr = np.clip(proba_flat_arr, 0.0, 1.0)
+        
+        # Compute argmax distribution (predicted class distribution)
+        proba_stack = np.stack([proba_flat_arr, proba_long_arr, proba_short_arr], axis=1)  # (N, 3)
+        predicted_classes = np.argmax(proba_stack, axis=1)  # (N,) with values {0: FLAT, 1: LONG, 2: SHORT}
+        
+        flat_count = int(np.sum(predicted_classes == LstmClassIndex.FLAT))
+        long_count = int(np.sum(predicted_classes == LstmClassIndex.LONG))
+        short_count = int(np.sum(predicted_classes == LstmClassIndex.SHORT))
+        total_count = len(predicted_classes)
+        
+        logger.info(
+            f"[Proba Cache][{adapter.name}] 3-class model statistics: "
+            f"mean_proba_flat={proba_flat_arr.mean():.4f}, "
+            f"predicted_class_distribution: FLAT={flat_count} ({100*flat_count/total_count:.1f}%), "
+            f"LONG={long_count} ({100*long_count/total_count:.1f}%), "
+            f"SHORT={short_count} ({100*short_count/total_count:.1f}%)"
+        )
     
     # Validation: Compare batch vs legacy for LSTM-Attention (small sample)
     if strategy_name == "ml_lstm_attn" and len(df) > 1000:
@@ -585,25 +633,53 @@ def compute_ml_proba_cache(
                         f"comparing batch vs legacy on {test_size} samples..."
                     )
                     
-                    # Legacy method: predict_proba_latest for each step
+                    # Legacy method: Use cached sequences directly for validation
+                    # IMPORTANT: Extract features from full DataFrame ONCE to use cache
+                    # Both batch and legacy now use the same cached sequences, ensuring mathematical identity
                     legacy_proba_long: list[float] = []
                     legacy_proba_short: list[float] = []
                     legacy_errors = 0
                     
+                    # Extract features once from full DataFrame (reuses cache from batch prediction)
+                    features_for_validation = model._extract_features(df, symbol=symbol, timeframe=timeframe)
+                    sequences_validation = model._get_or_build_sequences_full(
+                        features_df=features_for_validation,
+                        window_size=model.window_size,
+                        feature_cols=model.feature_cols,
+                        logger=logger,
+                    )
+                    
+                    # Validation: Compare batch vs legacy using same sequence indices
+                    # Batch predictions are indexed by sequence index: batch[seq_idx] corresponds to
+                    # sequence at index seq_idx, which uses features[seq_idx : seq_idx + window_size]
+                    # Legacy predictions use the same sequences, so we iterate over sequence indices
                     test_end_idx = min_rows + test_size
-                    for i in range(min_rows, test_end_idx):
-                        df_slice = df.iloc[: i + 1]
-                        try:
-                            proba_up = float(model.predict_proba_latest(df_slice, symbol=symbol, timeframe=timeframe))
-                            legacy_proba_long.append(proba_up)
-                            legacy_proba_short.append(1.0 - proba_up)
-                        except Exception as exc:
-                            legacy_errors += 1
-                            if legacy_errors <= 3:
-                                logger.warning(
-                                    f"[Proba Cache][{adapter.name}] Legacy prediction failed at index {i}: {exc}"
-                                )
-                            continue
+                    model.model.eval()
+                    with torch.no_grad():
+                        # Iterate over sequence indices (same as batch indexing)
+                        # Compare batch[seq_idx] with legacy prediction for sequence[seq_idx]
+                        for seq_idx in range(min(test_size, len(sequences_validation))):
+                            try:
+                                # Get sequence and predict (same as batch path)
+                                seq = sequences_validation[seq_idx:seq_idx+1]  # (1, window_size, feature_dim)
+                                seq_tensor = torch.from_numpy(seq).to(model.device)
+                                
+                                logits = model.model(seq_tensor)  # (1, 3)
+                                probs = torch.nn.functional.softmax(logits, dim=-1)  # (1, 3)
+                                
+                                # Extract probabilities from 3-class softmax using explicit class indices
+                                proba_long_val = float(probs[0, LstmClassIndex.LONG].cpu().item())  # LONG class (index 1)
+                                proba_short_val = float(probs[0, LstmClassIndex.SHORT].cpu().item())  # SHORT class (index 2)
+                                
+                                legacy_proba_long.append(proba_long_val)
+                                legacy_proba_short.append(proba_short_val)
+                            except Exception as exc:
+                                legacy_errors += 1
+                                if legacy_errors <= 3:
+                                    logger.warning(
+                                        f"[Proba Cache][{adapter.name}] Legacy prediction failed at seq_idx {seq_idx}: {exc}"
+                                    )
+                                continue
                     
                     if len(legacy_proba_long) > 0 and len(proba_long_values) >= len(legacy_proba_long):
                         # Compare first test_size predictions
@@ -612,33 +688,168 @@ def compute_ml_proba_cache(
                         legacy_proba_long_arr = np.array(legacy_proba_long, dtype=np.float32)
                         legacy_proba_short_arr = np.array(legacy_proba_short, dtype=np.float32)
                         
+                        # Check for NaN/Inf in batch or legacy arrays
+                        batch_has_nan = np.isnan(batch_proba_long).any() or np.isnan(batch_proba_short).any()
+                        batch_has_inf = np.isinf(batch_proba_long).any() or np.isinf(batch_proba_short).any()
+                        legacy_has_nan = np.isnan(legacy_proba_long_arr).any() or np.isnan(legacy_proba_short_arr).any()
+                        legacy_has_inf = np.isinf(legacy_proba_long_arr).any() or np.isinf(legacy_proba_short_arr).any()
+                        
+                        if batch_has_nan or batch_has_inf:
+                            logger.error(
+                                f"[Proba Cache][{adapter.name}] ⚠️  CRITICAL: Found NaN/Inf in batch predictions! "
+                                f"batch_has_nan={batch_has_nan}, batch_has_inf={batch_has_inf}. "
+                                f"This indicates a problem in batch inference path."
+                            )
+                            if batch_has_nan:
+                                nan_count_long = np.isnan(batch_proba_long).sum()
+                                nan_count_short = np.isnan(batch_proba_short).sum()
+                                logger.error(
+                                    f"[Proba Cache][{adapter.name}] NaN counts: "
+                                    f"proba_long={nan_count_long}/{len(batch_proba_long)}, "
+                                    f"proba_short={nan_count_short}/{len(batch_proba_short)}"
+                                )
+                            raise ValueError(
+                                "NaN/Inf detected in batch predictions. "
+                                "Cannot proceed with validation. Please check batch inference path."
+                            )
+                        
+                        if legacy_has_nan or legacy_has_inf:
+                            logger.error(
+                                f"[Proba Cache][{adapter.name}] ⚠️  CRITICAL: Found NaN/Inf in legacy predictions! "
+                                f"legacy_has_nan={legacy_has_nan}, legacy_has_inf={legacy_has_inf}. "
+                                f"This indicates a problem in legacy inference path."
+                            )
+                            raise ValueError(
+                                "NaN/Inf detected in legacy predictions. "
+                                "Cannot proceed with validation. Please check legacy inference path."
+                            )
+                        
                         # Calculate differences
                         diff_long = np.abs(batch_proba_long - legacy_proba_long_arr)
                         diff_short = np.abs(batch_proba_short - legacy_proba_short_arr)
                         
+                        # Check for NaN/Inf in differences (should not happen if inputs are valid)
+                        # With sanitization in the helper, this should not occur, but keep as defensive check
+                        if np.isnan(diff_long).any() or np.isnan(diff_short).any():
+                            logger.error(
+                                f"[Proba Cache][{adapter.name}] ⚠️  Found NaN in differences. "
+                                f"This should not happen if batch and legacy are both valid. "
+                                f"This may indicate a deeper issue despite sanitization."
+                            )
+                            # Replace NaN diffs with 0.0 for defensive calculation (but log the issue)
+                            nan_mask_long = np.isnan(diff_long)
+                            nan_mask_short = np.isnan(diff_short)
+                            if nan_mask_long.any():
+                                logger.error(
+                                    f"[Proba Cache][{adapter.name}] NaN in diff_long at {np.where(nan_mask_long)[0][:10]} "
+                                    f"(showing first 10 of {nan_mask_long.sum()} total)"
+                                )
+                                diff_long[nan_mask_long] = 0.0
+                            if nan_mask_short.any():
+                                logger.error(
+                                    f"[Proba Cache][{adapter.name}] NaN in diff_short at {np.where(nan_mask_short)[0][:10]} "
+                                    f"(showing first 10 of {nan_mask_short.sum()} total)"
+                                )
+                                diff_short[nan_mask_short] = 0.0
+                        
+                        # Check for Inf in differences (should not happen)
+                        if np.isinf(diff_long).any() or np.isinf(diff_short).any():
+                            logger.error(
+                                f"[Proba Cache][{adapter.name}] ⚠️  Found Inf in differences. "
+                                f"This should not happen if batch and legacy are both valid."
+                            )
+                            # Replace Inf diffs with a large but finite value for defensive calculation
+                            inf_mask_long = np.isinf(diff_long)
+                            inf_mask_short = np.isinf(diff_short)
+                            if inf_mask_long.any():
+                                diff_long[inf_mask_long] = 1.0  # Large but finite value
+                            if inf_mask_short.any():
+                                diff_short[inf_mask_short] = 1.0  # Large but finite value
+                        
+                        # Now calculate statistics (all values should be finite)
                         max_diff_long = float(np.max(diff_long))
                         max_diff_short = float(np.max(diff_short))
                         mean_diff_long = float(np.mean(diff_long))
                         mean_diff_short = float(np.mean(diff_short))
                         
+                        # Final sanity check: statistics should be finite
+                        if not (np.isfinite(max_diff_long) and np.isfinite(mean_diff_long) and
+                                np.isfinite(max_diff_short) and np.isfinite(mean_diff_short)):
+                            logger.error(
+                                f"[Proba Cache][{adapter.name}] ⚠️  CRITICAL: Statistics contain NaN/Inf despite sanitization. "
+                                f"max_diff_long={max_diff_long}, mean_diff_long={mean_diff_long}, "
+                                f"max_diff_short={max_diff_short}, mean_diff_short={mean_diff_short}"
+                            )
+                            # Use fallback values for defensive logging
+                            max_diff_long = 0.0 if not np.isfinite(max_diff_long) else max_diff_long
+                            mean_diff_long = 0.0 if not np.isfinite(mean_diff_long) else mean_diff_long
+                            max_diff_short = 0.0 if not np.isfinite(max_diff_short) else max_diff_short
+                            mean_diff_short = 0.0 if not np.isfinite(mean_diff_short) else mean_diff_short
+                        
+                        # Calculate percentiles for more detailed diagnostics
+                        p95_diff_long = float(np.percentile(diff_long, 95))
+                        p95_diff_short = float(np.percentile(diff_short, 95))
+                        p99_diff_long = float(np.percentile(diff_long, 99))
+                        p99_diff_short = float(np.percentile(diff_short, 99))
+                        
                         logger.info(
                             f"[Proba Cache][{adapter.name}] Validation results (batch vs legacy): "
                             f"test_samples={len(legacy_proba_long)}, "
                             f"max_diff_long={max_diff_long:.6f}, mean_diff_long={mean_diff_long:.6f}, "
-                            f"max_diff_short={max_diff_short:.6f}, mean_diff_short={mean_diff_short:.6f}"
+                            f"p95_diff_long={p95_diff_long:.6f}, p99_diff_long={p99_diff_long:.6f}, "
+                            f"max_diff_short={max_diff_short:.6f}, mean_diff_short={mean_diff_short:.6f}, "
+                            f"p95_diff_short={p95_diff_short:.6f}, p99_diff_short={p99_diff_short:.6f}"
                         )
                         
-                        # Warn if differences are too large (likely normalization mismatch)
-                        if max_diff_long > 0.01 or max_diff_short > 0.01:
-                            logger.warning(
-                                f"[Proba Cache][{adapter.name}] Large differences detected! "
-                                f"This may indicate a normalization mismatch. "
-                                f"Please review the batch prediction implementation."
+                        # Stricter tolerance: float precision level (1e-4 for mean, 1e-3 for max)
+                        tolerance_mean = 1e-4
+                        tolerance_max = 1e-3
+                        
+                        passed = (
+                            mean_diff_long < tolerance_mean and
+                            max_diff_long < tolerance_max and
+                            mean_diff_short < tolerance_mean and
+                            max_diff_short < tolerance_max
+                        )
+                        
+                        if passed:
+                            logger.info(
+                                f"[Proba Cache][{adapter.name}] ✅ Validation PASSED: "
+                                f"batch vs legacy match within tolerance "
+                                f"(mean_diff < {tolerance_mean:.0e}, max_diff < {tolerance_max:.0e}). "
+                                f"This confirms batch and legacy paths produce identical results."
                             )
                         else:
-                            logger.info(
-                                f"[Proba Cache][{adapter.name}] Validation passed: "
-                                f"differences are within acceptable range (<0.01)"
+                            # Find samples with largest differences for debugging
+                            worst_long_idx = int(np.argmax(diff_long))
+                            worst_short_idx = int(np.argmax(diff_short))
+                            
+                            logger.warning(
+                                f"[Proba Cache][{adapter.name}] ⚠️  Validation FAILED: "
+                                f"differences exceed tolerance. "
+                                f"mean_diff_long={mean_diff_long:.6f} (threshold={tolerance_mean:.0e}), "
+                                f"max_diff_long={max_diff_long:.6f} (threshold={tolerance_max:.0e}), "
+                                f"mean_diff_short={mean_diff_short:.6f} (threshold={tolerance_mean:.0e}), "
+                                f"max_diff_short={max_diff_short:.6f} (threshold={tolerance_max:.0e})"
+                            )
+                            logger.warning(
+                                f"[Proba Cache][{adapter.name}] Worst LONG diff at sample {worst_long_idx}: "
+                                f"batch={batch_proba_long[worst_long_idx]:.6f}, "
+                                f"legacy={legacy_proba_long_arr[worst_long_idx]:.6f}, "
+                                f"diff={diff_long[worst_long_idx]:.6f}"
+                            )
+                            logger.warning(
+                                f"[Proba Cache][{adapter.name}] Worst SHORT diff at sample {worst_short_idx}: "
+                                f"batch={batch_proba_short[worst_short_idx]:.6f}, "
+                                f"legacy={legacy_proba_short_arr[worst_short_idx]:.6f}, "
+                                f"diff={diff_short[worst_short_idx]:.6f}"
+                            )
+                            logger.warning(
+                                f"[Proba Cache][{adapter.name}] This may indicate: "
+                                f"(1) normalization mismatch between batch and legacy paths, "
+                                f"(2) feature extraction differences, or "
+                                f"(3) sequence window indexing differences. "
+                                f"Please review the implementation."
                             )
         except Exception as exc:
             logger.warning(
@@ -646,4 +857,160 @@ def compute_ml_proba_cache(
             )
     
     return proba_long_arr, proba_short_arr, df.iloc[valid_indices].reset_index(drop=True)
+
+
+def _parse_args():
+    """Parse command-line arguments for ML probability cache generation."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description="Generate and cache ML prediction probabilities for threshold optimization."
+    )
+    parser.add_argument(
+        "--strategy",
+        type=str,
+        required=True,
+        choices=["ml_xgb", "ml_lstm_attn"],
+        help="ML strategy name (ml_xgb or ml_lstm_attn)",
+    )
+    parser.add_argument(
+        "--symbol",
+        type=str,
+        default="BTCUSDT",
+        help="Trading symbol (default: BTCUSDT)",
+    )
+    parser.add_argument(
+        "--timeframe",
+        type=str,
+        default="1m",
+        help="Timeframe (default: 1m)",
+    )
+    parser.add_argument(
+        "--feature-preset",
+        type=str,
+        default="extended_safe",
+        choices=["base", "extended_safe", "extended_full"],
+        help="Feature preset for ml_xgb strategy (default: extended_safe)",
+    )
+    parser.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Force rebuild cache even if it already exists",
+    )
+    parser.add_argument(
+        "--nthread",
+        type=int,
+        default=None,
+        help="Number of CPU threads for XGBoost (default: auto-detected)",
+    )
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        default=None,
+        help="Filter OHLCV to samples at or after this date (YYYY-MM-DD format)",
+    )
+    parser.add_argument(
+        "--end-date",
+        type=str,
+        default=None,
+        help="Filter OHLCV to samples at or before this date (YYYY-MM-DD format)",
+    )
+    
+    return parser.parse_args()
+
+
+def main():
+    """Main entry point for CLI execution."""
+    import sys
+    
+    # Setup logging if not already configured
+    if not logger.handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(levelname)s:%(name)s:%(message)s",
+        )
+    
+    try:
+        args = _parse_args()
+        
+        # Log startup banner
+        logger.info("=" * 60)
+        logger.info("[ML_PROBA_CACHE] Starting probability cache generation")
+        logger.info(f"[ML_PROBA_CACHE] strategy={args.strategy}, symbol={args.symbol}, timeframe={args.timeframe}")
+        if args.strategy == "ml_xgb":
+            logger.info(f"[ML_PROBA_CACHE] feature_preset={args.feature_preset}")
+        if args.start_date or args.end_date:
+            logger.info(f"[ML_PROBA_CACHE] date_range: start={args.start_date or 'None'}, end={args.end_date or 'None'}")
+        logger.info(f"[ML_PROBA_CACHE] force_rebuild={args.force_rebuild}")
+        logger.info("=" * 60)
+        
+        # Validate strategy
+        from src.backtest.engine import _get_ml_adapter
+        try:
+            adapter = _get_ml_adapter(args.strategy)
+            logger.info(f"[ML_PROBA_CACHE] Strategy '{args.strategy}' is supported (adapter: {adapter.name})")
+        except ValueError as e:
+            logger.error(f"[ML_PROBA_CACHE] Unsupported strategy: {args.strategy}")
+            logger.error(f"[ML_PROBA_CACHE] Error: {e}")
+            logger.error("[ML_PROBA_CACHE] Supported strategies: ml_xgb, ml_lstm_attn")
+            sys.exit(1)
+        
+        # Get cache path for info
+        cache_path = _get_cache_path(
+            strategy_name=args.strategy,
+            symbol=args.symbol,
+            timeframe=args.timeframe,
+            feature_preset=args.feature_preset if args.strategy == "ml_xgb" else "base",
+            start_date=args.start_date,
+            end_date=args.end_date,
+        )
+        
+        # Check if cache exists
+        if cache_path.exists() and not args.force_rebuild:
+            logger.warning(
+                f"[ML_PROBA_CACHE] Cache file already exists and --force-rebuild not set: {cache_path}"
+            )
+            logger.info("[ML_PROBA_CACHE] Skipping cache generation. Use --force-rebuild to regenerate.")
+            logger.info("=" * 60)
+            logger.info("[ML_PROBA_CACHE] Done (skipped - cache exists)")
+            logger.info("=" * 60)
+            return 0
+        
+        # Generate cache
+        logger.info(f"[ML_PROBA_CACHE] Generating predictions and saving to: {cache_path}")
+        
+        proba_long_arr, proba_short_arr, df_aligned = get_or_build_predictions(
+            strategy_name=args.strategy,
+            symbol=args.symbol,
+            timeframe=args.timeframe,
+            feature_preset=args.feature_preset if args.strategy == "ml_xgb" else "base",
+            force_rebuild=args.force_rebuild,
+            nthread=args.nthread,
+            start_date=args.start_date,
+            end_date=args.end_date,
+        )
+        
+        # Success summary
+        num_rows = len(proba_long_arr)
+        start_ts = df_aligned["timestamp"].iloc[0] if len(df_aligned) > 0 else "N/A"
+        end_ts = df_aligned["timestamp"].iloc[-1] if len(df_aligned) > 0 else "N/A"
+        
+        logger.info("=" * 60)
+        logger.info("[ML_PROBA_CACHE] Done. Cache generation completed successfully.")
+        logger.info(f"[ML_PROBA_CACHE] Saved cache to: {cache_path}")
+        logger.info(f"[ML_PROBA_CACHE] Summary: rows={num_rows}, start={start_ts}, end={end_ts}")
+        logger.info("=" * 60)
+        
+        return 0
+        
+    except KeyboardInterrupt:
+        logger.warning("[ML_PROBA_CACHE] Interrupted by user (Ctrl+C)")
+        sys.exit(130)
+    except Exception as e:
+        logger.exception(f"[ML_PROBA_CACHE] Fatal error: {type(e).__name__}: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 

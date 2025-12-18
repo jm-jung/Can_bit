@@ -1,0 +1,32 @@
+{
+  "strategy": "ml_lstm_attn",
+  "symbol": "BTCUSDT",
+  "timeframe": "5m",
+  "timestamp": "20251217_165019",
+  "start_date": null,
+  "end_date": null,
+  "long_threshold": null,
+  "short_threshold": null,
+  "commission_rate": 0.0004,
+  "slippage_rate": 0.0005,
+  "metrics": {
+    "total_return": 0.006280336360930061,
+    "win_rate": 1.0,
+    "max_drawdown": 0.0,
+    "total_trades": 1,
+    "long_trades": 0,
+    "short_trades": 1,
+    "avg_profit": 0.006280336360930052,
+    "median_profit": 0.006280336360930052,
+    "avg_win": 0.006280336360930052,
+    "avg_loss": 0.0,
+    "max_consecutive_wins": 1,
+    "max_consecutive_losses": 0,
+    "short_win_rate": 1.0,
+    "short_avg_profit": 0.006280336360930052,
+    "short_avg_win": 0.006280336360930052,
+    "short_avg_loss": 0.0
+  },
+  "equity_curve_length": 1,
+  "trades_count": 1
+}

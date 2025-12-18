@@ -412,14 +412,16 @@ def run_backtest_with_ml(
             long_threshold = opt_long
             short_threshold = opt_short
             logger.info(
-                "[ML Backtest][XGBoost] Using optimized thresholds from %s: long=%.3f, short=%s",
+                "[ML Backtest][%s] Using optimized thresholds from %s: long=%.3f, short=%s",
+                adapter.name,
                 threshold_path,
                 long_threshold,
                 "None" if short_threshold is None else f"{short_threshold:.3f}",
             )
         except Exception as e:
             logger.warning(
-                "[ML Backtest][XGBoost] Failed to load optimized thresholds (%s). Falling back to defaults.",
+                "[ML Backtest][%s] Failed to load optimized thresholds (%s). Falling back to defaults.",
+                adapter.name,
                 str(e)
             )
             # Fall back to default thresholds
@@ -433,14 +435,16 @@ def run_backtest_with_ml(
             short_threshold = adapter.default_short
         
         logger.info(
-            "[ML Backtest][XGBoost] Using default thresholds: long=%.3f, short=%s",
+            "[ML Backtest][%s] Using default thresholds: long=%.3f, short=%s",
+            adapter.name,
             long_threshold,
             "None" if short_threshold is None else f"{short_threshold:.3f}",
         )
     
     # Log final thresholds before signal generation
     logger.info(
-        "[ML Backtest][XGBoost] Final thresholds applied: long=%.3f, short=%s",
+        "[ML Backtest][%s] Final thresholds applied: long=%.3f, short=%s",
+        adapter.name,
         long_threshold,
         "None" if short_threshold is None else f"{short_threshold:.3f}",
     )

@@ -11,7 +11,6 @@ import logging
 from datetime import datetime
 
 from src.backtest.backtest_report import print_backtest_summary, save_backtest_report
-from src.backtest.engine import run_backtest_with_ml
 from src.core.config import settings
 from src.research.ml_strategy_research import run_all_experiments
 
@@ -201,19 +200,21 @@ def main():
         return results
     
     # Normal backtest mode
-    # Note: Date filtering would need to be implemented in the data loading layer
-    # For now, we run backtest on all available data
-    # TODO: Implement date filtering in load_ohlcv_df or get_df_with_indicators
+    # Use strategy-aware backtest engine
+    from src.backtest.ml_backtest_engine_impl import get_ml_backtest_engine
     
-    # Run backtest
-    result = run_backtest_with_ml(
-        long_threshold=args.long_threshold,
-        short_threshold=args.short_threshold,
-        use_optimized_threshold=args.use_optimized_threshold,
+    engine = get_ml_backtest_engine(
         strategy_name=args.strategy,
         symbol=args.symbol,
         timeframe=args.timeframe,
         feature_preset=args.feature_preset,
+    )
+    
+    # Run backtest using engine
+    result = engine.run_backtest(
+        long_threshold=args.long_threshold,
+        short_threshold=args.short_threshold,
+        use_optimized_threshold=args.use_optimized_threshold,
         signal_confirmation_bars=args.signal_confirmation_bars,
         use_trend_filter=args.use_trend_filter,
         trend_ema_window=args.trend_ema_window,
