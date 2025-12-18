@@ -1,7 +1,7 @@
 # 🪙 Can_bit — Bitcoin Auto Trading System  
 ### FastAPI + CCXT + Strategy Engine + Backtest + Realtime + XGBoost + LSTM/Attention + Risk Management + Backoffice + Dashboard
 
-Can_bit은 **완전 자동화된 비트코인 알고리즘 트레이딩 시스템**입니다.
+Can_bit은 **이벤트 피처를 기반으로 완전 자동화된 비트코인 알고리즘 트레이딩 시스템**입니다.
 
 > **데이터 수집 → 피처 생성 → ML(XGB) / DL(LSTM+Attention) 학습 → Proba 캐시 → Threshold 최적화 → 백테스트 → 실시간 업데이트 → 자동매매 → 리스크 관리 → 대시보드**
 까지 모든 파이프라인을 한 번에 제공합니다.
