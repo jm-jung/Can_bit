@@ -1,0 +1,173 @@
+[
+  {
+    "run_id": "baseline",
+    "total_return": -1.9,
+    "max_drawdown": 2.22,
+    "total_trades": 174,
+    "win_rate": 48.28,
+    "avg_holding": null,
+    "cap_distribution": {
+      "cap_1_0": 14,
+      "cap_0_8": 4,
+      "cap_0_6": 2
+    },
+    "final_scale_mean": 0.09907,
+    "final_scale_median": 0.101679,
+    "high_entropy_th": 0.66,
+    "mid_entropy_th": 0.64,
+    "tiny_pdiff_th": 0.002,
+    "small_pdiff_th": 0.004
+  },
+  {
+    "run_id": "entropy_mid_62",
+    "total_return": -1.92,
+    "max_drawdown": 2.25,
+    "total_trades": 174,
+    "win_rate": 48.28,
+    "avg_holding": null,
+    "cap_distribution": {
+      "cap_1_0": 14,
+      "cap_0_8": 4,
+      "cap_0_6": 2
+    },
+    "final_scale_mean": 0.098686,
+    "final_scale_median": 0.101679,
+    "high_entropy_th": 0.66,
+    "mid_entropy_th": 0.62,
+    "tiny_pdiff_th": 0.002,
+    "small_pdiff_th": 0.004
+  },
+  {
+    "run_id": "entropy_mid_60",
+    "total_return": -1.92,
+    "max_drawdown": 2.25,
+    "total_trades": 174,
+    "win_rate": 48.28,
+    "avg_holding": null,
+    "cap_distribution": {
+      "cap_1_0": 14,
+      "cap_0_8": 4,
+      "cap_0_6": 2
+    },
+    "final_scale_mean": 0.098686,
+    "final_scale_median": 0.101679,
+    "high_entropy_th": 0.66,
+    "mid_entropy_th": 0.6,
+    "tiny_pdiff_th": 0.002,
+    "small_pdiff_th": 0.004
+  },
+  {
+    "run_id": "entropy_high_64_mid_62",
+    "total_return": -1.86,
+    "max_drawdown": 2.18,
+    "total_trades": 174,
+    "win_rate": 48.28,
+    "avg_holding": null,
+    "cap_distribution": {
+      "cap_1_0": 14,
+      "cap_0_8": 3,
+      "cap_0_6": 3
+    },
+    "final_scale_mean": 0.095227,
+    "final_scale_median": 0.086817,
+    "high_entropy_th": 0.64,
+    "mid_entropy_th": 0.62,
+    "tiny_pdiff_th": 0.002,
+    "small_pdiff_th": 0.004
+  },
+  {
+    "run_id": "entropy_high_62_mid_60",
+    "total_return": -1.89,
+    "max_drawdown": 2.2,
+    "total_trades": 174,
+    "win_rate": 48.28,
+    "avg_holding": null,
+    "cap_distribution": {
+      "cap_1_0": 14,
+      "cap_0_8": 3,
+      "cap_0_6": 3
+    },
+    "final_scale_mean": 0.094843,
+    "final_scale_median": 0.086817,
+    "high_entropy_th": 0.62,
+    "mid_entropy_th": 0.6,
+    "tiny_pdiff_th": 0.002,
+    "small_pdiff_th": 0.004
+  },
+  {
+    "run_id": "pdiff_small_005",
+    "total_return": -1.83,
+    "max_drawdown": 2.15,
+    "total_trades": 174,
+    "win_rate": 48.28,
+    "avg_holding": null,
+    "cap_distribution": {
+      "cap_1_0": 14,
+      "cap_0_8": 4,
+      "cap_0_6": 2
+    },
+    "final_scale_mean": 0.097705,
+    "final_scale_median": 0.101679,
+    "high_entropy_th": 0.66,
+    "mid_entropy_th": 0.64,
+    "tiny_pdiff_th": 0.002,
+    "small_pdiff_th": 0.005
+  },
+  {
+    "run_id": "pdiff_small_006",
+    "total_return": -1.86,
+    "max_drawdown": 2.18,
+    "total_trades": 174,
+    "win_rate": 48.28,
+    "avg_holding": null,
+    "cap_distribution": {
+      "cap_1_0": 13,
+      "cap_0_8": 5,
+      "cap_0_6": 2
+    },
+    "final_scale_mean": 0.097102,
+    "final_scale_median": 0.100305,
+    "high_entropy_th": 0.66,
+    "mid_entropy_th": 0.64,
+    "tiny_pdiff_th": 0.002,
+    "small_pdiff_th": 0.006
+  },
+  {
+    "run_id": "entropy_mid_62_pdiff_005",
+    "total_return": -1.85,
+    "max_drawdown": 2.18,
+    "total_trades": 174,
+    "win_rate": 48.28,
+    "avg_holding": null,
+    "cap_distribution": {
+      "cap_1_0": 14,
+      "cap_0_8": 4,
+      "cap_0_6": 2
+    },
+    "final_scale_mean": 0.097321,
+    "final_scale_median": 0.101679,
+    "high_entropy_th": 0.66,
+    "mid_entropy_th": 0.62,
+    "tiny_pdiff_th": 0.002,
+    "small_pdiff_th": 0.005
+  },
+  {
+    "run_id": "entropy_mid_60_pdiff_005",
+    "total_return": -1.85,
+    "max_drawdown": 2.18,
+    "total_trades": 174,
+    "win_rate": 48.28,
+    "avg_holding": null,
+    "cap_distribution": {
+      "cap_1_0": 14,
+      "cap_0_8": 4,
+      "cap_0_6": 2
+    },
+    "final_scale_mean": 0.097321,
+    "final_scale_median": 0.101679,
+    "high_entropy_th": 0.66,
+    "mid_entropy_th": 0.6,
+    "tiny_pdiff_th": 0.002,
+    "small_pdiff_th": 0.005
+  }
+]

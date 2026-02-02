@@ -1,0 +1,117 @@
+{
+  "run_id": "20260126_134313",
+  "mode": "backtest",
+  "timestamp": "2026-01-26T13:43:18.174340",
+  "total_checks": 142,
+  "entries_attempted": 87,
+  "entries_executed": 87,
+  "total_trades": 174,
+  "blocked_by_min_hold": 0,
+  "blocked_by_cooldown": 1033,
+  "blocked_by_guard_hard": 0,
+  "guard_scale_stats": {
+    "count": 14,
+    "mean": 0.08819938451051712,
+    "median": 0.07945685088634491,
+    "p10": 0.03798811882734299,
+    "p90": 0.14635786414146423,
+    "min": 0.036576077342033386,
+    "max": 0.16702108085155487
+  },
+  "stage2_cap_distribution": {
+    "cap_1_0": 54,
+    "cap_1_0_pct": 62.1,
+    "cap_0_8": 17,
+    "cap_0_8_pct": 19.5,
+    "cap_0_6": 16,
+    "cap_0_6_pct": 18.4,
+    "total": 87
+  },
+  "final_scale_stats": {
+    "count": 87,
+    "mean": 0.09386143833398819,
+    "median": 0.08483801782131195,
+    "p10": 0.052381034940481186,
+    "p90": 0.14026209712028503,
+    "min": 0.038399528712034225,
+    "max": 0.16362564265727997
+  },
+  "guard_scale_histogram": {
+    "0.0~0.1": 92,
+    "0.1~0.2": 50,
+    "0.2~0.3": 0,
+    "0.3~0.4": 0,
+    "0.4~0.5": 0,
+    "0.5~0.6": 0,
+    "0.6~0.7": 0,
+    "0.7~0.8": 0,
+    "0.8~0.9": 0,
+    "0.9~1.0": 0,
+    "1.0": 0
+  },
+  "stage2_cap_histogram": {
+    "cap_1_0": 54,
+    "cap_1_0_pct": 62.1,
+    "cap_0_8": 17,
+    "cap_0_8_pct": 19.5,
+    "cap_0_6": 16,
+    "cap_0_6_pct": 18.4,
+    "other": 0,
+    "total": 87
+  },
+  "final_scale_histogram": {
+    "0.0~0.1": 51,
+    "0.1~0.2": 36,
+    "0.2~0.3": 0,
+    "0.3~0.4": 0,
+    "0.4~0.5": 0,
+    "0.5~0.6": 0,
+    "0.6~0.7": 0,
+    "0.7~0.8": 0,
+    "0.8~0.9": 0,
+    "0.9~1.0": 0,
+    "1.0": 0
+  },
+  "cap_reason_counts": {
+    "no_cap": 54,
+    "mid_entropy(0.6433)_small_pdiff(0.0037)": 1,
+    "high_entropy(0.6426)_tiny_pdiff(0.0011)": 1,
+    "high_entropy(0.6817)_tiny_pdiff(0.0017)": 1,
+    "high_entropy(0.6881)_tiny_pdiff(0.0018)": 1,
+    "mid_entropy(0.6587)_small_pdiff(0.0033)": 1,
+    "mid_entropy(0.6664)_small_pdiff(0.0025)": 1,
+    "high_entropy(0.6586)_tiny_pdiff(0.0001)": 1,
+    "high_entropy(0.6555)_tiny_pdiff(0.0005)": 1,
+    "high_entropy(0.6761)_tiny_pdiff(0.0008)": 1
+  },
+  "config_snapshot": {
+    "symbol": "BTCUSDT",
+    "timeframe": "5m",
+    "mode": "backtest",
+    "run_id": "20260126_134313",
+    "stage2": {
+      "use_stage2": true,
+      "cap_entropy_high_th": 0.64,
+      "cap_entropy_mid_th": 0.62,
+      "cap_pdiff_tiny_th": 0.002,
+      "cap_pdiff_small_th": 0.005,
+      "cap_low": 0.6,
+      "cap_mid": 0.8,
+      "cap_default": 1.0,
+      "block_if_final_scale_below": 0.0
+    },
+    "anti_overtrading": {
+      "min_hold_bars": 12,
+      "cooldown_bars": 12
+    },
+    "guard_v2": {
+      "use_strategy_guard_v2": true,
+      "mode": "soft",
+      "scale_floor": 0.02,
+      "block_if_scale_below": null,
+      "min_margin": null,
+      "max_entropy": null,
+      "window_signal_stats": null
+    }
+  }
+}

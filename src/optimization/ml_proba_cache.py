@@ -11,7 +11,8 @@ import logging
 import sys
 from pathlib import Path
 from typing import Any
-import torch
+# Lazy import torch to avoid numpy compatibility issues when not needed
+# import torch
 import numpy as np
 import pandas as pd
 
@@ -161,12 +162,88 @@ def get_or_build_predictions(
                         f"[Proba Cache] Cache file {cache_path} has mismatched array lengths. Rebuilding..."
                     )
                 else:
+                    # ======================================================================
+                    # [CACHE DEBUG] 캐시 로드 정합성 검사
+                    # ======================================================================
                     date_range_str = ""
                     if start_date or end_date:
                         date_range_str = f" (date range: {start_date or 'None'} ~ {end_date or 'None'})"
+                    
+                    # Validate probability sum (3-class: p_long + p_flat + p_short = 1)
+                    proba_flat_arr = 1.0 - proba_long_arr - proba_short_arr
+                    proba_sum_arr = proba_long_arr + proba_flat_arr + proba_short_arr
+                    sum_deviation = np.abs(proba_sum_arr - 1.0)
+                    mean_sum_dev = float(np.mean(sum_deviation))
+                    max_sum_dev = float(np.max(sum_deviation))
+                    
+                    # Check for NaN/Inf
+                    nan_count = int(np.sum(np.isnan(proba_long_arr) | np.isnan(proba_short_arr)))
+                    inf_count = int(np.sum(np.isinf(proba_long_arr) | np.isinf(proba_short_arr)))
+                    
+                    # Get timestamp range if available
+                    ts_min = None
+                    ts_max = None
+                    if "timestamp" in df_aligned.columns:
+                        ts_min = str(df_aligned["timestamp"].min())
+                        ts_max = str(df_aligned["timestamp"].max())
+                    
+                    logger.info("=" * 60)
+                    logger.info("[CACHE DEBUG] Cache Load Validation")
+                    logger.info("=" * 60)
                     logger.info(
-                        f"[Proba Cache] Loaded {len(proba_long_arr)} cached predictions from {cache_path}{date_range_str}"
+                        f"[CACHE DEBUG] Loaded {len(proba_long_arr)} cached predictions from {cache_path}{date_range_str}"
                     )
+                    logger.info(
+                        f"[CACHE DEBUG] Index range: min_ts={ts_min}, max_ts={ts_max}, "
+                        f"shape={proba_long_arr.shape}, dtype={proba_long_arr.dtype}"
+                    )
+                    logger.info(
+                        f"[CACHE DEBUG] Probability sum check: mean(|sum-1|)={mean_sum_dev:.6f}, "
+                        f"max(|sum-1|)={max_sum_dev:.6f}"
+                    )
+                    logger.info(
+                        f"[CACHE DEBUG] NaN count: {nan_count}, Inf count: {inf_count}"
+                    )
+                    
+                    # Sample logging: first 3 and last 3 rows
+                    logger.debug("[CACHE DEBUG] Sample rows (first 3):")
+                    for i in range(min(3, len(proba_long_arr))):
+                        p_l = float(proba_long_arr[i])
+                        p_s = float(proba_short_arr[i])
+                        p_f = float(proba_flat_arr[i])
+                        p_sum = p_l + p_f + p_s
+                        ts = str(df_aligned.iloc[i]["timestamp"]) if "timestamp" in df_aligned.columns else "N/A"
+                        logger.debug(
+                            f"[CACHE DEBUG]   idx={i} ts={ts} pL={p_l:.4f} pF={p_f:.4f} pS={p_s:.4f} sum={p_sum:.4f}"
+                        )
+                    
+                    if len(proba_long_arr) > 3:
+                        logger.debug("[CACHE DEBUG] Sample rows (last 3):")
+                        for i in range(max(0, len(proba_long_arr) - 3), len(proba_long_arr)):
+                            p_l = float(proba_long_arr[i])
+                            p_s = float(proba_short_arr[i])
+                            p_f = float(proba_flat_arr[i])
+                            p_sum = p_l + p_f + p_s
+                            ts = str(df_aligned.iloc[i]["timestamp"]) if "timestamp" in df_aligned.columns else "N/A"
+                            logger.debug(
+                                f"[CACHE DEBUG]   idx={i} ts={ts} pL={p_l:.4f} pF={p_f:.4f} pS={p_s:.4f} sum={p_sum:.4f}"
+                            )
+                    
+                    # Warn if sum deviation is too large
+                    if max_sum_dev > 0.01:
+                        logger.warning(
+                            f"[CACHE DEBUG] WARNING: Large probability sum deviation detected! "
+                            f"max(|sum-1|)={max_sum_dev:.6f}. This may indicate cache corruption."
+                        )
+                    
+                    if nan_count > 0 or inf_count > 0:
+                        logger.warning(
+                            f"[CACHE DEBUG] WARNING: Found NaN/Inf in cached predictions! "
+                            f"NaN={nan_count}, Inf={inf_count}"
+                        )
+                    
+                    logger.info("=" * 60)
+                    
                     return proba_long_arr, proba_short_arr, df_aligned
         except Exception as e:
             logger.warning(
@@ -245,6 +322,88 @@ def get_or_build_predictions(
         feature_preset=feature_preset,
         nthread=nthread,
     )
+    
+    # ======================================================================
+    # [CACHE DEBUG] 캐시 저장 정합성 검사
+    # ======================================================================
+    # Validate probabilities before saving
+    proba_flat_arr = 1.0 - proba_long_arr - proba_short_arr
+    proba_sum_arr = proba_long_arr + proba_flat_arr + proba_short_arr
+    sum_deviation = np.abs(proba_sum_arr - 1.0)
+    mean_sum_dev = float(np.mean(sum_deviation))
+    max_sum_dev = float(np.max(sum_deviation))
+    
+    nan_count = int(np.sum(np.isnan(proba_long_arr) | np.isnan(proba_short_arr)))
+    inf_count = int(np.sum(np.isinf(proba_long_arr) | np.isinf(proba_short_arr)))
+    
+    logger.info("=" * 60)
+    logger.info("[CACHE DEBUG] Cache Save Validation")
+    logger.info("=" * 60)
+    logger.info(
+        f"[CACHE DEBUG] Saving {len(proba_long_arr)} predictions to cache {cache_path}"
+    )
+    
+    # Get timestamp range if available
+    ts_min = None
+    ts_max = None
+    if "timestamp" in df_aligned.columns:
+        ts_min = str(df_aligned["timestamp"].min())
+        ts_max = str(df_aligned["timestamp"].max())
+        logger.info(
+            f"[CACHE DEBUG] Index range: min_ts={ts_min}, max_ts={ts_max}, "
+            f"shape={proba_long_arr.shape}, dtype={proba_long_arr.dtype}"
+        )
+    
+    logger.info(
+        f"[CACHE DEBUG] Probability sum check: mean(|sum-1|)={mean_sum_dev:.6f}, "
+        f"max(|sum-1|)={max_sum_dev:.6f}"
+    )
+    logger.info(
+        f"[CACHE DEBUG] NaN count: {nan_count}, Inf count: {inf_count}"
+    )
+    
+    # Sample logging: first 3 and last 3 rows
+    logger.debug("[CACHE DEBUG] Sample rows (first 3):")
+    for i in range(min(3, len(proba_long_arr))):
+        p_l = float(proba_long_arr[i])
+        p_s = float(proba_short_arr[i])
+        p_f = float(proba_flat_arr[i])
+        p_sum = p_l + p_f + p_s
+        ts = str(df_aligned.iloc[i]["timestamp"]) if "timestamp" in df_aligned.columns else "N/A"
+        logger.debug(
+            f"[CACHE DEBUG]   idx={i} ts={ts} pL={p_l:.4f} pF={p_f:.4f} pS={p_s:.4f} sum={p_sum:.4f}"
+        )
+    
+    if len(proba_long_arr) > 3:
+        logger.debug("[CACHE DEBUG] Sample rows (last 3):")
+        for i in range(max(0, len(proba_long_arr) - 3), len(proba_long_arr)):
+            p_l = float(proba_long_arr[i])
+            p_s = float(proba_short_arr[i])
+            p_f = float(proba_flat_arr[i])
+            p_sum = p_l + p_f + p_s
+            ts = str(df_aligned.iloc[i]["timestamp"]) if "timestamp" in df_aligned.columns else "N/A"
+            logger.debug(
+                f"[CACHE DEBUG]   idx={i} ts={ts} pL={p_l:.4f} pF={p_f:.4f} pS={p_s:.4f} sum={p_sum:.4f}"
+            )
+    
+    # Warn if sum deviation is too large
+    if max_sum_dev > 0.01:
+        logger.warning(
+            f"[CACHE DEBUG] WARNING: Large probability sum deviation detected! "
+            f"max(|sum-1|)={max_sum_dev:.6f}. This may indicate prediction errors."
+        )
+    
+    if nan_count > 0 or inf_count > 0:
+        logger.error(
+            f"[CACHE DEBUG] ERROR: Found NaN/Inf in predictions! "
+            f"NaN={nan_count}, Inf={inf_count}. Cache will not be saved."
+        )
+        raise ValueError(
+            f"[CACHE DEBUG] Cannot save cache with NaN/Inf predictions: "
+            f"NaN={nan_count}, Inf={inf_count}"
+        )
+    
+    logger.info("=" * 60)
     
     # Save to cache
     try:
@@ -429,6 +588,137 @@ def compute_ml_proba_cache(
         # Log 3-class model information
         logger.info(
             f"[Proba Cache][{adapter.name}] Using 3-class LSTM-Attention model. "
+            f"Class indices: FLAT={LstmClassIndex.FLAT}, LONG={LstmClassIndex.LONG}, SHORT={LstmClassIndex.SHORT}. "
+            f"proba_long/proba_short are derived from 3-class softmax output."
+        )
+        
+        # Extract features once for entire dataset
+        logger.info(
+            f"[Proba Cache][{adapter.name}] Extracting features for batch prediction..."
+        )
+        full_features = build_feature_frame(
+            df,
+            symbol=symbol,
+            timeframe=timeframe,
+            use_events=settings.EVENTS_ENABLED,
+        )
+        full_features = full_features.dropna()
+        
+        # Validate we have enough data
+        if len(full_features) < min_rows:
+            raise ValueError(
+                f"[Proba Cache][{adapter.name}] Not enough features after extraction: "
+                f"need at least {min_rows}, got {len(full_features)}"
+            )
+        
+        # Use batch prediction
+        try:
+            proba_long_arr, proba_short_arr = model.predict_proba_batch(
+                features=full_features,
+                symbol=symbol,
+                timeframe=timeframe,
+                batch_size=512,
+            )
+            
+            # Align with original df indices
+            # IMPORTANT: Batch path now matches training exactly:
+            # - Training: for i in range(window_size, len(features)): seq = features[i-window_size:i]
+            # - Batch: for i in range(window_size, len(features)): seq = features[i-window_size:i]
+            # - proba arrays have length (len(full_features) - window_size)
+            # - Predictions correspond to indices [window_size, window_size+1, ..., len(features)-1] in features
+            # - We need to map these to df indices, accounting for dropna() in feature extraction
+            
+            num_proba = len(proba_long_arr)
+            num_features = len(full_features)
+            
+            # Batch path creates sequences for i in range(window_size, len(features))
+            # So proba arrays have length (len(features) - window_size)
+            # Predictions correspond to feature indices [window_size, window_size+1, ..., len(features)-1]
+            # We need to map these to df indices
+            
+            # Since features may have fewer rows than df due to dropna(), we need to be careful
+            # The mapping depends on how dropna() removed rows
+            # For now, assume features and df are aligned after dropna()
+            # (This is true if dropna() only removes rows with NaN, not reorders)
+            
+            # Calculate expected predictions: starting from min_rows (window_size) in df
+            expected_proba_count = len(df) - min_rows
+            
+            if num_proba < expected_proba_count:
+                # Fewer predictions than expected - this can happen if features dropped rows
+                logger.warning(
+                    f"[Proba Cache][{adapter.name}] Fewer predictions than expected: "
+                    f"got {num_proba}, expected {expected_proba_count}. "
+                    f"This may be due to feature extraction dropping rows."
+                )
+                # Use what we have
+                proba_long_arr = proba_long_arr[:num_proba]
+                proba_short_arr = proba_short_arr[:num_proba]
+                valid_indices = list(range(min_rows, min_rows + num_proba))
+            elif num_proba > expected_proba_count:
+                # More predictions than expected - truncate to match df length
+                logger.debug(
+                    f"[Proba Cache][{adapter.name}] Truncating predictions: "
+                    f"got {num_proba}, expected {expected_proba_count}"
+                )
+                proba_long_arr = proba_long_arr[:expected_proba_count]
+                proba_short_arr = proba_short_arr[:expected_proba_count]
+                valid_indices = list(range(min_rows, len(df)))
+            else:
+                # Perfect match
+                valid_indices = list(range(min_rows, len(df)))
+            
+            proba_long_values = proba_long_arr.tolist()
+            proba_short_values = proba_short_arr.tolist()
+            
+            logger.info(
+                f"[Proba Cache][{adapter.name}] Batch prediction completed: "
+                f"proba_count={len(proba_long_values)}, valid_indices_count={len(valid_indices)}, "
+                f"df_rows={len(df)}, min_rows={min_rows}"
+            )
+            
+        except Exception as exc:
+            logger.error(
+                f"[Proba Cache][{adapter.name}] Batch prediction failed: {type(exc).__name__}: {exc}"
+            )
+            logger.info(
+                f"[Proba Cache][{adapter.name}] Falling back to legacy per-step prediction..."
+            )
+            # Fallback to legacy path
+            # IMPORTANT: Use return_both=True to get correct proba_short from 3-class softmax
+            prediction_errors = 0
+            for i in range(min_rows, len(df)):
+                df_slice = df.iloc[: i + 1]
+                try:
+                    # Use return_both=True to get both proba_long and proba_short from 3-class softmax
+                    proba_long_val, proba_short_val = model.predict_proba_latest(
+                        df_slice, 
+                        symbol=symbol, 
+                        timeframe=timeframe,
+                        return_both=True
+                    )
+                    proba_long_values.append(float(proba_long_val))
+                    proba_short_values.append(float(proba_short_val))
+                    valid_indices.append(i)
+                except Exception as exc2:
+                    prediction_errors += 1
+                    if prediction_errors <= 5:
+                        logger.warning(
+                            f"[Proba Cache][{adapter.name}] Prediction failed at index {i}: "
+                            f"{type(exc2).__name__}: {exc2}"
+                        )
+                    continue
+    elif strategy_name == "ml_tcn":
+        # Optimized batch path for TCN (3-class model)
+        from src.dl.tcn_model import TCNSignalModel
+        
+        if not isinstance(model, TCNSignalModel):
+            raise ValueError(
+                f"[Proba Cache][{adapter.name}] Expected TCNSignalModel, got {type(model)}"
+            )
+        # Log 3-class model information
+        logger.info(
+            f"[Proba Cache][{adapter.name}] Using 3-class TCN model. "
             f"Class indices: FLAT={LstmClassIndex.FLAT}, LONG={LstmClassIndex.LONG}, SHORT={LstmClassIndex.SHORT}. "
             f"proba_long/proba_short are derived from 3-class softmax output."
         )
@@ -870,8 +1160,8 @@ def _parse_args():
         "--strategy",
         type=str,
         required=True,
-        choices=["ml_xgb", "ml_lstm_attn"],
-        help="ML strategy name (ml_xgb or ml_lstm_attn)",
+        choices=["ml_xgb", "ml_lstm_attn", "ml_tcn"],
+        help="ML strategy name (ml_xgb, ml_lstm_attn, or ml_tcn)",
     )
     parser.add_argument(
         "--symbol",
@@ -952,7 +1242,7 @@ def main():
         except ValueError as e:
             logger.error(f"[ML_PROBA_CACHE] Unsupported strategy: {args.strategy}")
             logger.error(f"[ML_PROBA_CACHE] Error: {e}")
-            logger.error("[ML_PROBA_CACHE] Supported strategies: ml_xgb, ml_lstm_attn")
+            logger.error("[ML_PROBA_CACHE] Supported strategies: ml_xgb, ml_lstm_attn, ml_tcn")
             sys.exit(1)
         
         # Get cache path for info

@@ -1,0 +1,47 @@
+{
+  "strategy": "ml_lstm_attn",
+  "symbol": "BTCUSDT",
+  "timeframe": "5m",
+  "timestamp": "20251223_153657",
+  "start_date": null,
+  "end_date": null,
+  "long_threshold": null,
+  "short_threshold": null,
+  "commission_rate": 0.0004,
+  "slippage_rate": 0.0005,
+  "use_stage2": false,
+  "stage2_trade_th": null,
+  "stage2_min_edge": 0.0,
+  "stage2_exit_on_flat": false,
+  "stage2_allow_flip": true,
+  "stage2_cooldown_bars": 0,
+  "metrics": {
+    "total_return": 0.0,
+    "win_rate": 0.0,
+    "max_drawdown": 0.0,
+    "total_trades": 0,
+    "long_trades": 0,
+    "short_trades": 0,
+    "avg_profit": 0.0,
+    "median_profit": 0.0,
+    "avg_win": 0.0,
+    "avg_loss": 0.0,
+    "max_consecutive_wins": 0,
+    "max_consecutive_losses": 0
+  },
+  "equity_curve_length": 1,
+  "trades_count": 0,
+  "stage2_stats": {
+    "stage2_no_trade_count": 0,
+    "stage2_trade_count": 623292,
+    "stage2_exit_on_flat_count": 0
+  },
+  "block_reasons": {
+    "min_hold": 0,
+    "cooldown": 0,
+    "confirmation": 0,
+    "margin_zone": 0,
+    "hysteresis": 134955,
+    "stage2_no_trade": 0
+  }
+}

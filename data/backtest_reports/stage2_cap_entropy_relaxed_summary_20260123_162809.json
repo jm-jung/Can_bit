@@ -1,0 +1,30 @@
+{
+  "before": {
+    "cap_1_0_pct": 63.2,
+    "cap_0_8_pct": 31.0,
+    "cap_0_6_pct": 5.7,
+    "total_return": -1.83,
+    "max_drawdown": 2.15,
+    "total_trades": 174,
+    "win_rate": 48.28
+  },
+  "after": {
+    "cap_1_0_count": 54,
+    "cap_1_0_pct": 62.1,
+    "cap_0_8_count": 17,
+    "cap_0_8_pct": 19.5,
+    "cap_0_6_count": 16,
+    "cap_0_6_pct": 18.4,
+    "total_return": -1.79,
+    "max_drawdown": 2.11,
+    "total_trades": 174,
+    "win_rate": 48.28
+  },
+  "changes": {
+    "cap_1_0_pct": -1.1000000000000014,
+    "cap_0_8_pct": -11.5,
+    "cap_0_6_pct": 12.7,
+    "total_return": 0.040000000000000036,
+    "max_drawdown": -0.040000000000000036
+  }
+}

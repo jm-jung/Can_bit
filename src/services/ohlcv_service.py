@@ -155,13 +155,24 @@ def load_ohlcv_df(timeframe: str = "1m", symbol: str = "BTCUSDT") -> pd.DataFram
         raise FileNotFoundError(f"OHLCV CSV not found: {DATA_PATH}")
     
     # Load raw data (assumed to be 1m)
-    df = pd.read_csv(DATA_PATH, parse_dates=["timestamp"])
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info(f"[OHLCV Loader] Loading fallback data from: {DATA_PATH}")
+    
+    df = pd.read_csv(DATA_PATH, parse_dates=["timestamp"], low_memory=False)
     df = df.sort_values("timestamp").reset_index(drop=True)
     
     # Resample if needed
     if target_timeframe != "1m":
         df = _resample_ohlcv(df, target_timeframe)
         df = df.sort_values("timestamp").reset_index(drop=True)
+    
+    # 진단 로그 추가 (필수)
+    ts_max = df["timestamp"].max()
+    ts_min = df["timestamp"].min()
+    logger.info(
+        f"[OHLCV] loaded file={DATA_PATH}, rows={len(df)}, ts_max={ts_max}, ts_min={ts_min}"
+    )
     
     return df
 

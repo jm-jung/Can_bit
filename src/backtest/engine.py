@@ -161,6 +161,17 @@ def _get_ml_adapter(strategy_name: str) -> MLBacktestAdapter:
             default_short=settings.LSTM_ATTN_THRESHOLD_DOWN,
         )
 
+    if strategy_name == "ml_tcn":
+        from src.dl.tcn_model import get_tcn_model
+        return MLBacktestAdapter(
+            name="TCN",
+            strategy_name=strategy_name,
+            get_model=get_tcn_model,
+            min_history_provider=lambda model: getattr(model, "window_size", 60),
+            default_long=settings.LSTM_ATTN_THRESHOLD_UP,  # Use same defaults as LSTM-Attn
+            default_short=settings.LSTM_ATTN_THRESHOLD_DOWN,
+        )
+
     if strategy_name == "ml_xgb":
         return MLBacktestAdapter(
             name="XGBoost",

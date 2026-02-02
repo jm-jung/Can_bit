@@ -1,0 +1,68 @@
+{
+  "report_period": {
+    "start": "2026-01-23T00:00:00",
+    "end": "2026-01-26T00:00:00"
+  },
+  "generated_at": "2026-01-26T11:31:36.091972",
+  "total_runs": 3,
+  "run_ids": [
+    "20260123_171150",
+    "20260123_181903",
+    "20260123_181946"
+  ],
+  "mode_distribution": {
+    "backtest": 3
+  },
+  "skipped_files": [],
+  "performance_trend": [
+    {
+      "run_id": "20260123_171150",
+      "return": null,
+      "max_drawdown": null,
+      "total_trades": 174,
+      "win_rate": null,
+      "entries_executed": 87,
+      "total_checks": 142,
+      "final_scale_stats": null
+    },
+    {
+      "run_id": "20260123_181903",
+      "return": null,
+      "max_drawdown": null,
+      "total_trades": 174,
+      "win_rate": null,
+      "entries_executed": 87,
+      "total_checks": 142,
+      "final_scale_stats": {
+        "count": 87,
+        "mean": 0.09386143833398819,
+        "median": 0.08483801782131195,
+        "p10": 0.052381034940481186,
+        "p90": 0.14026209712028503,
+        "min": 0.038399528712034225,
+        "max": 0.16362564265727997
+      }
+    },
+    {
+      "run_id": "20260123_181946",
+      "return": null,
+      "max_drawdown": null,
+      "total_trades": 174,
+      "win_rate": null,
+      "entries_executed": 87,
+      "total_checks": 142,
+      "final_scale_stats": {
+        "count": 87,
+        "mean": 0.09386143833398819,
+        "median": 0.08483801782131195,
+        "p10": 0.052381034940481186,
+        "p90": 0.14026209712028503,
+        "min": 0.038399528712034225,
+        "max": 0.16362564265727997
+      }
+    }
+  ],
+  "aggregated_distributions": {},
+  "alerts": [],
+  "config_changes": []
+}

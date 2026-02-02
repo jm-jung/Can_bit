@@ -1,0 +1,95 @@
+[
+  {
+    "run_id": "baseline",
+    "params": {
+      "run_id": "baseline",
+      "description": "\ud604\uc7ac \uc644\ud654 CAP (\uae30\ubcf8\uac12)",
+      "high_entropy_th": 0.66,
+      "mid_entropy_th": 0.64,
+      "tiny_pdiff_th": 0.002,
+      "small_pdiff_th": 0.004
+    },
+    "total_return": -1.9,
+    "max_drawdown": 2.22,
+    "total_trades": 174,
+    "win_rate": 48.28,
+    "cap_distribution": {
+      "cap_1_0": 62,
+      "cap_1_0_pct": 71.3,
+      "cap_0_8": 20,
+      "cap_0_8_pct": 23.0,
+      "cap_0_6": 5,
+      "cap_0_6_pct": 5.7,
+      "total_entries": 87
+    },
+    "final_scale_stats": {
+      "min": 0.0384,
+      "median": 0.101679,
+      "p90": 0.14707,
+      "max": 0.167021,
+      "mean": 0.09907
+    }
+  },
+  {
+    "run_id": "pdiff_small_005",
+    "params": {
+      "run_id": "pdiff_small_005",
+      "description": "p_diff small \uc784\uacc4\uac12 \uc644\ud654 (0.004 \u2192 0.005)",
+      "high_entropy_th": 0.66,
+      "mid_entropy_th": 0.64,
+      "tiny_pdiff_th": 0.002,
+      "small_pdiff_th": 0.005
+    },
+    "total_return": -1.83,
+    "max_drawdown": 2.15,
+    "total_trades": 174,
+    "win_rate": 48.28,
+    "cap_distribution": {
+      "cap_1_0": 55,
+      "cap_1_0_pct": 63.2,
+      "cap_0_8": 27,
+      "cap_0_8_pct": 31.0,
+      "cap_0_6": 5,
+      "cap_0_6_pct": 5.7,
+      "total_entries": 87
+    },
+    "final_scale_stats": {
+      "min": 0.0384,
+      "median": 0.101679,
+      "p90": 0.142713,
+      "max": 0.167021,
+      "mean": 0.097705
+    }
+  },
+  {
+    "run_id": "entropy_high_64_mid_62",
+    "params": {
+      "run_id": "entropy_high_64_mid_62",
+      "description": "entropy \uc784\uacc4\uac12 \uc644\ud654 (high=0.64, mid=0.62)",
+      "high_entropy_th": 0.64,
+      "mid_entropy_th": 0.62,
+      "tiny_pdiff_th": 0.002,
+      "small_pdiff_th": 0.004
+    },
+    "total_return": -1.86,
+    "max_drawdown": 2.18,
+    "total_trades": 174,
+    "win_rate": 48.28,
+    "cap_distribution": {
+      "cap_1_0": 61,
+      "cap_1_0_pct": 70.1,
+      "cap_0_8": 10,
+      "cap_0_8_pct": 11.5,
+      "cap_0_6": 16,
+      "cap_0_6_pct": 18.4,
+      "total_entries": 87
+    },
+    "final_scale_stats": {
+      "min": 0.0384,
+      "median": 0.086817,
+      "p90": 0.142713,
+      "max": 0.163626,
+      "mean": 0.095227
+    }
+  }
+]

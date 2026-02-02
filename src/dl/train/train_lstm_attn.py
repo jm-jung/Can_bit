@@ -739,14 +739,67 @@ def create_sequences(
     long_ratio = long_count / len(y) if len(y) > 0 else 0.0
     short_ratio = short_count / len(y) if len(y) > 0 else 0.0
     
+    # ======================================================================
+    # [LABEL DEBUG] 라벨 생성 단계 로그 (요약)
+    # ======================================================================
+    logger.info("=" * 60)
+    logger.info("[LABEL DEBUG] 3-Class Label Generation Summary")
+    logger.info("=" * 60)
+    logger.info(f"[LABEL DEBUG] Total samples (before NaN filtering): {total_count_all}")
+    logger.info(f"[LABEL DEBUG] NaN removed: {total_count_all - len(y)}")
+    logger.info(f"[LABEL DEBUG] Final samples (after filtering): {len(y)}")
     logger.info("-" * 60)
-    logger.info("3-Class Label Distribution:")
-    logger.info(f"  Total samples (before filtering): {total_count_all}")
-    logger.info(f"  FLAT (label=0): {flat_count_all} ({flat_count_all/total_count_all:.3f} of total)")
-    logger.info(f"  LONG (label=1): {long_count_all} ({long_count_all/total_count_all:.3f} of total)")
-    logger.info(f"  SHORT (label=2): {short_count_all} ({short_count_all/total_count_all:.3f} of total)")
+    logger.info("[LABEL DEBUG] Class distribution (before filtering):")
+    logger.info(
+        f"[LABEL DEBUG]   FLAT (label=0): {flat_count_all} "
+        f"({flat_count_all/total_count_all*100:.2f}%)"
+    )
+    logger.info(
+        f"[LABEL DEBUG]   LONG (label=1): {long_count_all} "
+        f"({long_count_all/total_count_all*100:.2f}%)"
+    )
+    logger.info(
+        f"[LABEL DEBUG]   SHORT (label=2): {short_count_all} "
+        f"({short_count_all/total_count_all*100:.2f}%)"
+    )
     logger.info("-" * 60)
-    logger.info(f"  Final samples (after filtering): {len(y)}")
+    logger.info("[LABEL DEBUG] Class distribution (after filtering):")
+    logger.info(
+        f"[LABEL DEBUG]   FLAT (label=0): {flat_count} ({flat_ratio*100:.2f}%)"
+    )
+    logger.info(
+        f"[LABEL DEBUG]   LONG (label=1): {long_count} ({long_ratio*100:.2f}%)"
+    )
+    logger.info(
+        f"[LABEL DEBUG]   SHORT (label=2): {short_count} ({short_ratio*100:.2f}%)"
+    )
+    logger.info("-" * 60)
+    logger.info(
+        f"[LABEL DEBUG] Label rule: horizon={horizon}, "
+        f"pos_threshold={pos_threshold:.4f}, neg_threshold={neg_threshold:.4f}"
+    )
+    
+    # Warn if class distribution is extremely imbalanced
+    max_ratio = max(flat_ratio, long_ratio, short_ratio)
+    if max_ratio > 0.95:
+        logger.warning(
+            f"[LABEL DEBUG] WARNING: Extreme class imbalance detected! "
+            f"One class dominates {max_ratio*100:.1f}% of samples. "
+            f"This may indicate label threshold issues."
+        )
+    
+    # Sample logging: first 3 labels with their future returns
+    logger.info("[LABEL DEBUG] Sample labels (first 3):")
+    for i in range(min(3, len(y))):
+        label_val = int(y[i])
+        label_name = ["FLAT", "LONG", "SHORT"][label_val]
+        future_ret = float(future_returns_arr[i])
+        logger.info(
+            f"[LABEL DEBUG]   idx={i}: label={label_name}({label_val}), "
+            f"future_return={future_ret:.6f}"
+        )
+    
+    logger.info("=" * 60)
     logger.info(f"  FLAT (label=0): {flat_count} ({flat_ratio:.3f})")
     logger.info(f"  LONG (label=1): {long_count} ({long_ratio:.3f})")
     logger.info(f"  SHORT (label=2): {short_count} ({short_ratio:.3f})")

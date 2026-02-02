@@ -29,6 +29,23 @@ def save_backtest_report(
     end_date: str | None = None,
     long_threshold: float | None = None,
     short_threshold: float | None = None,
+    # Stage-2 parameters (optional)
+    use_stage2: bool = False,
+    stage2_trade_th: float | None = None,
+    stage2_min_edge: float | None = None,
+    stage2_exit_on_flat: bool = False,
+    stage2_allow_flip: bool = True,
+    stage2_cooldown_bars: int = 0,
+    # Direction filter (optional)
+    direction: str = "both",
+    # StrategyGuard (optional)
+    use_strategy_guard: bool = False,
+    # StrategyGuard Phase-2 options (optional)
+    strategy_guard_unblock_win_rate: float | None = None,
+    strategy_guard_unblock_avg_return: float | None = None,
+    strategy_guard_min_block_trades: int | None = None,
+    # SHORT Strategy MVP (optional)
+    enable_short_strategy: bool = False,
 ) -> Path:
     """
     Save backtest result to JSON file.
@@ -71,6 +88,23 @@ def save_backtest_report(
         "short_threshold": short_threshold,
         "commission_rate": getattr(settings, "COMMISSION_RATE", 0.0004),
         "slippage_rate": getattr(settings, "SLIPPAGE_RATE", 0.0005),
+        # Stage-2 parameters
+        "use_stage2": use_stage2,
+        "stage2_trade_th": stage2_trade_th,
+        "stage2_min_edge": stage2_min_edge,
+        "stage2_exit_on_flat": stage2_exit_on_flat,
+        "stage2_allow_flip": stage2_allow_flip,
+        "stage2_cooldown_bars": stage2_cooldown_bars,
+        # Direction filter
+        "direction": direction,
+        # StrategyGuard
+        "use_strategy_guard": use_strategy_guard,
+        # StrategyGuard Phase-2 options
+        "strategy_guard_unblock_win_rate": strategy_guard_unblock_win_rate,
+        "strategy_guard_unblock_avg_return": strategy_guard_unblock_avg_return,
+        "strategy_guard_min_block_trades": strategy_guard_min_block_trades,
+        # SHORT Strategy MVP
+        "enable_short_strategy": enable_short_strategy,
         "metrics": {
             "total_return": result["total_return"],
             "win_rate": result["win_rate"],
@@ -87,6 +121,9 @@ def save_backtest_report(
         },
         "equity_curve_length": len(result["equity_curve"]),
         "trades_count": len(result["trades"]),
+        # SHORT Strategy MVP
+        "short_strategy_enabled": result.get("short_strategy_enabled", False),
+        "short_trades_count": result.get("short_trades_count", 0),
     }
     
     # Calculate additional metrics
@@ -124,6 +161,18 @@ def save_backtest_report(
             report_data["metrics"]["short_avg_loss"] = float(
                 pd.Series([p for p in short_profits if p <= 0]).mean()
             ) if any(p <= 0 for p in short_profits) else 0.0
+    
+    # Add Stage-2 statistics if available
+    if "stage2_no_trade_count" in result:
+        report_data["stage2_stats"] = {
+            "stage2_no_trade_count": result.get("stage2_no_trade_count", 0),
+            "stage2_trade_count": result.get("stage2_trade_count", 0),
+            "stage2_exit_on_flat_count": result.get("stage2_exit_on_flat_count", 0),
+        }
+    
+    # Add block reasons if available
+    if "block_reasons" in result:
+        report_data["block_reasons"] = result["block_reasons"]
     
     # Save to JSON
     with open(report_path, "w", encoding="utf-8") as f:

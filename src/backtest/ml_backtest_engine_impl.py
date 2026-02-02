@@ -20,6 +20,11 @@ from src.indicators.basic import add_basic_indicators
 from src.optimization.ml_proba_cache import _get_cache_path, get_or_build_predictions
 from src.services.ohlcv_service import load_ohlcv_df
 from src.strategies.ml_thresholds import resolve_ml_thresholds
+from src.strategies.ml_signal_policy import (
+    ActionDecisionConfig,
+    ActionDecisionState,
+    decide_action_3class,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -316,6 +321,15 @@ class LstmAttnBacktestEngine(MLBacktestEngine):
         logger.info(f"{self.log_prefix} Loading predictions from cache: {cache_path}")
         cache_df = pd.read_parquet(cache_path)
         
+        # 진단 로그: 캐시 데이터 범위 확인
+        if "timestamp" in cache_df.columns:
+            cache_ts_max = cache_df["timestamp"].max()
+            cache_ts_min = cache_df["timestamp"].min()
+            logger.info(
+                f"{self.log_prefix}[CACHE DEBUG] Cache DataFrame timestamp range: "
+                f"{cache_ts_min} ~ {cache_ts_max}"
+            )
+        
         # Validate cache structure
         required_cols = ["proba_long", "proba_short"]
         if not all(col in cache_df.columns for col in required_cols):
@@ -327,9 +341,55 @@ class LstmAttnBacktestEngine(MLBacktestEngine):
         proba_short_arr = cache_df["proba_short"].values.astype(np.float32)
         df_aligned = cache_df.drop(columns=["proba_long", "proba_short"])
         
+        # ======================================================================
+        # [CACHE DEBUG] 백테스트 캐시 로드 정합성 검사
+        # ======================================================================
+        # Validate probability sum (3-class: p_long + p_flat + p_short = 1)
+        proba_flat_arr = 1.0 - proba_long_arr - proba_short_arr
+        proba_sum_arr = proba_long_arr + proba_flat_arr + proba_short_arr
+        sum_deviation = np.abs(proba_sum_arr - 1.0)
+        mean_sum_dev = float(np.mean(sum_deviation))
+        max_sum_dev = float(np.max(sum_deviation))
+        
+        # Check for NaN/Inf
+        nan_count = int(np.sum(np.isnan(proba_long_arr) | np.isnan(proba_short_arr)))
+        inf_count = int(np.sum(np.isinf(proba_long_arr) | np.isinf(proba_short_arr)))
+        
+        # Check index alignment (if timestamp column exists)
+        ts_mismatch_count = 0
+        if "timestamp" in df_aligned.columns:
+            # Check if timestamps are sorted (basic sanity check)
+            ts_sorted = df_aligned["timestamp"].is_monotonic_increasing
+            if not ts_sorted:
+                logger.warning(
+                    f"{self.log_prefix} Timestamps are not sorted. "
+                    "This may indicate cache alignment issues."
+                )
+        
         logger.info(
             f"{self.log_prefix} Loaded {len(proba_long_arr)} predictions from cache. "
             f"3-class model: FLAT={LstmClassIndex.FLAT}, LONG={LstmClassIndex.LONG}, SHORT={LstmClassIndex.SHORT}"
+        )
+        logger.debug(
+            f"{self.log_prefix}[CACHE DEBUG] Probability sum check: "
+            f"mean(|sum-1|)={mean_sum_dev:.6f}, max(|sum-1|)={max_sum_dev:.6f}, "
+            f"NaN={nan_count}, Inf={inf_count}"
+        )
+        
+        if max_sum_dev > 0.01:
+            logger.warning(
+                f"{self.log_prefix}[CACHE DEBUG] WARNING: Large probability sum deviation! "
+                f"max(|sum-1|)={max_sum_dev:.6f}"
+            )
+        
+        if nan_count > 0 or inf_count > 0:
+            logger.error(
+                f"{self.log_prefix}[CACHE DEBUG] ERROR: Found NaN/Inf in cache! "
+                f"NaN={nan_count}, Inf={inf_count}"
+            )
+            raise ValueError(
+                f"{self.log_prefix} Cache contains NaN/Inf predictions. "
+                f"Cannot proceed with backtest."
         )
         
         return proba_long_arr, proba_short_arr, df_aligned
@@ -349,14 +409,22 @@ class LstmAttnBacktestEngine(MLBacktestEngine):
         flat_threshold: Optional[float] = None,
         confidence_margin: float = 0.0,
         min_proba_dominance: float = 0.0,
+        # Anti-overtrading parameters
+        flat_max_th: Optional[float] = None,
+        margin_th: Optional[float] = None,
+        apply_confirmation_to_flips: bool = True,
+        # Stage-2 parameters
+        use_stage2: bool = False,
+        stage2_trade_th: Optional[float] = None,
+        stage2_min_edge: float = 0.0,
+        stage2_exit_on_flat: bool = False,
+        stage2_allow_flip: bool = True,
+        stage2_cooldown_bars: int = 0,
     ) -> pd.DataFrame:
         """
-        Generate LSTM signals using 3-class logic.
+        Generate LSTM signals using 3-class logic (SSOT).
         
-        For each bar:
-        - Compute proba_flat = 1 - proba_long - proba_short
-        - Determine desired_direction using argmax and thresholds
-        - Generate signal based on 3-class position management rules
+        Uses decide_action_3class() as the single source of truth for signal generation.
         """
         n = len(df)
         signals = np.full(n, "HOLD", dtype=object)
@@ -376,55 +444,248 @@ class LstmAttnBacktestEngine(MLBacktestEngine):
         proba_flat_padded = 1.0 - proba_long_padded - proba_short_padded
         proba_flat_padded = np.clip(proba_flat_padded, 0.0, 1.0)
         
-        # Determine desired_direction using 3-class logic with optional filters
-        # Rule: if p_long >= T_long and p_long >= p_short: LONG
-        #       elif p_short >= T_short and p_short > p_long: SHORT
-        #       else: FLAT
-        # Optional filters:
-        #   - flat_threshold: if p_flat >= flat_threshold, force HOLD
-        #   - confidence_margin: require (p_long - p_short) >= margin for LONG
-        #   - min_proba_dominance: require min dominance over opposite direction
+        # Create policy config
+        config = ActionDecisionConfig(
+            long_threshold=long_threshold,
+            short_threshold=short_threshold,
+            margin=confidence_margin,  # Use confidence_margin as margin
+            min_confidence=min_proba_dominance,  # Use min_proba_dominance as min_confidence
+            flat_threshold=flat_threshold,
+            cooldown_bars=0,  # Cooldown handled separately if needed
+            require_flip_via_flat=False,  # Can be made configurable later
+            long_only=long_only,
+            short_only=short_only,
+        )
         
-        # Use provided filter parameters (defaults handled in function signature)
+        # Track state for cooldown/flip rules (if needed in future)
+        state = ActionDecisionState()
         
+        # Track reason codes for logging
+        reason_code_counts: dict[str, int] = {}
+        action_counts: dict[str, int] = {"LONG": 0, "SHORT": 0, "FLAT": 0}
+        
+        # Sample logging: first 5, random 5, and trade events
+        sample_indices = set(range(min(5, n)))
+        if n > 10:
+            # Add random samples (fixed seed for reproducibility)
+            np.random.seed(42)
+            random_indices = np.random.choice(range(5, n), size=min(5, n - 5), replace=False)
+            sample_indices.update(random_indices)
+        
+        # Generate signals using SSOT function
         for i in range(n):
             p_long = proba_long_padded[i]
             p_short = proba_short_padded[i]
             p_flat = proba_flat_padded[i]
             
-            # Step 1: Check flat_threshold (if set, high uncertainty forces HOLD)
-            if flat_threshold is not None and p_flat >= flat_threshold:
-                desired_direction = "HOLD"
-            else:
-                # Step 2: Determine desired direction with confidence filters
-                long_margin = p_long - p_short
-                short_margin = p_short - p_long
-                
-                # LONG signal: threshold + dominance + confidence margin
-                if (p_long >= long_threshold and 
-                    p_long >= p_short and
-                    long_margin >= confidence_margin and
-                    long_margin >= min_proba_dominance):
-                    desired_direction = "LONG"
-                # SHORT signal: threshold + dominance + confidence margin
-                elif (short_threshold is not None and
-                      p_short >= short_threshold and
-                      p_short > p_long and
-                      short_margin >= confidence_margin and
-                      short_margin >= min_proba_dominance):
-                    desired_direction = "SHORT"
-                else:
-                    desired_direction = "HOLD"  # FLAT
+            # Get timestamp for logging
+            ts = None
+            if "timestamp" in df.columns:
+                ts = str(df.iloc[i]["timestamp"])
             
-            # Apply long_only / short_only filters
-            if long_only and desired_direction == "SHORT":
-                desired_direction = "HOLD"
-            if short_only and desired_direction == "LONG":
-                desired_direction = "HOLD"
+            # ======================================================================
+            # [ANTI-OVERTRADING] No-trade zone 확대
+            # ======================================================================
+            # flat_max_th: max(proba_long, proba_short) < flat_max_th 이면 FLAT
+            if flat_max_th is not None:
+                max_proba = max(p_long, p_short)
+                if max_proba < flat_max_th:
+                    signals[i] = "HOLD"
+                    reason_code_counts["FLAT_MAX_TH"] = reason_code_counts.get("FLAT_MAX_TH", 0) + 1
+                    action_counts["FLAT"] = action_counts.get("FLAT", 0) + 1
+                    continue
             
-            signals[i] = desired_direction
+            # margin_th: |proba_long - proba_short| < margin_th 이면 FLAT
+            if margin_th is not None:
+                proba_diff = abs(p_long - p_short)
+                if proba_diff < margin_th:
+                    signals[i] = "HOLD"
+                    reason_code_counts["MARGIN_TH"] = reason_code_counts.get("MARGIN_TH", 0) + 1
+                    action_counts["FLAT"] = action_counts.get("FLAT", 0) + 1
+                    continue
+            
+            # Update state
+            state.current_idx = i
+            
+            # Decide action using SSOT
+            result = decide_action_3class(
+                proba={"p_long": p_long, "p_flat": p_flat, "p_short": p_short},
+                config=config,
+                state=state,
+                idx=i,
+                ts=ts,
+            )
+            
+            # Map FLAT to HOLD for compatibility
+            action = result.action
+            if action == "FLAT":
+                action = "HOLD"
+            
+            signals[i] = action
+            
+            # Track counts
+            reason_code = result.reason_code
+            reason_code_counts[reason_code] = reason_code_counts.get(reason_code, 0) + 1
+            action_counts[action] = action_counts.get(action, 0) + 1
+            
+            # Sample logging (DEBUG level)
+            if i in sample_indices:
+                logger.debug(
+                    f"{self.log_prefix}[POLICY] idx={i} ts={ts} "
+                    f"pL={p_long:.4f} pF={p_flat:.4f} pS={p_short:.4f} "
+                    f"top1={result.debug_info['top1_label']}({result.debug_info['top1_prob']:.4f}) "
+                    f"top2={result.debug_info['top2_label']}({result.debug_info['top2_prob']:.4f}) "
+                    f"margin={result.debug_info['margin']:.4f} "
+                    f"min_conf={result.debug_info['min_confidence']:.4f} "
+                    f"cooldown={result.debug_info['cooldown_left']} "
+                    f"reason={reason_code} action={action}"
+                )
+        
+        # Log summary
+        total_signals = sum(action_counts.values())
+        if total_signals > 0:
+            long_pct = 100 * action_counts["LONG"] / total_signals
+            short_pct = 100 * action_counts["SHORT"] / total_signals
+            hold_pct = 100 * action_counts["FLAT"] / total_signals
+            
+            logger.info(
+                f"{self.log_prefix} Signal generation (3-class SSOT): "
+                f"LONG={action_counts['LONG']} ({long_pct:.1f}%), "
+                f"SHORT={action_counts['SHORT']} ({short_pct:.1f}%), "
+                f"HOLD={action_counts['FLAT']} ({hold_pct:.1f}%)"
+            )
+            
+            # Log reason code distribution
+            logger.debug(
+                f"{self.log_prefix} Reason code distribution: {reason_code_counts}"
+            )
+            
+            # Warn if signal rate is extremely low
+            active_signal_pct = long_pct + short_pct
+            if active_signal_pct < 0.01:
+                logger.warning(
+                    f"{self.log_prefix} Extremely low active signal rate ({active_signal_pct:.3f}%). "
+                    f"Thresholds may be too strict: long={long_threshold:.3f}, short={short_threshold}. "
+                    f"Consider re-optimizing with relaxed constraints."
+                )
         
         df = df.copy()
+        df["raw_signal"] = signals  # Stage-1 결과
+        
+        # ======================================================================
+        # [STAGE-2] 2단계 게이팅: 거래 여부 이진 판정
+        # ======================================================================
+        if use_stage2:
+            stage2_trade = np.full(n, False, dtype=bool)
+            stage2_reason = np.full(n, "", dtype=object)
+            
+            for i in range(n):
+                raw_sig = signals[i]
+                p_long = proba_long_padded[i]
+                p_short = proba_short_padded[i]
+                p_flat = proba_flat_padded[i]
+                
+                # Stage-1이 FLAT/HOLD면 기본적으로 Trade=False (포지션 유지)
+                if raw_sig == "HOLD" or raw_sig == "FLAT":
+                    if stage2_exit_on_flat:
+                        # 강제 청산 옵션이 켜져 있으면 Trade=True (Exit 신호)
+                        stage2_trade[i] = True
+                        stage2_reason[i] = "exit_on_flat"
+                    else:
+                        stage2_trade[i] = False
+                        stage2_reason[i] = "flat_candidate"
+                    continue
+                
+                # LONG/SHORT 후보에 대해 Stage-2 판정
+                trade_ok_abs = False
+                trade_ok_edge = False
+                
+                if raw_sig == "LONG":
+                    # (A) Absolute threshold gate
+                    if stage2_trade_th is not None:
+                        trade_ok_abs = p_long >= stage2_trade_th
+                    
+                    # (B) Edge gate
+                    if stage2_min_edge > 0.0:
+                        trade_ok_edge = (p_long - p_short) >= stage2_min_edge
+                    
+                    # 둘 중 하나라도 만족하면 Trade=True
+                    if trade_ok_abs or trade_ok_edge:
+                        stage2_trade[i] = True
+                        if trade_ok_abs and trade_ok_edge:
+                            stage2_reason[i] = "trade_ok_abs_edge"
+                        elif trade_ok_abs:
+                            stage2_reason[i] = "trade_ok_abs"
+                        else:
+                            stage2_reason[i] = "trade_ok_edge"
+                    else:
+                        stage2_trade[i] = False
+                        if stage2_trade_th is not None and p_long < stage2_trade_th:
+                            stage2_reason[i] = f"no_trade_low_conf_abs(p_long={p_long:.4f}<{stage2_trade_th:.4f})"
+                        elif stage2_min_edge > 0.0 and (p_long - p_short) < stage2_min_edge:
+                            stage2_reason[i] = f"no_trade_low_edge(p_diff={(p_long-p_short):.4f}<{stage2_min_edge:.4f})"
+                        else:
+                            stage2_reason[i] = "no_trade_low_conf"
+                
+                elif raw_sig == "SHORT":
+                    # (A) Absolute threshold gate
+                    if stage2_trade_th is not None:
+                        trade_ok_abs = p_short >= stage2_trade_th
+                    
+                    # (B) Edge gate
+                    if stage2_min_edge > 0.0:
+                        trade_ok_edge = (p_short - p_long) >= stage2_min_edge
+                    
+                    # 둘 중 하나라도 만족하면 Trade=True
+                    if trade_ok_abs or trade_ok_edge:
+                        stage2_trade[i] = True
+                        if trade_ok_abs and trade_ok_edge:
+                            stage2_reason[i] = "trade_ok_abs_edge"
+                        elif trade_ok_abs:
+                            stage2_reason[i] = "trade_ok_abs"
+                        else:
+                            stage2_reason[i] = "trade_ok_edge"
+                    else:
+                        stage2_trade[i] = False
+                        if stage2_trade_th is not None and p_short < stage2_trade_th:
+                            stage2_reason[i] = f"no_trade_low_conf_abs(p_short={p_short:.4f}<{stage2_trade_th:.4f})"
+                        elif stage2_min_edge > 0.0 and (p_short - p_long) < stage2_min_edge:
+                            stage2_reason[i] = f"no_trade_low_edge(p_diff={(p_short-p_long):.4f}<{stage2_min_edge:.4f})"
+                        else:
+                            stage2_reason[i] = "no_trade_low_conf"
+                
+                else:
+                    # 예외: 알 수 없는 raw_sig면 안전하게 no_trade 처리
+                    stage2_trade[i] = False
+                    stage2_reason[i] = f"unknown_raw_sig({raw_sig})"
+            
+            # Final signal: Stage-2가 Trade=False면 HOLD (포지션 유지)
+            final_signals = np.where(stage2_trade, signals, "HOLD")
+            df["stage2_trade"] = stage2_trade
+            df["stage2_reason"] = stage2_reason
+            df["signal"] = final_signals
+            
+            # Stage-2 통계 로깅
+            stage2_trade_count = np.sum(stage2_trade)
+            stage2_no_trade_count = n - stage2_trade_count
+            logger.info(
+                f"{self.log_prefix} Stage-2 statistics: "
+                f"trade={stage2_trade_count} ({100*stage2_trade_count/n:.1f}%), "
+                f"no_trade={stage2_no_trade_count} ({100*stage2_no_trade_count/n:.1f}%)"
+            )
+            
+            # Stage-2 reason 분포
+            reason_counts = {}
+            for reason in stage2_reason:
+                if reason:
+                    reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            logger.debug(
+                f"{self.log_prefix} Stage-2 reason distribution: {reason_counts}"
+            )
+        else:
+            # Stage-2 비활성: 기존과 동일
+            df["stage2_trade"] = np.full(n, True, dtype=bool)  # 모두 Trade=True로 처리
+            df["stage2_reason"] = np.full(n, "stage2_disabled", dtype=object)
         df["signal"] = signals
         
         # Apply signal confirmation
@@ -464,23 +725,42 @@ class LstmAttnBacktestEngine(MLBacktestEngine):
             
             df["signal"] = filtered_signals
         
-        # Log signal distribution
-        signal_counts = {
-            "LONG": int(np.sum(signals == "LONG")),
-            "SHORT": int(np.sum(signals == "SHORT")),
-            "HOLD": int(np.sum(signals == "HOLD")),
+        # Log signal distribution (final signal after Stage-2)
+        final_signal_counts = {
+            "LONG": int(np.sum(df["signal"] == "LONG")),
+            "SHORT": int(np.sum(df["signal"] == "SHORT")),
+            "HOLD": int(np.sum(df["signal"] == "HOLD")),
         }
-        total_signals = sum(signal_counts.values())
+        total_signals = sum(final_signal_counts.values())
         if total_signals > 0:
-            long_pct = 100 * signal_counts['LONG'] / total_signals
-            short_pct = 100 * signal_counts['SHORT'] / total_signals
-            hold_pct = 100 * signal_counts['HOLD'] / total_signals
+            long_pct = 100 * final_signal_counts['LONG'] / total_signals
+            short_pct = 100 * final_signal_counts['SHORT'] / total_signals
+            hold_pct = 100 * final_signal_counts['HOLD'] / total_signals
             
             logger.info(
-                f"{self.log_prefix} Signal generation (3-class): "
-                f"LONG={signal_counts['LONG']} ({long_pct:.1f}%), "
-                f"SHORT={signal_counts['SHORT']} ({short_pct:.1f}%), "
-                f"HOLD={signal_counts['HOLD']} ({hold_pct:.1f}%)"
+                f"{self.log_prefix} Final signal distribution (after Stage-2): "
+                f"LONG={final_signal_counts['LONG']} ({long_pct:.1f}%), "
+                f"SHORT={final_signal_counts['SHORT']} ({short_pct:.1f}%), "
+                f"HOLD={final_signal_counts['HOLD']} ({hold_pct:.1f}%)"
+            )
+            
+            # Raw signal distribution (Stage-1) 로깅
+            if "raw_signal" in df.columns:
+                raw_signal_counts = {
+                    "LONG": int(np.sum(df["raw_signal"] == "LONG")),
+                    "SHORT": int(np.sum(df["raw_signal"] == "SHORT")),
+                    "HOLD": int(np.sum(df["raw_signal"] == "HOLD")),
+                }
+                raw_total = sum(raw_signal_counts.values())
+                if raw_total > 0:
+                    raw_long_pct = 100 * raw_signal_counts['LONG'] / raw_total
+                    raw_short_pct = 100 * raw_signal_counts['SHORT'] / raw_total
+                    raw_hold_pct = 100 * raw_signal_counts['HOLD'] / raw_total
+                    logger.info(
+                        f"{self.log_prefix} Raw signal distribution (Stage-1): "
+                        f"LONG={raw_signal_counts['LONG']} ({raw_long_pct:.1f}%), "
+                        f"SHORT={raw_signal_counts['SHORT']} ({raw_short_pct:.1f}%), "
+                        f"HOLD={raw_signal_counts['HOLD']} ({raw_hold_pct:.1f}%)"
             )
             
             # Warn if signal rate is extremely low (likely threshold issue)
@@ -539,6 +819,52 @@ class LstmAttnBacktestEngine(MLBacktestEngine):
         flat_threshold: Optional[float] = None,
         confidence_margin: float = 0.0,
         min_proba_dominance: float = 0.0,
+        # Anti-overtrading parameters
+        enter_long_th: Optional[float] = None,
+        exit_long_th: Optional[float] = None,
+        enter_short_th: Optional[float] = None,
+        exit_short_th: Optional[float] = None,
+        min_hold_bars: Optional[int] = None,
+        cooldown_bars: Optional[int] = None,
+        flat_max_th: Optional[float] = None,
+        margin_th: Optional[float] = None,
+        apply_confirmation_to_flips: bool = True,
+        # Stage-2 parameters
+        use_stage2: bool = False,
+        stage2_trade_th: Optional[float] = None,
+        stage2_min_edge: float = 0.0,
+        stage2_exit_on_flat: bool = False,
+        stage2_allow_flip: bool = True,
+        stage2_cooldown_bars: int = 0,
+        # StrategyGuard
+        use_strategy_guard: bool = False,
+        # StrategyGuard Phase-2 options
+        strategy_guard_min_win_rate: float | None = None,
+        strategy_guard_min_avg_return: float | None = None,
+        strategy_guard_unblock_win_rate: float | None = None,
+        strategy_guard_unblock_avg_return: float | None = None,
+        strategy_guard_min_block_trades: int | None = None,
+        strategy_guard_recent_trades_window: int | None = None,
+        strategy_guard_insufficient_sample_policy: str | None = None,
+        # StrategyGuard v2 options
+        use_strategy_guard_v2: bool = False,
+        strategy_guard_v2_mode: str | None = None,
+        strategy_guard_v2_window_signal_stats: int | None = None,
+        strategy_guard_v2_min_margin: float | None = None,
+        strategy_guard_v2_max_entropy: float | None = None,
+        strategy_guard_v2_scale_floor: float | None = None,
+        strategy_guard_v2_block_if_scale_below: float | None = None,
+        # SHORT Strategy MVP
+        enable_short_strategy: bool = False,
+        # Trade dump
+        dump_trades_path: str | None = None,
+        # Stage-2 v2.2 options
+        stage2_block_if_final_scale_below: float = 0.0,
+        # Stage-2 CAP 임계값 (스윕용)
+        stage2_cap_entropy_high_th: float = 0.64,  # 완화: 0.66 → 0.64
+        stage2_cap_entropy_mid_th: float = 0.62,   # 완화: 0.64 → 0.62
+        stage2_cap_pdiff_tiny_th: float = 0.002,
+        stage2_cap_pdiff_small_th: float = 0.005,  # 기본값 승격: pdiff_small_005 (기존 0.004)
     ) -> BacktestResult:
         """
         Run LSTM backtest with 3-class logic.
@@ -578,25 +904,118 @@ class LstmAttnBacktestEngine(MLBacktestEngine):
             df_with_proba=df_with_proba,
         )
         
+        # ======================================================================
+        # [CACHE DEBUG] 백테스트 데이터와 캐시 정합성 검사
+        # ======================================================================
+        logger.info("=" * 60)
+        logger.info(f"{self.log_prefix}[CACHE DEBUG] Backtest Data-Cache Alignment Check")
+        logger.info("=" * 60)
+        logger.info(
+            f"{self.log_prefix}[CACHE DEBUG] Data shapes: df={len(df)}, "
+            f"proba_long={len(proba_long_arr)}, proba_short={len(proba_short_arr)}"
+        )
+        
+        # Check alignment
+        if len(proba_long_arr) != len(df):
+            logger.warning(
+                f"{self.log_prefix}[CACHE DEBUG] WARNING: Length mismatch! "
+                f"df={len(df)}, proba_long={len(proba_long_arr)}. "
+                "This may cause alignment issues."
+            )
+        else:
+            logger.info(
+                f"{self.log_prefix}[CACHE DEBUG] Length match: ✓ "
+                f"All arrays have {len(df)} elements"
+            )
+        
+        # Check timestamp alignment if available
+        if "timestamp" in df.columns:
+            df_ts_min = str(df["timestamp"].min())
+            df_ts_max = str(df["timestamp"].max())
+            logger.info(
+                f"{self.log_prefix}[CACHE DEBUG] DataFrame timestamp range: "
+                f"{df_ts_min} ~ {df_ts_max}"
+            )
+        
+        logger.info("=" * 60)
+        
         # Apply index_mask if provided
         if index_mask is not None:
             if len(index_mask) != len(df):
                 logger.warning(
-                    f"{self.log_prefix} index_mask length ({len(index_mask)}) != df length ({len(df)}). Ignoring mask."
+                    f"{self.log_prefix}[CACHE DEBUG] index_mask length ({len(index_mask)}) != df length ({len(df)}). Ignoring mask."
                 )
             else:
+                rows_before = len(df)
                 df = df[index_mask].reset_index(drop=True)
                 proba_long_arr = proba_long_arr[index_mask]
                 proba_short_arr = proba_short_arr[index_mask]
-                logger.debug(f"{self.log_prefix} Applied index_mask: filtered to {len(df)} rows")
+                rows_after = len(df)
+                logger.info(
+                    f"{self.log_prefix}[CACHE DEBUG] Applied index_mask: "
+                    f"{rows_before} -> {rows_after} rows "
+                    f"({rows_after/rows_before*100:.1f}% retained)"
+                )
+        
+        # Resolve enter/exit thresholds (히스테리시스)
+        # If not provided, use long_threshold/short_threshold as defaults
+        if enter_long_th is None:
+            enter_long_th = long_threshold
+        if exit_long_th is None:
+            # Default: exit threshold is lower than enter (hysteresis)
+            exit_long_th = enter_long_th * 0.95  # 5% lower
+        if enter_short_th is None:
+            enter_short_th = short_threshold if short_threshold is not None else (1.0 - long_threshold)
+        if exit_short_th is None:
+            # Default: exit threshold is lower than enter (hysteresis)
+            exit_short_th = enter_short_th * 0.95  # 5% lower
+        
+        logger.info(
+            f"{self.log_prefix} Hysteresis thresholds: "
+            f"enter_long={enter_long_th:.3f}, exit_long={exit_long_th:.3f}, "
+            f"enter_short={enter_short_th:.3f}, exit_short={exit_short_th:.3f}"
+        )
+        if min_hold_bars is not None:
+            logger.info(f"{self.log_prefix} Min hold bars: {min_hold_bars}")
+        if cooldown_bars is not None:
+            logger.info(f"{self.log_prefix} Cooldown bars: {cooldown_bars}")
+        if flat_max_th is not None:
+            logger.info(f"{self.log_prefix} Flat max threshold: {flat_max_th:.3f}")
+        if margin_th is not None:
+            logger.info(f"{self.log_prefix} Margin threshold: {margin_th:.3f}")
+        logger.info(
+            f"{self.log_prefix} Apply confirmation to flips: {apply_confirmation_to_flips}"
+        )
         
         # Generate signals
+        # CRITICAL: Signal generation should use enter thresholds to match execution logic
+        # This ensures signal=LONG means we can actually enter LONG position
+        signal_gen_long_th = enter_long_th if enter_long_th is not None else long_threshold
+        signal_gen_short_th = enter_short_th if enter_short_th is not None else short_threshold
+        
+        logger.info(
+            f"{self.log_prefix} Signal generation thresholds: "
+            f"long={signal_gen_long_th:.3f}, short={signal_gen_short_th:.3f} "
+            f"(using enter thresholds to match execution)"
+        )
+        
+        # Stage-2 설정 로깅
+        if use_stage2:
+            logger.info(
+                f"{self.log_prefix} Stage-2 enabled: "
+                f"trade_th={stage2_trade_th}, min_edge={stage2_min_edge}, "
+                f"exit_on_flat={stage2_exit_on_flat}, allow_flip={stage2_allow_flip}, "
+                f"cooldown_bars={stage2_cooldown_bars}"
+            )
+        else:
+            logger.info(f"{self.log_prefix} Stage-2 disabled (using Stage-1 only)")
+        
         df = self.generate_signals(
             proba_long_arr=proba_long_arr,
             proba_short_arr=proba_short_arr,
             df=df,
-            long_threshold=long_threshold,
-            short_threshold=short_threshold,
+            long_threshold=signal_gen_long_th,  # Use enter threshold for signal generation
+            short_threshold=signal_gen_short_th,  # Use enter threshold for signal generation
             long_only=long_only,
             short_only=short_only,
             signal_confirmation_bars=signal_confirmation_bars,
@@ -605,6 +1024,16 @@ class LstmAttnBacktestEngine(MLBacktestEngine):
             flat_threshold=flat_threshold,
             confidence_margin=confidence_margin,
             min_proba_dominance=min_proba_dominance,
+            flat_max_th=flat_max_th,
+            margin_th=margin_th,
+            apply_confirmation_to_flips=apply_confirmation_to_flips,
+            # Stage-2 parameters
+            use_stage2=use_stage2,
+            stage2_trade_th=stage2_trade_th,
+            stage2_min_edge=stage2_min_edge,
+            stage2_exit_on_flat=stage2_exit_on_flat,
+            stage2_allow_flip=stage2_allow_flip,
+            stage2_cooldown_bars=stage2_cooldown_bars,
         )
         
         # Execute trades
@@ -618,6 +1047,46 @@ class LstmAttnBacktestEngine(MLBacktestEngine):
             use_confidence_filter=use_confidence_filter,
             confidence_quantile=confidence_quantile,
             daily_loss_limit=daily_loss_limit,
+            enter_long_th=enter_long_th,
+            exit_long_th=exit_long_th,
+            enter_short_th=enter_short_th,
+            exit_short_th=exit_short_th,
+            min_hold_bars=min_hold_bars,
+            cooldown_bars=cooldown_bars,
+            proba_long_arr=proba_long_arr,
+            proba_short_arr=proba_short_arr,
+            # Direction filter
+            long_only=long_only,
+            short_only=short_only,
+            # StrategyGuard
+            use_strategy_guard=use_strategy_guard,
+            # StrategyGuard Phase-2 options
+            strategy_guard_min_win_rate=strategy_guard_min_win_rate,
+            strategy_guard_min_avg_return=strategy_guard_min_avg_return,
+            strategy_guard_unblock_win_rate=strategy_guard_unblock_win_rate,
+            strategy_guard_unblock_avg_return=strategy_guard_unblock_avg_return,
+            strategy_guard_min_block_trades=strategy_guard_min_block_trades,
+            strategy_guard_recent_trades_window=strategy_guard_recent_trades_window,
+            strategy_guard_insufficient_sample_policy=strategy_guard_insufficient_sample_policy,
+            # StrategyGuard v2
+            use_strategy_guard_v2=use_strategy_guard_v2,
+            strategy_guard_v2_mode=strategy_guard_v2_mode,
+            strategy_guard_v2_window_signal_stats=strategy_guard_v2_window_signal_stats,
+            strategy_guard_v2_min_margin=strategy_guard_v2_min_margin,
+            strategy_guard_v2_max_entropy=strategy_guard_v2_max_entropy,
+            strategy_guard_v2_scale_floor=strategy_guard_v2_scale_floor,
+            strategy_guard_v2_block_if_scale_below=strategy_guard_v2_block_if_scale_below,
+            # SHORT Strategy MVP
+            enable_short_strategy=enable_short_strategy,
+            # Trade dump
+            dump_trades_path=dump_trades_path,
+            # Stage-2 (for dump accuracy)
+            use_stage2=use_stage2,
+            stage2_block_if_final_scale_below=stage2_block_if_final_scale_below,
+            stage2_cap_entropy_high_th=stage2_cap_entropy_high_th,
+            stage2_cap_entropy_mid_th=stage2_cap_entropy_mid_th,
+            stage2_cap_pdiff_tiny_th=stage2_cap_pdiff_tiny_th,
+            stage2_cap_pdiff_small_th=stage2_cap_pdiff_small_th,
         )
         
         return result
@@ -654,6 +1123,14 @@ def get_ml_backtest_engine(
             symbol=symbol,
             timeframe=timeframe,
             feature_preset="base",  # LSTM doesn't use feature_preset
+        )
+    elif strategy_name == "ml_tcn":
+        # TCN uses the same engine as LSTM-Attn (both are 3-class models)
+        return LstmAttnBacktestEngine(
+            strategy_name=strategy_name,
+            symbol=symbol,
+            timeframe=timeframe,
+            feature_preset="base",  # TCN doesn't use feature_preset
         )
     else:
         raise ValueError(f"Unsupported ML strategy: {strategy_name}")

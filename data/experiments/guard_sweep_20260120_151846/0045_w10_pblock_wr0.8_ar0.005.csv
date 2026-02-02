@@ -1,0 +1,1 @@
+event_type,trade_index,idx,timestamp,direction,price,raw_signal,final_signal,stage2_trade,stage2_reason,guard_decision,exit_reason,pnl

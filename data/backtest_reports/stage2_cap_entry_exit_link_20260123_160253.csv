@@ -1,0 +1,1 @@
+trade_id,entry_ts,exit_ts,side,entry_price,exit_price,holding_bars,p_long,margin,entropy,p_diff,guard_scale,stage2_cap,final_scale,cap_reason,realized_profit,scaled_profit

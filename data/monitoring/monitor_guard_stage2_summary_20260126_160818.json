@@ -1,0 +1,113 @@
+{
+  "run_id": "20260126_160818",
+  "mode": "backtest",
+  "timestamp": "2026-01-26T16:08:23.491754",
+  "total_checks": 94,
+  "entries_attempted": 20,
+  "entries_executed": 20,
+  "total_trades": 40,
+  "blocked_by_min_hold": 0,
+  "blocked_by_cooldown": 229,
+  "blocked_by_guard_hard": 0,
+  "guard_scale_stats": {
+    "count": 9,
+    "mean": 0.04696177985542824,
+    "median": 0.03958224663510918,
+    "p10": 0.02704297052323818,
+    "p90": 0.07947635646164417,
+    "min": 0.026357684522867204,
+    "max": 0.10533228196203709
+  },
+  "stage2_cap_distribution": {
+    "cap_1_0": 15,
+    "cap_1_0_pct": 75.0,
+    "cap_0_8": 3,
+    "cap_0_8_pct": 15.0,
+    "cap_0_6": 2,
+    "cap_0_6_pct": 10.0,
+    "total": 20
+  },
+  "final_scale_stats": {
+    "count": 20,
+    "mean": 0.08882872409052725,
+    "median": 0.08697836876293205,
+    "p10": 0.0536399743574507,
+    "p90": 0.12756590768694878,
+    "min": 0.04608251125916191,
+    "max": 0.14766361625470117
+  },
+  "guard_scale_histogram": {
+    "0.0~0.1": 82,
+    "0.1~0.2": 12,
+    "0.2~0.3": 0,
+    "0.3~0.4": 0,
+    "0.4~0.5": 0,
+    "0.5~0.6": 0,
+    "0.6~0.7": 0,
+    "0.7~0.8": 0,
+    "0.8~0.9": 0,
+    "0.9~1.0": 0,
+    "1.0": 0
+  },
+  "stage2_cap_histogram": {
+    "cap_1_0": 15,
+    "cap_1_0_pct": 75.0,
+    "cap_0_8": 3,
+    "cap_0_8_pct": 15.0,
+    "cap_0_6": 2,
+    "cap_0_6_pct": 10.0,
+    "other": 0,
+    "total": 20
+  },
+  "final_scale_histogram": {
+    "0.0~0.1": 11,
+    "0.1~0.2": 9,
+    "0.2~0.3": 0,
+    "0.3~0.4": 0,
+    "0.4~0.5": 0,
+    "0.5~0.6": 0,
+    "0.6~0.7": 0,
+    "0.7~0.8": 0,
+    "0.8~0.9": 0,
+    "0.9~1.0": 0,
+    "1.0": 0
+  },
+  "cap_reason_counts": {
+    "no_cap": 15,
+    "high_entropy(0.6672)_tiny_pdiff(0.0004)": 1,
+    "mid_entropy(0.6436)_small_pdiff(0.0036)": 1,
+    "high_entropy(0.6621)_tiny_pdiff(0.0016)": 1,
+    "mid_entropy(0.6828)_small_pdiff(0.0031)": 1,
+    "mid_entropy(0.6604)_small_pdiff(0.0022)": 1
+  },
+  "config_snapshot": {
+    "symbol": "BTCUSDT",
+    "timeframe": "5m",
+    "mode": "backtest",
+    "run_id": "20260126_160818",
+    "stage2": {
+      "use_stage2": true,
+      "cap_entropy_high_th": 0.64,
+      "cap_entropy_mid_th": 0.62,
+      "cap_pdiff_tiny_th": 0.002,
+      "cap_pdiff_small_th": 0.005,
+      "cap_low": 0.6,
+      "cap_mid": 0.8,
+      "cap_default": 1.0,
+      "block_if_final_scale_below": 0.0
+    },
+    "anti_overtrading": {
+      "min_hold_bars": 12,
+      "cooldown_bars": 12
+    },
+    "guard_v2": {
+      "use_strategy_guard_v2": true,
+      "mode": "soft",
+      "scale_floor": 0.02,
+      "block_if_scale_below": null,
+      "min_margin": null,
+      "max_entropy": null,
+      "window_signal_stats": null
+    }
+  }
+}

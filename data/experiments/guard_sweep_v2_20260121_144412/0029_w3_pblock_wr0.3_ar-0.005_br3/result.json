@@ -1,0 +1,29 @@
+{
+  "run_id": "0029_w3_pblock_wr0.3_ar-0.005_br3",
+  "strategy": "ml_tcn",
+  "symbol": "BTCUSDT",
+  "timeframe": "5m",
+  "direction": "long",
+  "start_date": "2023-01-01",
+  "end_date": "2024-12-31",
+  "guard_params": {
+    "recent_trades_window": 3,
+    "insufficient_sample_policy": "block",
+    "min_win_rate": 0.3,
+    "min_avg_return": -0.005,
+    "min_block_trades": 3
+  },
+  "metrics": {
+    "total_entries": 0,
+    "total_exits": 0,
+    "total_trades": 0,
+    "total_blocks": 1,
+    "block_rate": 0.0,
+    "final_return": 0.0,
+    "max_drawdown": 0.0,
+    "sharpe": 0.0
+  },
+  "last_decision_sample": null,
+  "guard_summary_sample": "[STRATEGY_GUARD][SUMMARY] total_trades=0 recent_trades_window=3 max_recent_trades_count=0",
+  "exit_code": 0
+}

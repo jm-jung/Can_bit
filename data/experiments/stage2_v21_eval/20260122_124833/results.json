@@ -1,0 +1,33 @@
+{
+  "run1_baseline": {
+    "total_return": -1.99,
+    "win_rate": 48.28,
+    "max_drawdown": 2.32,
+    "total_trades": 174,
+    "avg_holding_bars": 12.0,
+    "command": "/Users/jeongminjun/Projects/Can_bit/.venv/bin/python -m src.backtest.run_ml_xgb_backtest --strategy ml_tcn --symbol BTCUSDT --timeframe 5m --direction long --start-date 2023-01-01 --end-date 2024-12-31 --use-optimized-threshold --signal-confirmation-bars 1 --min-hold-bars 12 --cooldown-bars 12 --use-strategy-guard --strategy-guard-v2 --strategy-guard-v2-mode soft --strategy-guard-v2-scale-floor 0.02 --no-save"
+  },
+  "run3_v21": {
+    "total_return": -0.82,
+    "win_rate": 48.28,
+    "max_drawdown": 0.96,
+    "total_trades": 174,
+    "avg_holding_bars": 12.0,
+    "stage2_score_stats": {
+      "count": 87,
+      "min": 0.323,
+      "median": 0.393,
+      "p90": 0.435,
+      "max": 0.447,
+      "pct_at_floor": 0.0
+    },
+    "final_scale_stats": {
+      "count": 87,
+      "min": 0.018,
+      "median": 0.042,
+      "p90": 0.064,
+      "max": 0.071
+    },
+    "command": "/Users/jeongminjun/Projects/Can_bit/.venv/bin/python -m src.backtest.run_ml_xgb_backtest --strategy ml_tcn --symbol BTCUSDT --timeframe 5m --direction long --start-date 2023-01-01 --end-date 2024-12-31 --use-optimized-threshold --signal-confirmation-bars 1 --min-hold-bars 12 --cooldown-bars 12 --use-strategy-guard --strategy-guard-v2 --strategy-guard-v2-mode soft --strategy-guard-v2-scale-floor 0.02 --no-save --use-stage2"
+  }
+}

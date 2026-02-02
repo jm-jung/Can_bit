@@ -1,0 +1,72 @@
+{
+  "short_term": {
+    "period": "short_term",
+    "start_date": "2025-01-01",
+    "end_date": "2025-03-01",
+    "total_return": -1.79,
+    "max_drawdown": 2.11,
+    "total_trades": 174,
+    "win_rate": 48.28,
+    "cap_breakdown": {
+      "1.0": {
+        "trade_count": 54,
+        "win_rate": 0.5,
+        "mean_profit": -0.000299,
+        "median_profit": 4.9e-05,
+        "mean_holding_bars": 12.0,
+        "total_contribution": -0.016146
+      },
+      "0.8": {
+        "trade_count": 17,
+        "win_rate": 0.5294,
+        "mean_profit": 0.00012,
+        "median_profit": 0.000238,
+        "mean_holding_bars": 12.0,
+        "total_contribution": 0.002046
+      },
+      "0.6": {
+        "trade_count": 16,
+        "win_rate": 0.375,
+        "mean_profit": -0.000242,
+        "median_profit": -3.1e-05,
+        "mean_holding_bars": 12.0,
+        "total_contribution": -0.003865
+      }
+    }
+  },
+  "long_term": {
+    "period": "long_term",
+    "start_date": "2023-01-01",
+    "end_date": "2024-12-31",
+    "total_return": -1.79,
+    "max_drawdown": 2.11,
+    "total_trades": 174,
+    "win_rate": 48.28,
+    "cap_breakdown": {
+      "1.0": {
+        "trade_count": 54,
+        "win_rate": 0.5,
+        "mean_profit": -0.000299,
+        "median_profit": 4.9e-05,
+        "mean_holding_bars": 12.0,
+        "total_contribution": -0.016146
+      },
+      "0.8": {
+        "trade_count": 17,
+        "win_rate": 0.5294,
+        "mean_profit": 0.00012,
+        "median_profit": 0.000238,
+        "mean_holding_bars": 12.0,
+        "total_contribution": 0.002046
+      },
+      "0.6": {
+        "trade_count": 16,
+        "win_rate": 0.375,
+        "mean_profit": -0.000242,
+        "median_profit": -3.1e-05,
+        "mean_holding_bars": 12.0,
+        "total_contribution": -0.003865
+      }
+    }
+  }
+}
