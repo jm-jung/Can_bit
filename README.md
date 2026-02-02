@@ -142,6 +142,20 @@ python -m src.optimization.ml_proba_cache --strategy ml_lstm_attn --symbol BTCUS
 
 ---
 
+### 🔄 Long-Only / Short-Only 분리 실험
+
+Long-Only / Short-Only 실험은 성능 향상을 목적으로 하지 않는다.
+
+이 실험의 목적은:
+- 신호 방향별 기여도 분해
+- Stage-2 Guard(CAP)의 작동 구간 분석
+- Guard 판단 근거 로그의 정합성 검증
+
+특히 Long-Only 실험은 전략 선택을 위한 것이 아니라,
+**전략 구조를 해부하기 위한 분석 도구**로 사용된다.
+
+---
+
 ## 6. 실시간 업데이트 엔진 (Realtime Updater)
 `src/realtime/updater.py`
 
@@ -193,6 +207,31 @@ API:
 
 ---
 
+## 9-1. StrategyGuard v2 — 신호 안정화 & 과매매 방지 계층
+
+StrategyGuard v2는 Risk Manager 이전 단계에서 작동하는
+**신호 품질 안정화 계층**이다.
+
+Risk Manager가 손실을 제한하는 역할이라면,
+StrategyGuard는 애초에 **왜 이 신호가 나왔는지 설명 가능한 상태인지**를 검증한다.
+
+### 구조
+- Stage-1 Guard
+  - 신호 confidence 필터
+  - trade density / cooldown 제어
+  - 극단적 연속 시그널 차단
+
+- Stage-2 Guard
+  - CAP 기반 장기 구간 contribution 제어
+  - 특정 조건 또는 구간에 수익이 과도하게 집중되는 현상 방지
+
+StrategyGuard는 거래를 막기 위해 존재하지 않는다.
+**차단 실패(BLOCK=0) 또한 실험 결과로 기록**되며,
+이를 통해 Guard 파라미터와 전략 구조를 지속적으로 개선한다.
+
+
+---
+
 ## 10. Backoffice 로그 / 모니터링
 
 `src/backoffice/`
@@ -209,6 +248,31 @@ API:
 
 ---
 
+## 🧪 Stage-2 Guard — CAP 기반 Long-Run Contribution Control
+
+Stage-2 Guard는 단일 트레이드의 손익을 제한하지 않는다.
+대신 **장기 구간(Long-Run)에서 특정 조건이 전체 성과에 과도하게 기여하는 것을 제한**한다.
+
+### CAP의 의미
+- 단일 거래 수익 상한 ❌
+- 장기 구간에서의 누적 기여도 상한 ⭕
+- 수익이 특정 시점·조건·신호에 몰리는 현상 방지
+
+### 도입 배경
+- 단기 백테스트에서는 좋아 보이나
+  실제로는 일부 구간에만 성과가 집중되는 전략 다수 존재
+- 이는 실전에서 가장 위험한 착시 패턴
+
+### 실험 결과 요약
+- CAP ↓ : trade 수 감소, 안정성 증가
+- CAP ↑ : contribution 집중 위험 증가
+- CAP 값은 단기 성능과 장기 안정성 사이의 트레이드오프를 형성
+
+Stage-2 Guard의 모든 실험 결과는
+`data/backtest_reports/`에 자동 저장되며,
+BLOCK 발생 여부 및 판단 근거 로그를 함께 기록한다.
+
+---
 # 📊 Next.js Frontend Dashboard
 
 `/frontend/`
@@ -394,6 +458,17 @@ npm run dev
 → ML/DL 기반 전략 등장 후 완전히 폐기
 
 ---
+## 6. Guard 미적용 전략의 공통 문제
+StrategyGuard를 적용하지 않은 전략들은 공통적인 문제를 보였다.
+
+- trade density 폭증
+- 단기 Sharpe 착시
+- 특정 구간 수익 집중
+- 실전 리스크 급증
+
+이로 인해 Can_bit에서는
+**모든 전략이 StrategyGuard를 통과해야만 실전 후보로 간주된다.**
+
 
 # 📌 정리  
 포기한 전략들은 아래 같은 공통 이유를 가짐:
