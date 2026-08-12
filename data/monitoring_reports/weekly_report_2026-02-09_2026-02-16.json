@@ -1,0 +1,146 @@
+{
+  "report_period": {
+    "start": "2026-02-09T22:41:44.443070",
+    "end": "2026-02-16T22:41:44.443070"
+  },
+  "generated_at": "2026-02-16T22:41:44.452494",
+  "total_runs": 3,
+  "run_ids": [
+    "20260216_133306",
+    "20260216_221511",
+    "20260216_221916"
+  ],
+  "mode_distribution": {
+    "backtest": 3
+  },
+  "skipped_files": [],
+  "performance_trend": [
+    {
+      "run_id": "20260216_133306",
+      "return": null,
+      "max_drawdown": null,
+      "total_trades": 40,
+      "win_rate": null,
+      "entries_executed": 20,
+      "total_checks": 94,
+      "final_scale_stats": {
+        "count": 20,
+        "mean": 0.08882872409052725,
+        "median": 0.08697836876293205,
+        "p10": 0.0536399743574507,
+        "p90": 0.12756590768694878,
+        "min": 0.04608251125916191,
+        "max": 0.14766361625470117
+      }
+    },
+    {
+      "run_id": "20260216_221511",
+      "return": -0.0026477475413314577,
+      "max_drawdown": 0.0032583618212149884,
+      "total_trades": 40,
+      "win_rate": 0.3,
+      "entries_executed": 20,
+      "total_checks": 94,
+      "final_scale_stats": {
+        "count": 20,
+        "mean": 0.08882872409052725,
+        "median": 0.08697836876293205,
+        "p10": 0.0536399743574507,
+        "p90": 0.12756590768694878,
+        "min": 0.04608251125916191,
+        "max": 0.14766361625470117
+      }
+    },
+    {
+      "run_id": "20260216_221916",
+      "return": -0.0026477475413314577,
+      "max_drawdown": 0.0032583618212149884,
+      "total_trades": 40,
+      "win_rate": 0.3,
+      "entries_executed": 20,
+      "total_checks": 94,
+      "final_scale_stats": {
+        "count": 20,
+        "mean": 0.08882872409052725,
+        "median": 0.08697836876293205,
+        "p10": 0.0536399743574507,
+        "p90": 0.12756590768694878,
+        "min": 0.04608251125916191,
+        "max": 0.14766361625470117
+      }
+    }
+  ],
+  "aggregated_distributions": {
+    "guard_scale_histogram": {
+      "0.0~0.1": 246,
+      "0.1~0.2": 36,
+      "0.2~0.3": 0,
+      "0.3~0.4": 0,
+      "0.4~0.5": 0,
+      "0.5~0.6": 0,
+      "0.6~0.7": 0,
+      "0.7~0.8": 0,
+      "0.8~0.9": 0,
+      "0.9~1.0": 0,
+      "1.0": 0
+    },
+    "stage2_cap_histogram": {
+      "cap_1_0": 45,
+      "cap_0_8": 9,
+      "cap_0_6": 6
+    },
+    "final_scale_histogram": {
+      "0.0~0.1": 33,
+      "0.1~0.2": 27,
+      "0.2~0.3": 0,
+      "0.3~0.4": 0,
+      "0.4~0.5": 0,
+      "0.5~0.6": 0,
+      "0.6~0.7": 0,
+      "0.7~0.8": 0,
+      "0.8~0.9": 0,
+      "0.9~1.0": 0,
+      "1.0": 0
+    },
+    "cap_reason_counts": {
+      "no_cap": 45,
+      "high_entropy(0.6672)_tiny_pdiff(0.0004)": 3,
+      "mid_entropy(0.6436)_small_pdiff(0.0036)": 3,
+      "high_entropy(0.6621)_tiny_pdiff(0.0016)": 3,
+      "mid_entropy(0.6828)_small_pdiff(0.0031)": 3,
+      "mid_entropy(0.6604)_small_pdiff(0.0022)": 3
+    }
+  },
+  "alerts": [],
+  "config_changes": [],
+  "aggregated_metrics": {
+    "total_trades": 120,
+    "total_return": -0.0026477475413314577,
+    "max_drawdown": -0.0032583618212149884,
+    "win_rate": 0.3,
+    "sharpe": 0.0
+  },
+  "decision": {
+    "label": "개선 필요",
+    "reasons": [
+      "win_rate(30.00%) < improve_win_rate(40.00%)",
+      "total_return < 0"
+    ],
+    "metrics_snapshot": {
+      "total_trades": 120,
+      "total_return": -0.0026477475413314577,
+      "max_drawdown": -0.0032583618212149884,
+      "win_rate": 0.3,
+      "sharpe": 0.0
+    },
+    "thresholds_used": {
+      "min_trades": 100,
+      "discard_mdd": 0.12,
+      "discard_return": -0.02,
+      "discard_sharpe": -0.2,
+      "candidate_mdd": 0.05,
+      "candidate_win_rate": 0.45,
+      "improve_win_rate": 0.4
+    }
+  }
+}

@@ -1,0 +1,11 @@
+event_type,trade_index,idx,timestamp,direction,price,raw_signal,final_signal,stage2_trade,stage2_reason,guard_decision,exit_reason,pnl
+ENTRY_SHORT,1,0,2026-03-18 13:00:00,SHORT,72324.63,SHORT,SHORT,False,no_trade_low_conf,ALLOW,,
+FLIP,2,24,2026-03-18 15:00:00,SHORT,72324.63,LONG,LONG,False,no_trade_low_conf,,signal_exit_th,0.012472481056281709
+ENTRY_LONG,2,48,2026-03-18 17:00:00,LONG,71240.08,LONG,LONG,False,no_trade_low_conf,ALLOW,,
+EXIT_TO_FLAT,3,72,2026-03-18 19:00:00,LONG,71240.08,HOLD,HOLD,False,flat_candidate,,early_exit,-0.0013265508182135736
+ENTRY_LONG,3,228,2026-03-19 08:50:00,LONG,70001.47,LONG,LONG,False,no_trade_low_conf,ALLOW,,
+EXIT_TO_FLAT,4,252,2026-03-19 10:50:00,LONG,70001.47,HOLD,HOLD,False,flat_candidate,,early_exit,0.0004911052854759704
+ENTRY_SHORT,4,303,2026-03-19 15:05:00,SHORT,69712.42,SHORT,SHORT,False,no_trade_low_conf,ALLOW,,
+EXIT_TO_FLAT,5,327,2026-03-19 17:05:00,SHORT,69712.42,HOLD,HOLD,False,flat_candidate,,signal_exit_th,0.005881357061390735
+ENTRY_SHORT,5,405,2026-03-19 23:35:00,SHORT,69894.64,SHORT,SHORT,False,no_trade_low_conf,ALLOW,,
+EXIT_TO_FLAT,6,429,2026-03-20 02:10:00,SHORT,69894.64,HOLD,HOLD,False,flat_candidate,,signal_exit_th,-0.008623033666585076

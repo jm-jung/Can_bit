@@ -1,0 +1,4 @@
+# Walk-forward
+
+folds=11 OOS=2013-05-10→2024-05-14 rows=2772
+selected=LOGISTIC_PRICE_PLUS_ALL_REGIME

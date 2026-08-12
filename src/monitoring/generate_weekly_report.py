@@ -17,6 +17,50 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
+def _aggregate_metrics_from_trend(performance_trend: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """performance_trend 리스트에서 최근 7일 집계 메트릭 계산 (비율 단위)."""
+    from src.decision.decision_utils import (
+        aggregate_returns_for_sharpe,
+        normalize_ratio,
+        safe_float,
+    )
+
+    total_trades = sum(int(safe_float(p.get("total_trades")) or 0) for p in performance_trend)
+    returns = []
+    for p in performance_trend:
+        r = p.get("return") or p.get("total_return")
+        v = normalize_ratio(r)
+        if v is not None:
+            returns.append(v)
+    total_return = (sum(returns) / len(returns)) if returns else None
+    mdd_list = []
+    for p in performance_trend:
+        m = p.get("max_drawdown")
+        v = normalize_ratio(m)
+        if v is not None:
+            mdd_list.append(abs(v))
+    max_drawdown = max(mdd_list) if mdd_list else None
+    if max_drawdown is not None:
+        max_drawdown = -max_drawdown  # convention: MDD 음수로 저장 가능
+
+    wr_list = [(safe_float(p.get("win_rate")), int(safe_float(p.get("total_trades")) or 0)) for p in performance_trend]
+    wr_list = [(w, t) for w, t in wr_list if w is not None and t > 0]
+    if wr_list:
+        total_w = sum(w * t for w, t in wr_list)
+        total_t = sum(t for _, t in wr_list)
+        win_rate = total_w / total_t
+    else:
+        win_rate = None
+    sharpe = aggregate_returns_for_sharpe(returns)
+    return {
+        "total_trades": total_trades,
+        "total_return": total_return,
+        "max_drawdown": max_drawdown,
+        "win_rate": win_rate,
+        "sharpe": sharpe,
+    }
+
+
 def parse_run_id_date(run_id: str) -> Optional[datetime]:
     """run_id (YYYYMMDD_HHMMSS)에서 날짜 파싱"""
     try:
@@ -74,10 +118,12 @@ def generate_weekly_report(
     start_date: Optional[datetime] = None,
     end_date: Optional[datetime] = None,
     output_dir: Optional[Path] = None,
-) -> Path:
+    decision_thresholds: Optional[Any] = None,
+) -> Optional[Path]:
     """주간 리포트 생성"""
     if output_dir is None:
         output_dir = PROJECT_ROOT / "data" / "monitoring_reports"
+    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # 기본값: 최근 7일
@@ -97,7 +143,10 @@ def generate_weekly_report(
     
     # 리포트 생성
     report_md = generate_markdown_report(summaries, start_date, end_date, skipped_files)
-    report_json = generate_json_report(summaries, start_date, end_date, skipped_files)
+    report_json = generate_json_report(
+        summaries, start_date, end_date, skipped_files,
+        decision_thresholds=decision_thresholds,
+    )
     
     # 파일 저장
     start_str = start_date.strftime("%Y-%m-%d")
@@ -106,17 +155,15 @@ def generate_weekly_report(
     md_path = output_dir / f"weekly_report_{start_str}_{end_str}.md"
     json_path = output_dir / f"weekly_report_{start_str}_{end_str}.json"
     
-    # 중복 생성 방지: 이미 존재하면 스킵
-    if md_path.exists():
-        print(f"[WeeklyReport] already exists, skip generation: {md_path}")
-        return md_path
-    
-    with open(md_path, "w", encoding="utf-8") as f:
-        f.write(report_md)
-    
+    if not md_path.exists():
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write(report_md)
+    else:
+        print(f"[WeeklyReport] MD already exists, skip: {md_path}")
+
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(report_json, f, indent=2, ensure_ascii=False, default=str)
-    
+
     print(f"주간 리포트 생성 완료:")
     print(f"  - Markdown: {md_path}")
     print(f"  - JSON: {json_path}")
@@ -542,6 +589,7 @@ def generate_json_report(
     start_date: datetime,
     end_date: datetime,
     skipped_files: List[tuple],
+    decision_thresholds: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """JSON 리포트 생성 (기계가 읽기 쉬운 형식)"""
     report = {
@@ -607,7 +655,16 @@ def generate_json_report(
             for reason, count in reason_dict.items():
                 reason_combined[reason] += count
         report["aggregated_distributions"]["cap_reason_counts"] = dict(reason_combined)
-    
+
+    # Decision Engine: 최근 7일 집계 기반 판정
+    aggregated = _aggregate_metrics_from_trend(report["performance_trend"])
+    report["aggregated_metrics"] = aggregated
+    from src.decision.decision_engine import decide
+    from src.config.decision_config import thresholds_from_env
+    thresholds = decision_thresholds if decision_thresholds is not None else thresholds_from_env()
+    decision_result = decide(aggregated, thresholds)
+    report["decision"] = decision_result.to_dict()
+
     return report
 
 
@@ -625,26 +682,60 @@ def main():
         help="종료 날짜 (YYYY-MM-DD). 기본값: 오늘",
     )
     parser.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        help="최근 N일 (지정 시 --start/--end 무시, start=오늘-N일, end=오늘)",
+    )
+    parser.add_argument(
         "--output-dir",
         type=str,
         help="출력 디렉토리. 기본값: data/monitoring_reports/",
     )
-    
+    # Decision 기준값 (기본값은 config에서, 여기서 override)
+    parser.add_argument("--min-trades", type=int, default=None, help="최소 거래 수 (데이터 부족 판정)")
+    parser.add_argument("--discard-mdd", type=float, default=None, help="폐기 MDD 임계값 (비율, 0.12=12%%)")
+    parser.add_argument("--discard-return", type=float, default=None, help="폐기 수익률 하한 (비율)")
+    parser.add_argument("--discard-sharpe", type=float, default=None, help="폐기 Sharpe 하한")
+    parser.add_argument("--candidate-mdd", type=float, default=None, help="실전 후보 MDD 상한 (비율)")
+    parser.add_argument("--candidate-win-rate", type=float, default=None, help="실전 후보 승률 하한")
+    parser.add_argument("--improve-win-rate", type=float, default=None, help="개선 필요 승률 하한")
+
     args = parser.parse_args()
-    
+
     start_date = None
     end_date = None
-    
-    if args.start:
-        start_date = datetime.strptime(args.start, "%Y-%m-%d")
-    if args.end:
-        end_date = datetime.strptime(args.end, "%Y-%m-%d")
-    
+    if getattr(args, "days", None) is not None:
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=args.days)
+    else:
+        if args.start:
+            start_date = datetime.strptime(args.start, "%Y-%m-%d")
+        if args.end:
+            end_date = datetime.strptime(args.end, "%Y-%m-%d")
+        if start_date is None and end_date is None:
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=7)
+
     output_dir = None
     if args.output_dir:
         output_dir = Path(args.output_dir)
-    
-    report_path = generate_weekly_report(start_date, end_date, output_dir)
+
+    from src.config.decision_config import thresholds_from_env, thresholds_from_dict
+    th = thresholds_from_env()
+    th = thresholds_from_dict({
+        "min_trades": getattr(args, "min_trades", None),
+        "discard_mdd": getattr(args, "discard_mdd", None),
+        "discard_return": getattr(args, "discard_return", None),
+        "discard_sharpe": getattr(args, "discard_sharpe", None),
+        "candidate_mdd": getattr(args, "candidate_mdd", None),
+        "candidate_win_rate": getattr(args, "candidate_win_rate", None),
+        "improve_win_rate": getattr(args, "improve_win_rate", None),
+    })
+
+    report_path = generate_weekly_report(
+        start_date, end_date, output_dir, decision_thresholds=th
+    )
     
     if report_path:
         print(f"\n리포트 생성 완료: {report_path}")

@@ -4,8 +4,11 @@ Main entry point for the application
 """
 import asyncio
 import logging
+import subprocess
+import sys
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime
+from pathlib import Path
 from typing import List
 
 from fastapi import FastAPI, Query
@@ -48,10 +51,10 @@ logger = logging.getLogger(__name__)
 
 
 async def candle_updater():
-    """Background task that periodically fetches new candles."""
+    """Background task that periodically fetches new candles. Runs sync I/O in thread to avoid blocking /docs and API."""
     while True:
         try:
-            updated = update_latest_candle()
+            updated = await asyncio.to_thread(update_latest_candle)
             if updated:
                 logger.info("📈 New candle appended & indicators refreshed.")
             else:
@@ -63,15 +66,91 @@ async def candle_updater():
 
 
 async def auto_trader():
-    """Automated trading loop that executes the strategy every minute."""
+    """Automated trading loop that executes the strategy every minute. Runs sync in thread to avoid blocking /docs and API."""
     while True:
         try:
-            result = trading_step()
+            result = await asyncio.to_thread(trading_step)
             logger.info("🤖 Trade step: %s", result)
         except Exception as exc:
             logger.error(f"❌ Trading engine error: {exc}")
             log_error_event({"event": "trading_step_failed", "details": str(exc)})
         await asyncio.sleep(60)
+
+
+async def meta_updater():
+    """
+    Meta Layer를 trading_step과 독립적으로 주기 평가하여
+    meta_state_snapshot/state_log가 '반드시' 갱신되도록 보장한다.
+    (evaluate() 자체가 내부 rate-limit을 가지므로 폴링은 가볍게/자주 해도 안전)
+    """
+    from src.trading.engine import _meta_layer  # local import to avoid import-time side effects
+
+    poll_s = float(getattr(settings, "META_EVAL_POLL_SECONDS", 300.0))
+    while True:
+        try:
+            snap = await asyncio.to_thread(_meta_layer.evaluate)
+            # skipped=True면 rate-limit으로 평가 생략된 상태
+            logger.info(
+                "🧭 Meta eval: state=%s mult=%s skipped=%s last_eval_ts=%s",
+                snap.get("current_state"),
+                snap.get("position_multiplier"),
+                snap.get("skipped"),
+                snap.get("last_eval_ts"),
+            )
+        except Exception as exc:
+            logger.error(f"❌ Meta eval error: {exc}")
+            log_error_event({"event": "meta_eval_failed", "details": str(exc)})
+        await asyncio.sleep(poll_s)
+
+
+async def meta_metrics_refresher():
+    """
+    FR2 rolling metrics 공급자(meta_metrics_source_latest.json)를 주기적으로 갱신.
+
+    중요 순서:
+    - metrics refresh -> meta evaluate
+    - 둘은 같은 프로세스에서 돌아가지만 파일 교체(atomic rename)로 인해 race condition을 최소화.
+    """
+    refresh_enabled = bool(getattr(settings, "META_METRICS_REFRESH_ENABLED", True))
+    if not refresh_enabled:
+        logger.info("Meta metrics refresh disabled (META_METRICS_REFRESH_ENABLED=False).")
+        return
+
+    refresh_s = float(getattr(settings, "META_METRICS_REFRESH_SECONDS", 3600.0))
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "refresh_fr2_meta_metrics.py"
+    mode = str(getattr(settings, "META_METRICS_REFRESH_MODE", "operational_latest")).strip()
+
+    # Prevent overlap
+    refresh_lock = asyncio.Lock()
+
+    if not script_path.exists():
+        logger.error("Meta metrics refresh script not found: %s", script_path)
+        return
+
+    while True:
+        try:
+            async with refresh_lock:
+                logger.info("🔄 Refreshing FR2 meta rolling metrics: %s", script_path)
+                args = []
+                if mode == "legacy_last_row":
+                    args.append("--use-legacy-last-row")
+                elif mode == "operational_latest":
+                    args.append("--latest-eval")
+                elif mode == "research_step":
+                    pass
+                await asyncio.to_thread(
+                    subprocess.run,
+                    [sys.executable, str(script_path), *args],
+                    check=False,
+                )
+        except Exception as exc:
+            logger.error("Meta metrics refresh failed: %s", exc)
+            try:
+                log_error_event({"event": "meta_metrics_refresh_failed", "details": str(exc)})
+            except Exception:
+                pass
+        await asyncio.sleep(refresh_s)
+
 
 
 @asynccontextmanager
@@ -96,13 +175,26 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Failed to load model: {exc}. App will continue without model.")
         app.state.model = None
     
+    # 시작 시 기본값: SIM + live 주문 비활성화 (실수 방지)
+    trading_router.set_sim()
+    binance_real.disable_live_mode()
+    logger.info("Trading mode: SIM, live orders: disabled (default).")
+
     candle_task = asyncio.create_task(candle_updater())
-    trading_task = asyncio.create_task(auto_trader())
+    meta_task = asyncio.create_task(meta_updater())
+    meta_metrics_task = asyncio.create_task(meta_metrics_refresher())
+    tasks_to_cancel = [candle_task, meta_task, meta_metrics_task]
+    if getattr(settings, "AUTO_TRADING_ENABLED", True):
+        trading_task = asyncio.create_task(auto_trader())
+        tasks_to_cancel.append(trading_task)
+        logger.info("Auto-trading loop enabled (AUTO_TRADING_ENABLED=True).")
+    else:
+        logger.info("Auto-trading loop disabled (AUTO_TRADING_ENABLED=False). Use /trade/step or POST /trading/step to run manually.")
 
     try:
         yield
     finally:
-        for task in (candle_task, trading_task):
+        for task in tasks_to_cancel:
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task

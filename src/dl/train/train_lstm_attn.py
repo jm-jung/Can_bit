@@ -405,6 +405,7 @@ def create_sequences(
     neg_threshold: float | None = None,
     ignore_margin: float | None = None,
     debug_inspect: bool = False,
+    feature_config: Any | None = None,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """
     Create sequences for LSTM training with improved label definition.
@@ -561,6 +562,7 @@ def create_sequences(
         timeframe=timeframe,
         use_events=settings.EVENTS_ENABLED,
         enable_hold_labels=False,  # LSTM 3-class에서는 HOLD label 불필요
+        feature_config=feature_config,
         debug_inspect=debug_inspect,
         debug_logger=logger,
     )

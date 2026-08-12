@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -130,33 +130,60 @@ class TCNSignalModel:
         num_channels: list[int] | None = None,
         kernel_size: int = 3,
         dropout: float = 0.2,
+        use_events: bool | None = None,
+        feature_config: Optional[Any] = None,
     ):
         """
         Initialize TCN model wrapper.
-        
+
         Args:
             model_path: Path to saved model file. If None, uses default from settings.
             window_size: Sequence length (must match training)
             num_channels: List of channel sizes (must match training)
             kernel_size: Convolution kernel size (must match training)
             dropout: Dropout rate (must match training)
+            use_events: If False, use no-events model (TCN_MODEL_NO_EVENTS_PATH) and
+                build_feature_frame(..., use_events=False). If None, use settings.EVENTS_ENABLED.
+            feature_config: Optional MLFeatureConfig (e.g. from_preset("extended_safe_v1")) so that
+                feature_dim at load time matches the saved model. If None, uses default base preset.
         """
+        if use_events is None:
+            use_events = getattr(settings, "EVENTS_ENABLED", True)
+        self._use_events = use_events
+        self._feature_config = feature_config
+
         if model_path is None:
-            # Default model path (can be customized via environment variable TCN_MODEL_PATH)
-            env_path = os.getenv("TCN_MODEL_PATH")
-            if env_path:
-                default_path = env_path
-                logger.info(
-                    f"[TCN] Using model path from environment variable TCN_MODEL_PATH: {default_path}"
-                )
+            if not use_events:
+                env_path = os.getenv("TCN_MODEL_NO_EVENTS_PATH")
+                if env_path:
+                    default_path = env_path
+                    logger.info(
+                        "[TCN] Using no-events model from TCN_MODEL_NO_EVENTS_PATH: %s",
+                        default_path,
+                    )
+                else:
+                    default_path = "data/diagnostics/tcn_no_events.pt"
+                    logger.info(
+                        "[TCN] Using default no-events model path (TCN_MODEL_NO_EVENTS_PATH not set): %s",
+                        default_path,
+                    )
+                model_path = Path(default_path)
             else:
-                default_path = "models/tcn_v1.pt"
-                logger.info(
-                    f"[TCN] Using default model path (TCN_MODEL_PATH not set): {default_path}"
-                )
-            model_path = Path(default_path)
+                env_path = os.getenv("TCN_MODEL_PATH")
+                if env_path:
+                    default_path = env_path
+                    logger.info(
+                        "[TCN] Using model path from TCN_MODEL_PATH: %s", default_path
+                    )
+                else:
+                    default_path = "models/tcn_v1.pt"
+                    logger.info(
+                        "[TCN] Using default model path (TCN_MODEL_PATH not set): %s",
+                        default_path,
+                    )
+                model_path = Path(default_path)
         else:
-            logger.info(f"[TCN] Using model path from constructor argument: {model_path}")
+            logger.info("[TCN] Using model path from constructor argument: %s", model_path)
         
         # Allow model_path to be set via environment or settings
         if isinstance(model_path, str):
@@ -206,7 +233,7 @@ class TCNSignalModel:
         
         logger.info(f"[TCN] Loading TCN model from: {self.model_path.resolve()}")
         
-        # Determine feature dimension
+        # Determine feature dimension (must match the saved model, e.g. extended_safe_v1 => 81)
         try:
             if self.feature_cols is None:
                 from src.services.ohlcv_service import load_ohlcv_df
@@ -216,12 +243,14 @@ class TCNSignalModel:
                 symbol = getattr(settings, "BINANCE_SYMBOL", "BTC/USDT").replace("/", "").upper()
                 timeframe = getattr(settings, "THRESHOLD_TIMEFRAME", "1m")
                 
-                X_features = build_feature_frame(
-                    df,
+                kwargs = dict(
                     symbol=symbol,
                     timeframe=timeframe,
-                    use_events=settings.EVENTS_ENABLED,
-                ).dropna()
+                    use_events=self._use_events,
+                )
+                if self._feature_config is not None:
+                    kwargs["feature_config"] = self._feature_config
+                X_features = build_feature_frame(df, **kwargs).dropna()
                 self.feature_cols = X_features.columns.tolist()
             
             feature_dim = len(self.feature_cols)
@@ -264,14 +293,12 @@ class TCNSignalModel:
         if timeframe is None:
             timeframe = getattr(settings, "THRESHOLD_TIMEFRAME", "1m")
         
-        features = build_feature_frame(
-            df,
-            symbol=symbol,
-            timeframe=timeframe,
-            use_events=settings.EVENTS_ENABLED,
-        )
+        kwargs = dict(symbol=symbol, timeframe=timeframe, use_events=self._use_events)
+        if self._feature_config is not None:
+            kwargs["feature_config"] = self._feature_config
+        features = build_feature_frame(df, **kwargs)
         features = features.dropna()
-        
+
         if self.feature_cols is None:
             self.feature_cols = features.columns.tolist()
         
@@ -321,6 +348,7 @@ class TCNSignalModel:
         symbol: str | None = None,
         timeframe: str | None = None,
         batch_size: int = 512,
+        temperature: float = 1.0,
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Batch prediction for multiple sequences.
@@ -330,6 +358,7 @@ class TCNSignalModel:
             symbol: Trading symbol (default: from settings)
             timeframe: Timeframe (default: from settings)
             batch_size: Batch size for model forward passes
+            temperature: Temperature for softmax (default 1.0 = no scaling). T>1 softens, T<1 sharpens.
         
         Returns:
             Tuple of (proba_long: np.ndarray, proba_short: np.ndarray)
@@ -389,6 +418,8 @@ class TCNSignalModel:
                     )
                     raise ValueError("NaN/Inf detected in model logits.")
                 
+                if temperature != 1.0:
+                    logits = logits / temperature
                 probs = torch.nn.functional.softmax(logits, dim=-1)  # (batch_size, 3)
                 
                 # Extract LONG and SHORT probabilities
@@ -409,14 +440,25 @@ class TCNSignalModel:
         return proba_long_arr, proba_short_arr
 
 
-# Global model instance
+# Global model instances (events ON / OFF)
 _tcn_model: Optional[TCNSignalModel] = None
+_tcn_model_no_events: Optional[TCNSignalModel] = None
 
 
-def get_tcn_model() -> Optional[TCNSignalModel]:
-    """Get global TCN model instance (lazy loading)."""
-    global _tcn_model
-    if _tcn_model is None:
-        _tcn_model = TCNSignalModel()
-    return _tcn_model
+def get_tcn_model(use_events: bool | None = None) -> Optional[TCNSignalModel]:
+    """
+    Get global TCN model instance (lazy loading).
+    use_events: If False, return model for use_events=False (no event columns).
+    If None, use env USE_EVENTS_FOR_TCN (1=true, 0=false).
+    """
+    global _tcn_model, _tcn_model_no_events
+    if use_events is None:
+        use_events = os.environ.get("USE_EVENTS_FOR_TCN", "1").strip().lower() in ("1", "true", "yes")
+    if use_events:
+        if _tcn_model is None:
+            _tcn_model = TCNSignalModel(use_events=True)
+        return _tcn_model
+    if _tcn_model_no_events is None:
+        _tcn_model_no_events = TCNSignalModel(use_events=False)
+    return _tcn_model_no_events
 

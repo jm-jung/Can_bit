@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.canbit.forward_research_v2_alpha_logger</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/jeongminjun/Projects/Can_bit/ops/run_forward_research_v2_alpha_logger.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/jeongminjun/Projects/Can_bit</string>
+  <key>StartInterval</key>
+  <integer>900</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>/Users/jeongminjun/Projects/Can_bit/data/diagnostics/forward_research_v2_alpha_logger/launchd_stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/jeongminjun/Projects/Can_bit/data/diagnostics/forward_research_v2_alpha_logger/launchd_stderr.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CANBIT_PRODUCTION_ACTION</key>
+    <string>none</string>
+  </dict>
+</dict>
+</plist>

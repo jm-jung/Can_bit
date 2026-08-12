@@ -12,7 +12,6 @@ import pandas as pd
 
 from src.core.config import settings
 from src.indicators.basic import get_df_with_indicators, add_basic_indicators
-from src.ml.xgb_model import get_xgb_model, MLXGBModel
 from src.dl.lstm_attn_model import get_lstm_attn_model
 from src.strategies.ml_thresholds import resolve_ml_thresholds
 from src.services.ohlcv_service import load_ohlcv_df
@@ -117,6 +116,43 @@ class Trade(TypedDict):
     profit: float | None
 
 
+def _roundtrip_key(t: Trade) -> tuple[str, str, str]:
+    """Round-trip identity for dedupe: (entry_time, exit_time, direction)."""
+    return (
+        str(t.get("entry_time", "")),
+        str(t.get("exit_time", "")),
+        str(t.get("direction", "")),
+    )
+
+
+def dedupe_trades_round_trips(trades: List[Trade]) -> List[Trade]:
+    """
+    Keep the first row per (entry_time, exit_time, direction); drop later duplicates.
+
+    Engine bug (historical): normal EXIT appended scaled_profit first, then raw profit.
+    First row matches balance-updating profit — keep first only.
+
+    If three or more rows share the same key, log a warning and still keep only the first.
+    """
+    out: List[Trade] = []
+    counts: dict[tuple[str, str, str], int] = {}
+    for t in trades:
+        k = _roundtrip_key(t)
+        counts[k] = counts.get(k, 0) + 1
+        n = counts[k]
+        if n == 1:
+            out.append(t)
+        elif n == 2:
+            continue
+        else:
+            logger.warning(
+                "dedupe_trades_round_trips: %d rows for same round-trip key %s (keeping first row only)",
+                n,
+                k,
+            )
+    return out
+
+
 class BacktestResult(TypedDict):
     total_return: float
     win_rate: float
@@ -173,10 +209,17 @@ def _get_ml_adapter(strategy_name: str) -> MLBacktestAdapter:
         )
 
     if strategy_name == "ml_xgb":
+        # NOTE: sklearn 의존성(xgb/scalers)이 있는 XGB 경로는
+        # backtest 실행 시점에만 로딩되어야 함.
+        # ml_tcn 분석/스윕에서는 절대 import되지 않도록 여기서 lazy import를 사용.
+        def _lazy_get_xgb_model():
+            from src.ml.xgb_model import get_xgb_model
+            return get_xgb_model()
+
         return MLBacktestAdapter(
             name="XGBoost",
             strategy_name="ml_xgb",
-            get_model=get_xgb_model,
+            get_model=_lazy_get_xgb_model,
             min_history_provider=lambda _: 20,
             default_long=0.5,
             default_short=None,
@@ -514,6 +557,7 @@ def run_backtest_with_ml(
         # Phase E: Use MLXGBModel for ml_xgb strategy
         if strategy_name == "ml_xgb":
             try:
+                from src.ml.xgb_model import MLXGBModel
                 ml_model = MLXGBModel(
                     strategy=strategy_name,
                     symbol=backtest_symbol,
@@ -569,14 +613,8 @@ def run_backtest_with_ml(
         if model is None:
             return _empty_result(f"{adapter.name} model instance is None. Cannot run ML backtest.")
 
-        # Check if model is loaded (MLXGBModel or legacy XGBSignalModel)
-        if isinstance(model, MLXGBModel):
-            if not model.is_loaded():
-                return _empty_result(
-                    f"{adapter.name} MLXGBModel not loaded. "
-                    f"long={model.long_model_path}, short={model.short_model_path}"
-                )
-        elif not getattr(model, "is_loaded", lambda: False)():
+        # Check if model is loaded (XGB/LSTM/TCN)
+        if not getattr(model, "is_loaded", lambda: False)():
             model_path = getattr(model, "model_path", None)
             exists = model_path.exists() if model_path is not None else False
             return _empty_result(
@@ -591,10 +629,7 @@ def run_backtest_with_ml(
 
         try:
             # Get min history requirement
-            if isinstance(model, MLXGBModel):
-                min_rows_for_prediction = 20  # Default for XGBoost
-            else:
-                min_rows_for_prediction = max(0, adapter.min_history_provider(model))
+            min_rows_for_prediction = 20 if strategy_name == "ml_xgb" else max(0, adapter.min_history_provider(model))
             start_idx = min_rows_for_prediction
 
             # Extract symbol and timeframe for event features
@@ -613,8 +648,8 @@ def run_backtest_with_ml(
                 f"for the entire dataset, not per-row."
             )
             
-            # Phase E: Use MLXGBModel's prediction methods if available
-            if isinstance(model, MLXGBModel):
+            # Phase E: Use MLXGBModel's prediction methods if available (ml_xgb only)
+            if strategy_name == "ml_xgb" and hasattr(model, "predict_proba_long") and hasattr(model, "predict_proba_short"):
                 # MLXGBModel: Extract features once and use batch prediction
                 try:
                     from src.features.ml_feature_config import MLFeatureConfig

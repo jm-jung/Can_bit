@@ -7,9 +7,22 @@ Discord Webhook 기반 알림 모듈
 import json
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, List
+
+# 타임존 처리 (pytz 없으면 zoneinfo 사용)
+try:
+    import pytz
+    HAS_PYTZ = True
+    HAS_ZONEINFO = False
+except ImportError:
+    HAS_PYTZ = False
+    try:
+        from zoneinfo import ZoneInfo
+        HAS_ZONEINFO = True
+    except ImportError:
+        HAS_ZONEINFO = False
 
 try:
     from dotenv import load_dotenv
@@ -22,6 +35,96 @@ except ImportError:
     pass  # dotenv가 없어도 동작 (환경변수 직접 설정 가능)
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
+
+
+def get_cache_freshness(
+    cache_path: str,
+    tz: str = "Asia/Seoul",
+    stale_days: float = 2.0
+) -> Dict[str, Any]:
+    """
+    예측 캐시 파일의 신선도 체크
+    
+    Args:
+        cache_path: 캐시 파일 경로 (절대 경로 또는 프로젝트 루트 기준 상대 경로)
+        tz: 타임존 (기본값: "Asia/Seoul")
+        stale_days: 오래된 것으로 판단하는 일수 (기본값: 2.0일)
+    
+    Returns:
+        {
+            "path": "...",
+            "exists": true/false,
+            "mtime_kst": "2026-02-16 13:10:00",
+            "age_days": 21.3,
+            "status": "FRESH|STALE|MISSING|ERROR",
+            "message": "✅ 최신" / "⚠️ 21.3일 전 갱신" / "❌ 캐시 없음" / "❌ 캐시 확인 실패"
+        }
+    """
+    result = {
+        "path": cache_path,
+        "exists": False,
+        "mtime_kst": "N/A",
+        "age_days": 0.0,
+        "status": "ERROR",
+        "message": "❌ 캐시 확인 실패"
+    }
+    
+    try:
+        # 경로 정규화 (프로젝트 루트 기준 상대 경로 처리)
+        cache_file = Path(cache_path)
+        if not cache_file.is_absolute():
+            cache_file = PROJECT_ROOT / cache_file
+        
+        # 파일 존재 확인
+        if not cache_file.exists():
+            result["status"] = "MISSING"
+            result["message"] = "❌ 캐시 없음"
+            return result
+        
+        result["exists"] = True
+        
+        # 파일 수정 시간 가져오기
+        mtime_ts = os.path.getmtime(cache_file)
+        mtime_dt = datetime.fromtimestamp(mtime_ts, tz=timezone.utc)
+        
+        # KST로 변환
+        try:
+            if HAS_PYTZ:
+                kst_tz = pytz.timezone(tz)
+                mtime_kst = mtime_dt.astimezone(kst_tz)
+            elif HAS_ZONEINFO:
+                from zoneinfo import ZoneInfo
+                kst_tz = ZoneInfo(tz)
+                mtime_kst = mtime_dt.astimezone(kst_tz)
+            else:
+                # 타임존 라이브러리가 없으면 UTC 사용
+                mtime_kst = mtime_dt
+        except Exception:
+            # 타임존 변환 실패 시 UTC 사용
+            mtime_kst = mtime_dt
+        
+        result["mtime_kst"] = mtime_kst.strftime("%Y-%m-%d %H:%M:%S KST")
+        
+        # 나이 계산 (일 단위)
+        now_utc = datetime.now(timezone.utc)
+        age_delta = now_utc - mtime_dt
+        age_days = age_delta.total_seconds() / 86400.0
+        result["age_days"] = round(age_days, 1)
+        
+        # 상태 판정
+        if age_days <= stale_days:
+            result["status"] = "FRESH"
+            result["message"] = "✅ 최신"
+        else:
+            result["status"] = "STALE"
+            result["message"] = f"⚠️ {age_days:.1f}일 전 갱신"
+        
+    except Exception as e:
+        # 예외 발생 시 ERROR 상태로 반환 (raise 금지)
+        result["status"] = "ERROR"
+        result["message"] = f"❌ 캐시 확인 실패: {str(e)[:50]}"
+    
+    return result
 
 
 def send_discord_message(
@@ -96,6 +199,24 @@ def send_discord_message(
         )
 
 
+def _load_decision_from_weekly_report(weekly_report_path: Optional[str]) -> Optional[Dict[str, Any]]:
+    """주간 리포트 경로(.md 또는 .json)에서 decision 객체 로드. 단일 진실 소스."""
+    if not weekly_report_path:
+        return None
+    p = Path(weekly_report_path)
+    if not p.exists():
+        return None
+    json_path = p.with_suffix(".json") if p.suffix.lower() == ".md" else p
+    if not json_path.exists():
+        return None
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("decision")
+    except Exception:
+        return None
+
+
 def load_recent_summaries(days: int = 7) -> List[Dict[str, Any]]:
     """최근 N일간의 summary JSON 파일들을 로드"""
     monitoring_dir = PROJECT_ROOT / "data" / "monitoring"
@@ -133,6 +254,8 @@ def send_daily_report(
     ohlcv_info: Optional[Dict[str, Any]] = None,
     weekly_report_path: Optional[str] = None,
     pipeline_status: str = "정상 완료",
+    cache_path: Optional[str] = None,
+    dry_run: bool = False,
 ) -> None:
     """
     일일 실험 리포트를 Discord로 전송
@@ -140,15 +263,17 @@ def send_daily_report(
     Args:
         summary_json_path: monitor_guard_stage2_summary_*.json 파일 경로
         ohlcv_info: OHLCV 데이터 정보 (symbol, timeframe, latest_ts, new_candles 등)
-        weekly_report_path: 주간 리포트 파일 경로 (존재 시)
+        weekly_report_path: 주간 리포트 파일 경로 (존재 시; .md면 동일 stem .json에서 decision 로드)
         pipeline_status: 파이프라인 상태 ("정상 완료" / "부분 실패" / "실패")
+        cache_path: 예측 캐시 파일 경로 (선택적, 없으면 캐시 체크 생략)
+        dry_run: True면 payload만 출력하고 전송하지 않음
     
     Returns:
         None (실패 시에도 예외를 던지지 않음)
     """
     webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
     
-    if not webhook_url:
+    if not webhook_url and not dry_run:
         print(
             "[DiscordNotify][WARN] DISCORD_WEBHOOK_URL not found in environment. Skipping notification.",
             file=sys.stderr
@@ -172,6 +297,26 @@ def send_daily_report(
     
     # 기본값 설정
     ohlcv_info = ohlcv_info or {}
+    
+    # 캐시 신선도 체크 (선택적)
+    cache_info = None
+    cache_stale = False
+    if cache_path:
+        try:
+            cache_info = get_cache_freshness(cache_path, stale_days=2.0)
+            if cache_info["status"] in ["STALE", "MISSING", "ERROR"]:
+                cache_stale = True
+        except Exception:
+            # 캐시 체크 실패해도 파이프라인 계속 진행
+            cache_info = {
+                "path": cache_path,
+                "exists": False,
+                "mtime_kst": "N/A",
+                "age_days": 0.0,
+                "status": "ERROR",
+                "message": "❌ 캐시 확인 실패"
+            }
+            cache_stale = True
     
     # Embed Fields 구성
     fields: List[Dict[str, Any]] = []
@@ -200,6 +345,19 @@ def send_daily_report(
         data_interpretation = "데이터 갱신 과정에서 문제가 발생했을 수 있습니다."
     
     data_status += f"\n\n**해석 문장**: {data_interpretation}"
+    
+    # 예측 캐시 상태 추가 (캐시 정보가 있는 경우)
+    if cache_info:
+        cache_status_text = f"\n\n**예측 캐시 상태**:\n"
+        cache_status_text += f"- 파일: `{Path(cache_info['path']).name}`\n"
+        cache_status_text += f"- 수정: {cache_info['mtime_kst']}\n"
+        cache_status_text += f"- 나이: {cache_info['age_days']}일\n"
+        cache_status_text += f"- 판정: {cache_info['message']}"
+        
+        if cache_stale:
+            cache_status_text += "\n- 안내: 예측 캐시 갱신 후 다시 관찰 권장"
+        
+        data_status += cache_status_text
     
     fields.append({
         "name": "📊 [1] 데이터 상태",
@@ -308,31 +466,41 @@ def send_daily_report(
             "inline": False
         })
     
-    # [4] 단기 판단 (오늘 기준)
+    # [4] Decision (최근 7일 집계 기반, 단일 진실 소스: 주간 리포트 JSON)
     short_term_judgment = ""
-    
-    if total_return is not None and entries_executed > 0:
-        if total_return > 0.01 and (win_rate or 0) > 0.5 and total_trades >= 10:
-            recommendation = "✅ 권장"
-            reason = "양의 수익률, 높은 승률, 충분한 거래 수를 보이고 있습니다."
-        elif total_return > 0 and total_trades >= 5:
-            recommendation = "⚠️ 판단 보류"
-            reason = "소폭 수익이지만 데이터 기간이 짧아 실전 투입은 아직 권장되지 않습니다."
-        elif total_return < -0.01:
-            recommendation = "❌ 비권장"
-            reason = "손실이 발생하여 실전 투입은 권장되지 않습니다."
-        else:
-            recommendation = "⚠️ 판단 보류"
-            reason = "거래 수가 부족하여 신뢰할 만한 판단이 어렵습니다."
+    decision_data = _load_decision_from_weekly_report(weekly_report_path)
+    if decision_data:
+        label = decision_data.get("label", "데이터 부족(보류)")
+        reasons = decision_data.get("reasons") or []
+        metrics_snapshot = decision_data.get("metrics_snapshot") or {}
+        short_term_judgment += f"**Decision**: {label}\n"
+        short_term_judgment += "**Reasons**:\n"
+        for r in reasons[:3]:
+            short_term_judgment += f"- {r}\n"
+        t = metrics_snapshot.get("total_trades")
+        r = metrics_snapshot.get("total_return")
+        mdd = metrics_snapshot.get("max_drawdown")
+        wr = metrics_snapshot.get("win_rate")
+        sh = metrics_snapshot.get("sharpe")
+        short_term_judgment += "**Key metrics**: "
+        parts = []
+        if t is not None:
+            parts.append(f"trades={t}")
+        if r is not None:
+            parts.append(f"return={r:.2%}")
+        if mdd is not None:
+            parts.append(f"mdd={mdd:.2%}" if isinstance(mdd, (int, float)) else f"mdd={mdd}")
+        if wr is not None:
+            parts.append(f"win_rate={wr:.2%}")
+        if sh is not None:
+            parts.append(f"sharpe={sh:.2f}")
+        short_term_judgment += ", ".join(parts) if parts else "N/A"
     else:
-        recommendation = "⚠️ 판단 보류"
-        reason = "데이터 부족으로 판단이 불가능합니다."
-    
-    short_term_judgment += f"**실거래 권장 여부**: {recommendation}\n"
-    short_term_judgment += f"**사유**: {reason}"
-    
+        short_term_judgment += "**Decision**: 데이터 부족(보류)\n"
+        short_term_judgment += "**Reasons**: 주간 리포트 없음 또는 decision 미생성. 주간 리포트 생성 후 다시 확인하세요."
+
     fields.append({
-        "name": "🔍 [4] 단기 판단 (오늘 기준)",
+        "name": "🔍 [4] Decision (최근 7일 집계)",
         "value": short_term_judgment,
         "inline": False
     })
@@ -482,20 +650,32 @@ def send_daily_report(
     header = f"**생성 시간**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S KST')}\n"
     header += f"**파이프라인 상태**: {pipeline_status}"
     
+    # 캐시가 오래됐으면 경고 문장 추가
+    if cache_stale and cache_info:
+        if cache_info["status"] == "STALE":
+            header += f"\n\n⚠️ **경고**: 예측 캐시가 {cache_info['age_days']:.1f}일 전에 갱신되었습니다. 캐시 갱신 후 다시 관찰 권장."
+        elif cache_info["status"] == "MISSING":
+            header += "\n\n⚠️ **경고**: 예측 캐시 파일이 없습니다. 캐시 생성 후 다시 관찰 권장."
+        elif cache_info["status"] == "ERROR":
+            header += "\n\n⚠️ **경고**: 예측 캐시 확인 중 오류가 발생했습니다."
+    
     fields.insert(0, {
         "name": "📋 [0] 공통 헤더",
         "value": header,
         "inline": False
     })
     
-    # Discord Embed 생성
+    # Discord Embed 생성 (같은 웹훅으로 Shadow Ops 메시지가 이어질 때 제목으로 구분)
     embed = {
-        "title": "Can_bit 일일 실험 리포트",
-        "description": "일일 운영 파이프라인 실행 결과입니다.",
+        "title": "【일일 파이프라인】Can_bit 일일 실험 리포트",
+        "description": (
+            "OHLCV·FR2 메타·Paper/Shadow 백테스트 등 **기존 daily_run** 결과입니다. "
+            "이어서 **【Shadow Ops】** 제목의 메시지가 오면 Production 확정 파이프라인 배치 요약입니다."
+        ),
         "color": 0x3498db if pipeline_status == "정상 완료" else 0xf1c40f,  # 파랑 또는 노랑
         "fields": fields,
         "footer": {
-            "text": f"Can_bit Auto Monitor | {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+            "text": f"Can_bit 일일 파이프라인 (daily_run) | {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
         },
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -503,19 +683,21 @@ def send_daily_report(
     payload = {
         "embeds": [embed]
     }
-    
+
+    if dry_run:
+        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+        return
+
     try:
         import requests
-        
+
         response = requests.post(
             webhook_url,
             json=payload,
             timeout=10
         )
         response.raise_for_status()
-        
-        # 성공 시 로그 출력하지 않음 (운영 로그 오염 방지)
-        
+
     except ImportError:
         print(
             "[DiscordNotify][WARN] Failed to send message: requests module not installed.",
@@ -526,6 +708,113 @@ def send_daily_report(
             f"[DiscordNotify][WARN] Failed to send message: {e}",
             file=sys.stderr
         )
+
+
+def send_b_with_meta_daily_report(
+    daily_report_md_path: Optional[str] = None,
+    summary_json_path: Optional[str] = None,
+    dry_run: bool = False,
+) -> None:
+    """
+    B_with_meta 일일 운영 리포트를 Discord 웹훅으로 전송 (일일 cadence용).
+
+    daily_report_md_path 또는 summary_json_path 중 하나 이상 제공.
+    summary_json_path가 있으면 그걸로 embed 필드 구성, 없으면 md에서 요약만 추출.
+    """
+    webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
+    if not webhook_url and not dry_run:
+        print(
+            "[DiscordNotify][WARN] DISCORD_WEBHOOK_URL not set. Skipping B_with_meta daily report.",
+            file=sys.stderr
+        )
+        return
+
+    summary = {}
+    report_date = datetime.now().strftime("%Y-%m-%d")
+    if summary_json_path and Path(summary_json_path).exists():
+        try:
+            with open(summary_json_path, "r", encoding="utf-8") as f:
+                summary = json.load(f)
+            report_date = summary.get("report_date", report_date)
+        except Exception:
+            summary = {}
+    if not summary and daily_report_md_path and Path(daily_report_md_path).exists():
+        try:
+            text = Path(daily_report_md_path).read_text(encoding="utf-8")
+            for line in text.splitlines():
+                if line.startswith("- **현재 상태**:"):
+                    summary.setdefault("executive_summary", {})["current_state"] = line.replace("- **현재 상태**:", "").strip()
+                if line.startswith("- **운영 판단**:"):
+                    summary.setdefault("executive_summary", {})["verdict"] = line.replace("- **운영 판단**:", "").strip()
+                if line.startswith("## I."):
+                    break
+                if "**자동 판단**: " in line:
+                    summary.setdefault("off_evaluation", {})["verdict"] = line.split("**자동 판단**: ")[-1].strip()
+                if line.strip().startswith("현재 Meta") or line.strip().startswith("로그 갱신") or line.strip().startswith("OFF 조건"):
+                    summary["conclusion"] = line.strip()
+        except Exception:
+            pass
+
+    exec_sum = summary.get("executive_summary") or {}
+    log_health = summary.get("log_health") or {}
+    off_eval = summary.get("off_evaluation") or {}
+    meta_latest = summary.get("meta_metrics_latest") or {}
+    meta_health = summary.get("meta_metrics_health") or {}
+    conclusion = summary.get("conclusion", "N/A")
+
+    title = f"B_with_meta 일일 운영 리포트 ({report_date})"
+    fields = [
+        {
+            "name": "Executive Summary",
+            "value": f"상태: {exec_sum.get('current_state', 'N/A')}\nmultiplier: {exec_sum.get('current_multiplier', 'N/A')}\n판단: {exec_sum.get('verdict', 'N/A')}",
+            "inline": True,
+        },
+        {
+            "name": "로그 건강도",
+            "value": f"{log_health.get('verdict', 'N/A')}\nmetrics: {meta_health.get('metrics_stale_flag', 'N/A')}",
+            "inline": True,
+        },
+        {
+            "name": "OFF 민감도",
+            "value": off_eval.get("verdict", "N/A"),
+            "inline": True,
+        },
+        {
+            "name": "Rolling Metrics (latest)",
+            "value": (
+                f"score/alpha_score: {meta_latest.get('score', 'N/A')} / {meta_latest.get('alpha_score', 'N/A')}\n"
+                f"cost_on 60/90d: {meta_latest.get('cost_on_60d', 'N/A')} / {meta_latest.get('cost_on_90d', 'N/A')}\n"
+                f"alpha_fee_ratio 60/90d: {meta_latest.get('alpha_fee_ratio_60d', 'N/A')} / {meta_latest.get('alpha_fee_ratio_90d', 'N/A')}\n"
+                f"trades_60d: {meta_latest.get('trades_60d', 'N/A')}"
+            ),
+            "inline": False,
+        },
+        {
+            "name": "오늘의 결론",
+            "value": conclusion[:500] + ("..." if len(conclusion) > 500 else ""),
+            "inline": False,
+        },
+    ]
+
+    embed = {
+        "title": title,
+        "color": 0x3498db,
+        "fields": fields,
+        "footer": {"text": f"Can_bit B_with_meta Daily | {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"},
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    payload = {"embeds": [embed]}
+
+    if dry_run:
+        print(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
+        return
+
+    try:
+        import requests
+        response = requests.post(webhook_url, json=payload, timeout=10)
+        response.raise_for_status()
+    except Exception as e:
+        print(f"[DiscordNotify][WARN] Failed to send B_with_meta daily report: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":

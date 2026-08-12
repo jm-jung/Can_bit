@@ -1,0 +1,12 @@
+{
+  "run_id": "phase_d10_baseline",
+  "min_proba_gap": 0.0,
+  "180d_cost_on": 0.012621292690840447,
+  "365d_cost_on": -0.0733818966155878,
+  "720d_cost_on": -0.111968647467793,
+  "720d_mdd": 0.15231130635904097,
+  "720d_trades": 1491,
+  "filtered_trade_ratio": 0.0,
+  "spot_stability": "STABLE",
+  "verdict": "NO_IMPROVE"
+}

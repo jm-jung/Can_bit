@@ -1,0 +1,10 @@
+{
+  "candidate_id": "DUAL_TREND_FILTER",
+  "feature_set_hash": "7981720842564229237",
+  "config_hash": "-2817965901775006339",
+  "holdout_start": "2024-06-27",
+  "holdout_end": "2026-07-01",
+  "threshold": null,
+  "evaluated_at_utc": "2026-07-31T06:01:02.846075+00:00",
+  "result_path": "/Users/jeongminjun/Projects/Can_bit/data/equity_etf/qqq/reports/qqq_final_holdout_report.json"
+}

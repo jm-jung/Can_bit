@@ -15,8 +15,11 @@ from src.features.extended_features import (
     build_volatility_features,
     build_volume_features,
     build_structure_features,
+    build_realized_vol_features,
+    build_multitimeframe_trend_features,
 )
 from src.features.ml_feature_config import MLFeatureConfig
+from src.features.microstructure_features import build_microstructure_features
 from src.indicators.basic import add_basic_indicators
 from src.services.ohlcv_service import load_ohlcv_df
 
@@ -218,6 +221,25 @@ def build_feature_frame(
         struct_features = _reindex_and_fill(struct_features, target_index)
         _log_feature_debug("[STRUCT]", struct_features, debug_inspect=debug_inspect, debug_logger=debug_logger)
     
+    realized_vol_features = None
+    if getattr(feature_config, "use_realized_vol_features", False):
+        realized_vol_features = build_realized_vol_features(df)
+        realized_vol_features = _reindex_and_fill(realized_vol_features, target_index)
+        _log_feature_debug("[RV]", realized_vol_features, debug_inspect=debug_inspect, debug_logger=debug_logger)
+    
+    multi_tf_features = None
+    if getattr(feature_config, "use_multi_timeframe_trend_features", False):
+        tf_minutes = {"1m": 1, "5m": 5, "15m": 15, "1h": 60}.get(timeframe, 5)
+        multi_tf_features = build_multitimeframe_trend_features(df, timeframe_minutes=tf_minutes)
+        multi_tf_features = _reindex_and_fill(multi_tf_features, target_index)
+        _log_feature_debug("[MTF]", multi_tf_features, debug_inspect=debug_inspect, debug_logger=debug_logger)
+
+    micro_features = None
+    if getattr(feature_config, "use_microstructure_features", False):
+        micro_features = build_microstructure_features(df)
+        micro_features = _reindex_and_fill(micro_features, target_index)
+        _log_feature_debug("[MICRO]", micro_features, debug_inspect=debug_inspect, debug_logger=debug_logger)
+    
     # Combine all base and extended features (only non-None)
     feature_frames = []
     if tech_features is not None:
@@ -230,6 +252,12 @@ def build_feature_frame(
         feature_frames.append(volume_features)
     if struct_features is not None:
         feature_frames.append(struct_features)
+    if realized_vol_features is not None:
+        feature_frames.append(realized_vol_features)
+    if multi_tf_features is not None:
+        feature_frames.append(multi_tf_features)
+    if micro_features is not None:
+        feature_frames.append(micro_features)
     
     if feature_frames:
         feature_df = pd.concat(feature_frames, axis=1)
@@ -256,6 +284,21 @@ def build_feature_frame(
         feature_df = pd.concat([feature_df, event_df], axis=1)
         
         _log_feature_debug("[EVENT]", feature_df, debug_inspect=debug_inspect, debug_logger=debug_logger)
+
+    # Add E0 calendar features if enabled (separate from 18-event preset)
+    if getattr(feature_config, "use_calendar_e0", False):
+        from datetime import timedelta
+        from src.events.calendar.storage import load_calendar_events
+        from src.events.calendar.features import build_calendar_e0_features
+        start_utc = target_index.min().to_pydatetime() - timedelta(days=1)
+        end_utc = target_index.max().to_pydatetime() + timedelta(days=1)
+        events = load_calendar_events(start_utc=start_utc, end_utc=end_utc)
+        calendar_df = build_calendar_e0_features(target_index, events, include_optional=True)
+        calendar_df = _reindex_and_fill(calendar_df, target_index)
+        feature_df = pd.concat([feature_df, calendar_df], axis=1)
+        if debug_logger:
+            debug_logger.info(f"[FEATURE_CONFIG] calendar_e0 features: {list(calendar_df.columns)}")
+        _log_feature_debug("[CALENDAR_E0]", feature_df, debug_inspect=debug_inspect, debug_logger=debug_logger)
 
     # Replace inf/-inf with NaN, then fill remaining NaN with 0
     feature_df = feature_df.replace([np.inf, -np.inf], np.nan)

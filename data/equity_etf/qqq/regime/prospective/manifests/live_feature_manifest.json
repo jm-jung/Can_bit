@@ -1,0 +1,138 @@
+{
+  "features": [
+    {
+      "feature_name": "vix_level",
+      "group": "VOLATILITY",
+      "lookback": 0,
+      "availability_lag": 0,
+      "first_valid_session": "2000-03-08",
+      "last_valid_session": "2026-08-11",
+      "missing_rows": 0,
+      "feature_hash": "5d68baed70f619e809cc142747e6bfb5b5ceb90df4e26fe518c70bd32e70e19c"
+    },
+    {
+      "feature_name": "vix_change_5d",
+      "group": "VOLATILITY",
+      "lookback": 5,
+      "availability_lag": 0,
+      "first_valid_session": "2000-03-15",
+      "last_valid_session": "2026-08-11",
+      "missing_rows": 5,
+      "feature_hash": "87c466fc2b3374494da7ee3a85add92744fadcff70ee1c824b0a0c18698098d1"
+    },
+    {
+      "feature_name": "vix_sma20_ratio",
+      "group": "VOLATILITY",
+      "lookback": 20,
+      "availability_lag": 0,
+      "first_valid_session": "2000-04-04",
+      "last_valid_session": "2026-08-11",
+      "missing_rows": 19,
+      "feature_hash": "8465087989f643a2dc87b47319cb1120c30ddd0bac09d88e27098648b74ae248"
+    },
+    {
+      "feature_name": "dgs10_change_20d",
+      "group": "RATES",
+      "lookback": 20,
+      "availability_lag": 1,
+      "first_valid_session": "2000-04-06",
+      "last_valid_session": "2026-08-11",
+      "missing_rows": 21,
+      "feature_hash": "fa0613193dccb403169911b6ea23041143421ec96aac855a9f232874c0eb2a07"
+    },
+    {
+      "feature_name": "dgs2_change_20d",
+      "group": "RATES",
+      "lookback": 20,
+      "availability_lag": 1,
+      "first_valid_session": "2000-04-06",
+      "last_valid_session": "2026-08-11",
+      "missing_rows": 21,
+      "feature_hash": "512caea4b4030c3d9a8e5214943fd2c128e5d4a6e37ec33e32321019da4ef544"
+    },
+    {
+      "feature_name": "t10y2y_level",
+      "group": "RATES",
+      "lookback": 0,
+      "availability_lag": 1,
+      "first_valid_session": "2000-03-09",
+      "last_valid_session": "2026-08-11",
+      "missing_rows": 1,
+      "feature_hash": "d50722402c3cfae5e66bb15c2d9114f80f54098ee7f3ad3047c1edea6ba12874"
+    },
+    {
+      "feature_name": "rsp_spy_relative_return_20d",
+      "group": "BREADTH_LEADERSHIP",
+      "lookback": 20,
+      "availability_lag": 0,
+      "first_valid_session": "2003-05-30",
+      "last_valid_session": "2026-08-11",
+      "missing_rows": 809,
+      "feature_hash": "8f0070e9014bf38f5927ad69d75ffeccd9b04b450774836d16b9002993007d8e"
+    },
+    {
+      "feature_name": "qew_qqq_relative_return_20d",
+      "group": "BREADTH_LEADERSHIP",
+      "lookback": 20,
+      "availability_lag": 0,
+      "first_valid_session": "2006-05-31",
+      "last_valid_session": "2026-08-11",
+      "missing_rows": 1565,
+      "feature_hash": "649535bda190cc815a084acdf1921eca8cc747ac9595f8716796a3e5d106f37c"
+    },
+    {
+      "feature_name": "smh_qqq_relative_return_20d",
+      "group": "BREADTH_LEADERSHIP",
+      "lookback": 20,
+      "availability_lag": 0,
+      "first_valid_session": "2000-07-03",
+      "last_valid_session": "2026-08-11",
+      "missing_rows": 81,
+      "feature_hash": "085f6d7c2fd301de7bda39349891a88ce909ed7805b42c99c6ffb2bcfd01859a"
+    },
+    {
+      "feature_name": "hyg_ief_relative_return_20d",
+      "group": "CREDIT",
+      "lookback": 20,
+      "availability_lag": 0,
+      "first_valid_session": "2007-05-09",
+      "last_valid_session": "2026-08-11",
+      "missing_rows": 1801,
+      "feature_hash": "811fa59633f53233bf51e99d856c060dc0a432c7565da71164d02057ab7de219"
+    }
+  ],
+  "all_regime_features": [
+    "vix_level",
+    "vix_change_5d",
+    "vix_sma20_ratio",
+    "dgs10_change_20d",
+    "dgs2_change_20d",
+    "t10y2y_level",
+    "rsp_spy_relative_return_20d",
+    "qew_qqq_relative_return_20d",
+    "smh_qqq_relative_return_20d",
+    "hyg_ief_relative_return_20d"
+  ],
+  "price_only_features": [
+    "ret_1d",
+    "ret_5d",
+    "ret_10d",
+    "ret_20d",
+    "ret_60d",
+    "close_sma_ratio_20",
+    "close_sma_ratio_50",
+    "close_sma_ratio_200",
+    "sma_50_sma_200_ratio",
+    "realized_vol_20",
+    "momentum_20",
+    "momentum_60",
+    "rsi_14",
+    "volume_ratio_5_20",
+    "drawdown_from_60d_high",
+    "distance_from_52w_high",
+    "overnight_gap",
+    "atr_14_ratio"
+  ],
+  "alignment_verdict": "ALIGNMENT_PASS",
+  "feature_set_hash": "5587a1b1e70ed70b9e82959121a8836968a555186ce2937c18774f8889a367b0"
+}

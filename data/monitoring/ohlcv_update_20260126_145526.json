@@ -1,9 +1,0 @@
-{
-  "status": "success",
-  "before_last_ts": "2026-01-26 05:40:00",
-  "after_last_ts": "2026-01-26 05:55:00",
-  "fetched_rows": 3,
-  "new_rows": 3,
-  "merged_total_rows": 533164,
-  "csv_path": "/Users/jeongminjun/Projects/Can_bit/data/ohlcv/BTCUSDT_5m_full.csv"
-}

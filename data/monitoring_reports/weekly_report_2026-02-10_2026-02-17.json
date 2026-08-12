@@ -1,0 +1,269 @@
+{
+  "report_period": {
+    "start": "2026-02-10T22:47:29.929332",
+    "end": "2026-02-17T22:47:29.929332"
+  },
+  "generated_at": "2026-02-17T22:47:29.931449",
+  "total_runs": 7,
+  "run_ids": [
+    "20260216_133306",
+    "20260216_221511",
+    "20260216_221916",
+    "20260217_222543",
+    "20260217_222710",
+    "20260217_224624",
+    "20260217_224625"
+  ],
+  "mode_distribution": {
+    "backtest": 7
+  },
+  "skipped_files": [],
+  "performance_trend": [
+    {
+      "run_id": "20260216_133306",
+      "return": null,
+      "max_drawdown": null,
+      "total_trades": 40,
+      "win_rate": null,
+      "entries_executed": 20,
+      "total_checks": 94,
+      "final_scale_stats": {
+        "count": 20,
+        "mean": 0.08882872409052725,
+        "median": 0.08697836876293205,
+        "p10": 0.0536399743574507,
+        "p90": 0.12756590768694878,
+        "min": 0.04608251125916191,
+        "max": 0.14766361625470117
+      }
+    },
+    {
+      "run_id": "20260216_221511",
+      "return": -0.0026477475413314577,
+      "max_drawdown": 0.0032583618212149884,
+      "total_trades": 40,
+      "win_rate": 0.3,
+      "entries_executed": 20,
+      "total_checks": 94,
+      "final_scale_stats": {
+        "count": 20,
+        "mean": 0.08882872409052725,
+        "median": 0.08697836876293205,
+        "p10": 0.0536399743574507,
+        "p90": 0.12756590768694878,
+        "min": 0.04608251125916191,
+        "max": 0.14766361625470117
+      }
+    },
+    {
+      "run_id": "20260216_221916",
+      "return": -0.0026477475413314577,
+      "max_drawdown": 0.0032583618212149884,
+      "total_trades": 40,
+      "win_rate": 0.3,
+      "entries_executed": 20,
+      "total_checks": 94,
+      "final_scale_stats": {
+        "count": 20,
+        "mean": 0.08882872409052725,
+        "median": 0.08697836876293205,
+        "p10": 0.0536399743574507,
+        "p90": 0.12756590768694878,
+        "min": 0.04608251125916191,
+        "max": 0.14766361625470117
+      }
+    },
+    {
+      "run_id": "20260217_222543",
+      "return": -1.0,
+      "max_drawdown": 1.0,
+      "total_trades": 773693,
+      "win_rate": 0.09102835362346563,
+      "entries_executed": 386846,
+      "total_checks": 386847,
+      "final_scale_stats": {
+        "count": 386847,
+        "mean": 0.1972877132302952,
+        "median": 0.19999999999999998,
+        "p10": 0.19999999999999998,
+        "p90": 0.19999999999999998,
+        "min": 0.11999999999999998,
+        "max": 0.2
+      }
+    },
+    {
+      "run_id": "20260217_222710",
+      "return": -1.0,
+      "max_drawdown": 1.0,
+      "total_trades": 773855,
+      "win_rate": 0.09102480438841902,
+      "entries_executed": 386927,
+      "total_checks": 386928,
+      "final_scale_stats": {
+        "count": 386928,
+        "mean": 0.1972880742670471,
+        "median": 0.19999999999999998,
+        "p10": 0.19999999999999998,
+        "p90": 0.19999999999999998,
+        "min": 0.11999999999999998,
+        "max": 0.2
+      }
+    },
+    {
+      "run_id": "20260217_224624",
+      "return": -0.3499469493662096,
+      "max_drawdown": 0.34978446885951886,
+      "total_trades": 2393,
+      "win_rate": 0.09862097785206854,
+      "entries_executed": 1196,
+      "total_checks": 1197,
+      "final_scale_stats": {
+        "count": 1197,
+        "mean": 0.19652464494569757,
+        "median": 0.19999999999999998,
+        "p10": 0.19999999999999998,
+        "p90": 0.19999999999999998,
+        "min": 0.11999999999999998,
+        "max": 0.2
+      }
+    },
+    {
+      "run_id": "20260217_224625",
+      "return": -0.3677286386092473,
+      "max_drawdown": 0.3675706026288536,
+      "total_trades": 2555,
+      "win_rate": 0.09706457925636008,
+      "entries_executed": 1277,
+      "total_checks": 1278,
+      "final_scale_stats": {
+        "count": 1278,
+        "mean": 0.1966823161189358,
+        "median": 0.19999999999999998,
+        "p10": 0.19999999999999998,
+        "p90": 0.19999999999999998,
+        "min": 0.11999999999999998,
+        "max": 0.2
+      }
+    }
+  ],
+  "aggregated_distributions": {
+    "guard_scale_histogram": {
+      "0.0~0.1": 246,
+      "0.1~0.2": 776250,
+      "0.2~0.3": 36,
+      "0.3~0.4": 0,
+      "0.4~0.5": 0,
+      "0.5~0.6": 0,
+      "0.6~0.7": 0,
+      "0.7~0.8": 0,
+      "0.8~0.9": 0,
+      "0.9~1.0": 0,
+      "1.0": 0
+    },
+    "stage2_cap_histogram": {
+      "cap_1_0": 737909,
+      "cap_0_8": 24107,
+      "cap_0_6": 14294
+    },
+    "final_scale_histogram": {
+      "0.0~0.1": 33,
+      "0.1~0.2": 776245,
+      "0.2~0.3": 32,
+      "0.3~0.4": 0,
+      "0.4~0.5": 0,
+      "0.5~0.6": 0,
+      "0.6~0.7": 0,
+      "0.7~0.8": 0,
+      "0.8~0.9": 0,
+      "0.9~1.0": 0,
+      "1.0": 0
+    },
+    "cap_reason_counts": {
+      "no_cap": 737909,
+      "high_entropy(0.6672)_tiny_pdiff(0.0004)": 3,
+      "mid_entropy(0.6436)_small_pdiff(0.0036)": 3,
+      "high_entropy(0.6621)_tiny_pdiff(0.0016)": 3,
+      "mid_entropy(0.6828)_small_pdiff(0.0031)": 3,
+      "mid_entropy(0.6604)_small_pdiff(0.0022)": 3,
+      "mid_entropy(0.6664)_small_pdiff(0.0045)": 14,
+      "high_entropy(0.6683)_tiny_pdiff(0.0007)": 14,
+      "mid_entropy(0.6551)_small_pdiff(0.0032)": 12,
+      "high_entropy(0.6670)_tiny_pdiff(0.0007)": 12,
+      "mid_entropy(0.6611)_small_pdiff(0.0047)": 12,
+      "high_entropy(0.6603)_tiny_pdiff(0.0003)": 10,
+      "high_entropy(0.6587)_tiny_pdiff(0.0014)": 10,
+      "mid_entropy(0.6754)_small_pdiff(0.0030)": 10,
+      "mid_entropy(0.6623)_small_pdiff(0.0033)": 10,
+      "high_entropy(0.6806)_tiny_pdiff(0.0014)": 2,
+      "mid_entropy(0.6710)_small_pdiff(0.0031)": 2,
+      "high_entropy(0.6697)_tiny_pdiff(0.0017)": 2,
+      "high_entropy(0.6670)_tiny_pdiff(0.0003)": 2,
+      "high_entropy(0.6640)_tiny_pdiff(0.0013)": 2,
+      "mid_entropy(0.6579)_small_pdiff(0.0021)": 2,
+      "high_entropy(0.6553)_tiny_pdiff(0.0001)": 2,
+      "mid_entropy(0.6542)_small_pdiff(0.0045)": 2,
+      "high_entropy(0.6574)_tiny_pdiff(0.0019)": 2
+    }
+  },
+  "alerts": [
+    {
+      "type": "Guard Scale Median 급변",
+      "message": "run_id=20260216_133306: guard_scale_median=0.0396 (주간 평균 대비 0.30배)"
+    },
+    {
+      "type": "Guard Scale Median 급변",
+      "message": "run_id=20260216_221511: guard_scale_median=0.0396 (주간 평균 대비 0.30배)"
+    },
+    {
+      "type": "Guard Scale Median 급변",
+      "message": "run_id=20260216_221916: guard_scale_median=0.0396 (주간 평균 대비 0.30배)"
+    },
+    {
+      "type": "Trades 급증",
+      "message": "run_id=20260217_222543: total_trades=773693 (주간 평균 대비 3.49배)"
+    },
+    {
+      "type": "Trades 급증",
+      "message": "run_id=20260217_222710: total_trades=773855 (주간 평균 대비 3.49배)"
+    },
+    {
+      "type": "Entries Executed 급증",
+      "message": "run_id=20260217_222543: entries_executed=386846 (주간 평균 대비 3.49배)"
+    },
+    {
+      "type": "Entries Executed 급증",
+      "message": "run_id=20260217_222710: entries_executed=386927 (주간 평균 대비 3.49배)"
+    }
+  ],
+  "config_changes": [],
+  "aggregated_metrics": {
+    "total_trades": 1552616,
+    "total_return": -0.45382851384302003,
+    "max_drawdown": -1.0,
+    "win_rate": 0.09105898841667011,
+    "sharpe": -2.458894251066519
+  },
+  "decision": {
+    "label": "폐기",
+    "reasons": [
+      "mdd(100.00%) >= discard_mdd(12.00%)",
+      "total_return(-45.38%) <= discard_return(-2.00%) and sharpe(-2.458894251066519) <= discard_sharpe(-0.2)"
+    ],
+    "metrics_snapshot": {
+      "total_trades": 1552616,
+      "total_return": -0.45382851384302003,
+      "max_drawdown": -1.0,
+      "win_rate": 0.09105898841667011,
+      "sharpe": -2.458894251066519
+    },
+    "thresholds_used": {
+      "min_trades": 100,
+      "discard_mdd": 0.12,
+      "discard_return": -0.02,
+      "discard_sharpe": -0.2,
+      "candidate_mdd": 0.05,
+      "candidate_win_rate": 0.45,
+      "improve_win_rate": 0.4
+    }
+  }
+}

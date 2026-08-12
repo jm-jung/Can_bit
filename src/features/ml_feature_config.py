@@ -41,7 +41,19 @@ class MLFeatureConfig:
     
     use_structure_features: bool = False
     """Candle structure features (body, shadows, direction counts)"""
-    
+
+    use_realized_vol_features: bool = False
+    """Realized volatility (rolling std of returns over 12/24/48 bars)"""
+
+    use_multi_timeframe_trend_features: bool = False
+    """Multi-timeframe trend (15m, 1h: ema, close_ema_ratio, trend_flag)"""
+
+    use_microstructure_features: bool = False
+    """FR2: Order flow, funding/position pressure, liquidation cluster, aggressive volume"""
+
+    use_calendar_e0: bool = False
+    """E0 calendar features (event_in_next_60m, event_in_last_60m, minutes_to_next_event, etc.)"""
+
     preset_name: str = "base"
     """Preset identifier for this configuration"""
     
@@ -54,9 +66,10 @@ class MLFeatureConfig:
         - "base": Current production feature set (100% compatible with existing models)
         - "extended_safe": Base + extended trend + volatility features
         - "extended_full": All features enabled
+        - "extended_safe_v1": Base + trend + volatility + volume + structure + realized_vol + multi-TF (Feature Research Round 1)
         
         Args:
-            preset_name: Name of the preset ("base", "extended_safe", "extended_full")
+            preset_name: Name of the preset ("base", "extended_safe", "extended_full", "extended_safe_v1")
         
         Returns:
             MLFeatureConfig instance
@@ -70,6 +83,7 @@ class MLFeatureConfig:
                 use_volatility_features=False,
                 use_volume_features=False,
                 use_structure_features=False,
+                use_calendar_e0=False,
                 preset_name="base",
             )
         elif preset_name == "extended_safe":
@@ -81,6 +95,7 @@ class MLFeatureConfig:
                 use_volatility_features=True,
                 use_volume_features=False,
                 use_structure_features=False,
+                use_calendar_e0=False,
                 preset_name="extended_safe",
             )
         elif preset_name == "extended_full":
@@ -92,12 +107,57 @@ class MLFeatureConfig:
                 use_volatility_features=True,
                 use_volume_features=True,
                 use_structure_features=True,
+                use_calendar_e0=False,
                 preset_name="extended_full",
+            )
+        elif preset_name == "calendar_e0":
+            return cls(
+                use_base_price_features=True,
+                use_indicator_features=True,
+                use_event_features=False,
+                use_extended_trend_features=False,
+                use_volatility_features=False,
+                use_volume_features=False,
+                use_structure_features=False,
+                use_realized_vol_features=False,
+                use_multi_timeframe_trend_features=False,
+                use_calendar_e0=True,
+                preset_name="calendar_e0",
+            )
+        elif preset_name == "extended_safe_v1":
+            return cls(
+                use_base_price_features=True,
+                use_indicator_features=True,
+                use_event_features=True,
+                use_extended_trend_features=True,
+                use_volatility_features=True,
+                use_volume_features=True,
+                use_structure_features=True,
+                use_realized_vol_features=True,
+                use_multi_timeframe_trend_features=True,
+                use_calendar_e0=False,
+                use_microstructure_features=False,
+                preset_name="extended_safe_v1",
+            )
+        elif preset_name == "microstructure_v1":
+            return cls(
+                use_base_price_features=True,
+                use_indicator_features=True,
+                use_event_features=True,
+                use_extended_trend_features=True,
+                use_volatility_features=True,
+                use_volume_features=True,
+                use_structure_features=True,
+                use_realized_vol_features=True,
+                use_multi_timeframe_trend_features=True,
+                use_calendar_e0=False,
+                use_microstructure_features=True,
+                preset_name="microstructure_v1",
             )
         else:
             raise ValueError(
                 f"Unknown preset: {preset_name}. "
-                f"Available presets: 'base', 'extended_safe', 'extended_full'"
+                f"Available presets: 'base', 'extended_safe', 'extended_full', 'calendar_e0', 'extended_safe_v1', 'microstructure_v1'"
             )
     
     def __repr__(self) -> str:
@@ -110,6 +170,8 @@ class MLFeatureConfig:
             f"trend={self.use_extended_trend_features}, "
             f"vol={self.use_volatility_features}, "
             f"volume={self.use_volume_features}, "
-            f"struct={self.use_structure_features})"
+            f"struct={self.use_structure_features}, "
+            f"microstructure={self.use_microstructure_features}, "
+            f"calendar_e0={self.use_calendar_e0})"
         )
 

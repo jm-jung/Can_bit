@@ -3,8 +3,12 @@
 # 
 # 실행 순서:
 # 1. OHLCV 업데이트
-# 2. Paper/Shadow 실행
-# 3. 주간 리포트 생성 (월요일만)
+# 2. FR2 meta_metrics (--force-latest, OHLCV 직후)
+# 3. FR2 meta_layer → state_log_legacy_*.csv (다음 실행용 레거시 갱신; 운영 state_log.csv는 덮어쓰지 않음)
+# 4. Paper/Shadow 실행
+# 5. 주간 리포트 생성 (월요일만)
+# 6. SIGNAL_EXIT_TH 리포트 등
+# 7. Production Shadow Ops (확정 파이프라인 배치 + 별도 Discord; 같은 13시 job에서 연속 전송)
 #
 # 실패 시 즉시 종료 (exit code != 0)
 
@@ -89,7 +93,7 @@ fi
 log "필수 모듈 점검 완료"
 
 # (1) OHLCV 업데이트
-log "=== [1/3] OHLCV 업데이트 시작 ==="
+log "=== [1/7] OHLCV 업데이트 시작 ==="
 UPDATE_OUTPUT=$("${VENV_PYTHON}" -m src.data.update_ohlcv \
     --symbol BTCUSDT \
     --timeframe 5m \
@@ -110,25 +114,53 @@ if [[ -n "${UPDATE_EXIT:-}" ]] && [[ "${UPDATE_EXIT}" != "0" ]]; then
         log "OHLCV 업데이트: 모든 데이터가 중복 (이미 최신 상태)"
     fi
 fi
-log "=== [1/3] OHLCV 업데이트 완료 ==="
+log "=== [1/7] OHLCV 업데이트 완료 ==="
 
-# (2) Paper/Shadow 실행
-log "=== [2/3] Paper/Shadow 실행 시작 ==="
+# (2) FR2 meta_metrics: OHLCV 직후 (실패해도 파이프라인 계속)
+log "=== [2/7] FR2 meta_metrics refresh (--force-latest) 시작 ==="
+set +e
+"${VENV_PYTHON}" scripts/refresh_fr2_meta_metrics.py --force-latest 2>&1 | tee -a "${LOG_FILE}"
+META_REFRESH_EXIT=$?
+set -e
+if [[ "${META_REFRESH_EXIT}" -eq 0 ]]; then
+    log "FR2 meta_metrics refresh 완료"
+else
+    log_error "FR2 meta_metrics refresh 실패 (exit=${META_REFRESH_EXIT}, 파이프라인 계속)"
+fi
+log "=== [2/7] FR2 meta_metrics refresh 종료 ==="
+
+# (3) FR2 meta_layer 오프라인 CSV (legacy; 이후 일정용 rolling 소스)
+log "=== [3/7] FR2 meta_layer (legacy CSV) 시작 ==="
+META_LEGACY_OUT="${PROJECT_ROOT}/data/diagnostics/fr2/state_log_legacy_${DATE_STR}.csv"
+set +e
+"${VENV_PYTHON}" scripts/run_fr2_meta_layer.py --output "${META_LEGACY_OUT}" 2>&1 | tee -a "${LOG_FILE}"
+META_LAYER_EXIT=$?
+set -e
+if [[ "${META_LAYER_EXIT}" -eq 0 ]]; then
+    log "FR2 meta_layer legacy 작성: ${META_LEGACY_OUT}"
+else
+    log_error "FR2 meta_layer 실패 (exit=${META_LAYER_EXIT}, 파이프라인 계속)"
+fi
+log "=== [3/7] FR2 meta_layer 종료 ==="
+
+# (4) Paper/Shadow 실행
+log "=== [4/7] Paper/Shadow 실행 시작 ==="
 if ! "${VENV_PYTHON}" -m src.monitoring.run_paper_shadow \
     --symbol BTCUSDT \
     --timeframe 5m \
     --lookback-days 30 \
     --update-data 0 \
+    --force-refresh-proba 1 \
     2>&1 | tee -a "${LOG_FILE}"; then
     log_error "Paper/Shadow 실행 실패"
     exit 1
 fi
-log "=== [2/3] Paper/Shadow 실행 완료 ==="
+log "=== [4/7] Paper/Shadow 실행 완료 ==="
 
-# (3) 주간 리포트 생성 (월요일만)
+# (5) 주간 리포트 생성 (월요일만)
 DAY_OF_WEEK=$(date +%u)  # 1=월요일, 7=일요일
 if [[ "${DAY_OF_WEEK}" == "1" ]]; then
-    log "=== [3/3] 주간 리포트 생성 시작 (월요일) ==="
+    log "=== [5/7] 주간 리포트 생성 시작 (월요일) ==="
     
     # 주간 범위 계산: 지난 주 월요일 ~ 지난 주 일요일 (또는 오늘이 월요일이면 지난 주 전체)
     TODAY=$(date +%Y-%m-%d)
@@ -149,10 +181,31 @@ if [[ "${DAY_OF_WEEK}" == "1" ]]; then
         log_error "주간 리포트 생성 실패"
         exit 1
     fi
-    log "=== [3/3] 주간 리포트 생성 완료 ==="
+    log "=== [5/7] 주간 리포트 생성 완료 ==="
 else
-    log "=== [3/3] 주간 리포트 생성 건너뜀 (월요일 아님, 요일: ${DAY_OF_WEEK}) ==="
+    log "=== [5/7] 주간 리포트 생성 건너뜀 (월요일 아님, 요일: ${DAY_OF_WEEK}) ==="
 fi
+
+# (6) SIGNAL_EXIT_TH conditional/deployment 리포트 생성 (daily, non-blocking)
+log "=== [6/7] SIGNAL_EXIT_TH 리포트 생성 시작 ==="
+set +e
+"${VENV_PYTHON}" scripts/signal_exit_th_conditional_deployment_report.py 2>&1 | tee -a "${LOG_FILE}"
+COND_EXIT=$?
+if [[ "${COND_EXIT}" == "0" ]]; then
+    log "conditional deployment report 생성 성공"
+else
+    log_error "conditional deployment report 생성 실패 (exit=${COND_EXIT})"
+fi
+
+"${VENV_PYTHON}" scripts/signal_exit_th_deployment_decision.py 2>&1 | tee -a "${LOG_FILE}"
+DEC_EXIT=$?
+if [[ "${DEC_EXIT}" == "0" ]]; then
+    log "deployment decision report 생성 성공"
+else
+    log_error "deployment decision report 생성 실패 (exit=${DEC_EXIT})"
+fi
+set -e
+log "=== [6/7] SIGNAL_EXIT_TH 리포트 생성 완료 ==="
 
 log "=== Can_bit 일일 운영 완료 (DONE) ==="
 
@@ -204,6 +257,12 @@ if [[ "${DAY_OF_WEEK}" == "1" ]]; then
     WEEKLY_REPORT=$(ls -t "${PROJECT_ROOT}/data/monitoring_reports/weekly_report_"*.md 2>/dev/null | head -1 || echo "")
 fi
 
+# 예측 캐시 경로 계산 (현재 전략: ml_tcn)
+CACHE_PATH="${PROJECT_ROOT}/data/cache/ml_predictions/ml_tcn_BTCUSDT_5m_proba.parquet"
+if [[ ! -f "${CACHE_PATH}" ]]; then
+    log "경고: 예측 캐시 파일이 없습니다: ${CACHE_PATH}"
+fi
+
 # Discord 일일 리포트 전송 (실패해도 스크립트는 정상 종료)
 "${VENV_PYTHON}" -c "
 import json
@@ -213,6 +272,7 @@ from src.monitoring.notify_discord import send_daily_report
 summary_path = '${LATEST_SUMMARY}' if '${LATEST_SUMMARY}' else None
 ohlcv_info_str = '''${OHLCV_INFO}'''
 weekly_report_path = '${WEEKLY_REPORT}' if '${WEEKLY_REPORT}' else None
+cache_path = '${CACHE_PATH}'
 
 try:
     ohlcv_info = json.loads(ohlcv_info_str)
@@ -223,8 +283,21 @@ send_daily_report(
     summary_json_path=summary_path,
     ohlcv_info=ohlcv_info,
     weekly_report_path=weekly_report_path,
-    pipeline_status='정상 완료'
+    pipeline_status='정상 완료',
+    cache_path=cache_path
 )
 " 2>&1 | tee -a "${LOG_FILE}" || true
+
+# (7) Production Shadow Ops — 일일 파이프라인과 별도 측정, 같은 웹훅으로 두 번째 embed 전송
+log "=== [7/7] Production Shadow Ops (배치 + Discord) 시작 ==="
+set +e
+bash "${PROJECT_ROOT}/scripts/run_daily_shadow_ops.sh" 2>&1 | tee -a "${LOG_FILE}"
+SHADOW_OPS_EXIT=$?
+set -e
+if [[ "${SHADOW_OPS_EXIT}" -eq 0 ]]; then
+    log "=== [7/7] Production Shadow Ops 완료 ==="
+else
+    log_error "Production Shadow Ops 실패 (exit=${SHADOW_OPS_EXIT}, 일일 파이프라인은 이미 완료됨)"
+fi
 
 exit 0

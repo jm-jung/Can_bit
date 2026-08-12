@@ -1,0 +1,82 @@
+{
+  "original_lock_path": "/Users/jeongminjun/Projects/Can_bit/data/equity_etf/qqq/regime/locks/qqq_regime_prospective_holdout_lock.json",
+  "original_lock_sha256": "f0f1cfab7e3ab69215e393447e59172c8e983167d11cdd23f1bf0a1e4fa9ee3a",
+  "lock_version": "REGIME_PROSPECTIVE_V1",
+  "created_at_utc": "2026-07-31T08:46:08.599341+00:00",
+  "candidate_id": "LOGISTIC_PRICE_PLUS_ALL_REGIME",
+  "feature_group": "PRICE_PLUS_ALL_REGIME",
+  "exact_feature_order": [
+    "ret_1d",
+    "ret_5d",
+    "ret_10d",
+    "ret_20d",
+    "ret_60d",
+    "close_sma_ratio_20",
+    "close_sma_ratio_50",
+    "close_sma_ratio_200",
+    "sma_50_sma_200_ratio",
+    "realized_vol_20",
+    "momentum_20",
+    "momentum_60",
+    "rsi_14",
+    "volume_ratio_5_20",
+    "drawdown_from_60d_high",
+    "distance_from_52w_high",
+    "overnight_gap",
+    "atr_14_ratio",
+    "vix_level",
+    "vix_change_5d",
+    "vix_sma20_ratio",
+    "dgs10_change_20d",
+    "dgs2_change_20d",
+    "t10y2y_level",
+    "rsp_spy_relative_return_20d",
+    "qew_qqq_relative_return_20d",
+    "smh_qqq_relative_return_20d",
+    "hyg_ief_relative_return_20d"
+  ],
+  "feature_hash": "5587a1b1e70ed70b9e82959121a8836968a555186ce2937c18774f8889a367b0",
+  "feature_order_hash": "a2c6da49fb35191a8ac43eccd6aff1921d70f6e926ee684b67b847e1d3090d02",
+  "external_manifest_hash": "3927b934bad26d7af0a6089b99bb2acde63d2415eee56c3af79cdeb8486e490b",
+  "config_hash": "5070477672a866749a2e2b7674a2029c1fb5b461e349bd3dc52d9e4e337d0bf5",
+  "model_config": {
+    "solver": "lbfgs",
+    "class_weight": "balanced",
+    "max_iter": 2000,
+    "seed": 42
+  },
+  "threshold_candidates": [
+    0.45,
+    0.5,
+    0.55,
+    0.6
+  ],
+  "fixed_prospective_threshold": 0.45,
+  "threshold_policy": "mode_of_locked_development_fold_distribution",
+  "threshold_resolution": {
+    "policy": "mode_of_locked_development_fold_distribution",
+    "distribution": {
+      "0.45": 8,
+      "0.5": 2,
+      "0.55": 1
+    },
+    "mode_count": 8,
+    "tied_modes": [
+      0.45
+    ],
+    "selected_fixed_threshold": 0.45,
+    "note": "Not an arbitrary pick; derived from immutable lock fold threshold distribution."
+  },
+  "label_horizon": 20,
+  "signal_timing": "t_close",
+  "execution_timing": "t_plus_1_open",
+  "first_unseen_session": "2026-07-31",
+  "final_refit_end": "2026-07-30",
+  "minimum_prospective_sessions": 126,
+  "target_prospective_sessions": 252,
+  "old_holdout_status": "SEEN_HISTORICAL_REFERENCE",
+  "production_ready": false,
+  "promotion_ready": false,
+  "snapshotted_at_utc": "2026-08-12T06:20:05.446028+00:00",
+  "lock_not_overwritten": true
+}

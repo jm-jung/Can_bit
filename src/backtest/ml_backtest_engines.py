@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import uuid
 from abc import ABC, abstractmethod
@@ -22,6 +23,106 @@ from src.backtest.ml_backtest_types import BacktestResult, Signal, Trade
 from src.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_profit_lock_intrabar(
+    direction: str,
+    entry_price: float,
+    current_high: float,
+    current_low: float,
+    take_profit: float,
+    stop_loss: float,
+    *,
+    conservative: bool,
+) -> tuple[str | None, float | None]:
+    """
+    현재 봉의 high/low만 보고 profit lock TP/SL 여부를 판별한다.
+    LONG: TP는 상단 터치(high), SL은 하단 터치(low) 시 해당 극값으로 청산 가정.
+    SHORT: 반대. 동일 바 TP·SL 동시 충족 시 conservative=True면 SL 우선.
+    """
+    if entry_price <= 0:
+        return None, None
+    d = (direction or "LONG").upper()
+    sl_mag = abs(float(stop_loss))
+
+    if d == "LONG":
+        tp_px = entry_price * (1.0 + float(take_profit))
+        sl_px = entry_price * (1.0 + float(stop_loss))
+        tp_hit = current_high >= tp_px
+        sl_hit = current_low <= sl_px
+        if tp_hit and sl_hit:
+            if conservative:
+                return "profit_lock_sl", float(current_low)
+            return "profit_lock_tp", float(current_high)
+        if sl_hit:
+            return "profit_lock_sl", float(current_low)
+        if tp_hit:
+            return "profit_lock_tp", float(current_high)
+        return None, None
+
+    # SHORT
+    tp_px = entry_price / (1.0 + float(take_profit))
+    sl_px = entry_price / (1.0 + sl_mag)
+    tp_hit = current_low <= tp_px
+    sl_hit = current_high >= sl_px
+    if tp_hit and sl_hit:
+        if conservative:
+            return "profit_lock_sl", float(current_high)
+        return "profit_lock_tp", float(current_low)
+    if sl_hit:
+        return "profit_lock_sl", float(current_high)
+    if tp_hit:
+        return "profit_lock_tp", float(current_low)
+    return None, None
+
+
+def overtrading_reentry_block(
+    bar_index: int,
+    signal: str,
+    last_exit_bar_index: int | None,
+    last_exit_direction: str | None,
+    last_exit_reason: str | None,
+    *,
+    enable_reentry_cooldown: bool,
+    reentry_cooldown_bars: int,
+    enable_directional_cooldown: bool,
+    directional_cooldown_bars: int,
+    enable_post_tp_block: bool,
+    post_tp_block_bars: int,
+    enable_post_sl_block: bool,
+    post_sl_block_bars: int,
+) -> tuple[bool, str | None, str | None]:
+    """
+    재진입 억제 필터. 우선순위(로깅): post_sl > post_tp > directional > global.
+    반환: (blocked, cooldown_type, skip_reason)
+    """
+    if signal not in ("LONG", "SHORT"):
+        return False, None, None
+    if last_exit_bar_index is None:
+        return False, None, None
+
+    bars_since = bar_index - int(last_exit_bar_index)
+    ler = last_exit_reason or ""
+
+    if enable_post_sl_block and ler == "profit_lock_sl" and bars_since < int(post_sl_block_bars):
+        return True, "post_sl", "post_sl_block"
+
+    if enable_post_tp_block and ler == "profit_lock_tp" and bars_since < int(post_tp_block_bars):
+        return True, "post_tp", "post_tp_block"
+
+    if (
+        enable_directional_cooldown
+        and last_exit_direction is not None
+        and signal == last_exit_direction
+        and bars_since < int(directional_cooldown_bars)
+    ):
+        return True, "directional", "directional_cooldown"
+
+    if enable_reentry_cooldown and bars_since < int(reentry_cooldown_bars):
+        return True, "global", "reentry_cooldown"
+
+    return False, None, None
+
 
 # 모니터링 디렉토리
 MONITORING_DIR = Path("data/monitoring")
@@ -249,8 +350,14 @@ class MonitoringLogger:
         blocked_by_cooldown: int = 0,
         blocked_by_guard_hard: int = 0,
         config_snapshot: dict | None = None,
+        *,
+        total_return: float | None = None,
+        max_drawdown: float | None = None,
+        win_rate: float | None = None,
+        avg_profit: float | None = None,
+        equity_final: float | None = None,
     ):
-        """집계 요약 스냅샷 저장"""
+        """집계 요약 스냅샷 저장 (리스크 통계 + 선택적 백테스트 성과 지표)"""
         import numpy as np
         from collections import Counter
         
@@ -266,6 +373,16 @@ class MonitoringLogger:
             "blocked_by_cooldown": blocked_by_cooldown,
             "blocked_by_guard_hard": blocked_by_guard_hard,
         }
+        
+        # 백테스트 성과 지표 (Discord 리포트 등에서 사용)
+        if total_return is not None or max_drawdown is not None or win_rate is not None or avg_profit is not None or equity_final is not None:
+            summary.update({
+                "total_return": total_return,
+                "max_drawdown": max_drawdown,
+                "win_rate": win_rate,
+                "avg_profit": avg_profit,
+                "equity_final": equity_final,
+            })
         
         # Guard scale 통계 (샘플링된 데이터, 기존 호환성)
         if self.guard_scales:
@@ -706,6 +823,45 @@ def calculate_stage2_quality_score(
     
     return score, debug_info
 
+
+def _position_scale_from_proba(
+    p: float,
+    mode: str,
+    p_floor: float,
+    p_full: float,
+    size_min: float,
+    size_max: float,
+    p_mid: float = 0.60,
+    k: float = 25.0,
+) -> float:
+    """Proba-based position scale: linear (piecewise) or sigmoid. Returns 0..size_max."""
+    if mode == "linear":
+        if p < p_floor:
+            return 0.0
+        denom = p_full - p_floor
+        raw = (p - p_floor) / denom if denom > 0 else 1.0
+        raw = max(0.0, min(1.0, raw))
+        return size_min + (size_max - size_min) * raw
+    else:  # sigmoid
+        if p < p_floor:
+            return 0.0
+        x = k * (p - p_mid)
+        sig = 1.0 / (1.0 + math.exp(-x)) if x < 500 else 1.0
+        return size_min + (size_max - size_min) * sig
+
+
+def _scale_bin_key(scale: float) -> str:
+    if scale <= 0:
+        return "[0.0]"
+    if scale <= 0.4:
+        return "[0.25-0.4]"
+    if scale <= 0.6:
+        return "[0.4-0.6]"
+    if scale <= 0.8:
+        return "[0.6-0.8]"
+    return "[0.8-1.0]"
+
+
 # Default commission and slippage rates
 DEFAULT_COMMISSION_RATE = getattr(settings, "COMMISSION_RATE", 0.0004)
 DEFAULT_SLIPPAGE_RATE = getattr(settings, "SLIPPAGE_RATE", 0.0005)
@@ -730,20 +886,23 @@ class MLBacktestEngine(ABC):
         symbol: str,
         timeframe: str,
         feature_preset: str = "extended_safe",
+        tcn_preset: str | None = None,
     ):
         """
         Initialize backtest engine.
-        
+
         Args:
             strategy_name: Strategy identifier (e.g., "ml_xgb", "ml_lstm_attn")
             symbol: Trading symbol (e.g., "BTCUSDT")
             timeframe: Timeframe (e.g., "5m")
             feature_preset: Feature preset (for XGBoost, ignored for LSTM)
+            tcn_preset: For ml_tcn only: "base" or "calendar_e0" to select cache file.
         """
         self.strategy_name = strategy_name
         self.symbol = symbol
         self.timeframe = timeframe
         self.feature_preset = feature_preset
+        self.tcn_preset = tcn_preset
         self.log_prefix = f"[ML Backtest][{self.get_engine_name()}]"
     
     @abstractmethod
@@ -862,6 +1021,114 @@ class MLBacktestEngine(ABC):
         stage2_cap_entropy_mid_th: float = 0.62,   # 완화: 0.64 → 0.62
         stage2_cap_pdiff_tiny_th: float = 0.002,
         stage2_cap_pdiff_small_th: float = 0.005,  # 기본값 승격: pdiff_small_005 (기존 0.004)
+        # Entry filters (minimal invasive: optional)
+        min_max_proba: Optional[float] = None,
+        max_entropy: Optional[float] = None,
+        min_proba_gap: float = 0.0,
+        # Phase D11: directional edge + flat suppression (optional, default off)
+        min_directional_gap: Optional[float] = None,
+        max_flat_entry_proba: Optional[float] = None,
+        min_hold_bars_override: Optional[int] = None,
+        cooldown_bars_override: Optional[int] = None,
+        # D12: when False (directional_edge pure), skip min_max_proba / max_entropy entry gates
+        use_legacy_entry_gates: bool = True,
+        # Regime filter (EMA200: Long entry only when close > ema200; default OFF)
+        regime_filter_enabled: bool = False,
+        regime_ema_span: int = 200,
+        regime_rule: str = "ema_only",  # "ema_only" | ... | "downtrend_block" | "proba_quantile"
+        regime_slope_lookback: int = 48,
+        vol_window: int = 48,
+        vol_threshold: float = 0.0010,
+        breakout_lookback: int = 96,
+        breakout_mode: str = "ema_high",  # "ema" | "ema_high"
+        slope_threshold: float = 1e-5,  # flat_slope: skip entry when abs(ema_slope) <= this
+        q_window: int = 8640,  # proba_quantile: rolling window (bars), default 30d @ 5m
+        q: float = 0.90,  # proba_quantile: quantile threshold (e.g. 0.90 = top 10%)
+        p_floor: float = 0.55,  # proba_quantile: minimum p gate
+        # Position scaling (proba-based size): default OFF
+        position_scaling_enabled: bool = False,
+        position_scaling_mode: str = "linear",  # "linear" | "sigmoid"
+        position_p_floor: float = 0.55,
+        position_p_full: float = 0.65,
+        position_size_min: float = 0.25,
+        position_size_max: float = 1.0,
+        position_p_mid: float = 0.60,  # sigmoid
+        position_k: float = 25.0,  # sigmoid steepness
+        # Early exit (proba-based): default OFF
+        early_exit_enabled: bool = False,
+        early_exit_lookback: int = 12,
+        early_exit_p_floor: float = 0.55,
+        early_exit_bad_k: int = 8,
+        # Entry flat-proba gate (Phase C): skip entry when proba_flat > max_flat_proba; default OFF
+        entry_flat_gate_enabled: bool = False,
+        max_flat_proba: float = 0.45,
+        # Flat-aware early exit (Phase C3): when proba_flat > threshold, use lower effective_bad_k; default OFF
+        flat_exit_aware_enabled: bool = False,
+        flat_exit_threshold: float = 0.30,
+        flat_exit_badk_delta: int = 2,
+        # Time-stop (Phase C4): force exit when holding_bars >= time_stop_bars; default OFF
+        time_stop_enabled: bool = False,
+        time_stop_bars: int = 96,
+        # Partial take-profit (Phase C7): lock part of profit at threshold; default OFF
+        partial_tp_enabled: bool = False,
+        partial_tp_threshold: float = 0.0025,
+        partial_tp_ratio: float = 0.5,
+        # Partial TP fee correction (Phase C8 audit): if True, use correct fee on partial close/remaining exit; default False for backward compat
+        partial_tp_fee_correct: bool = False,
+        # Break-even stop (Phase C9): when unrealized return >= be_threshold, move stop to entry; default OFF
+        break_even_stop_enabled: bool = False,
+        be_threshold: float = 0.0,
+        # Trade log (candidate_validation sanity check): when True, result will include trade_events for CSV export
+        emit_trade_log: bool = False,
+        # signal_exit_th only (does not touch early_exit / time_stop / SHORT logic):
+        # - trailing_window_bars=1: 기존과 동일 (현재 바 proba만 사용).
+        # - trailing_window_bars>1: 최근 W바 구간의 min(방향 proba) < exit_*_th 이면 청산 (min_hold 이후 약세 기억 청산).
+        signal_exit_th_trailing_window_bars: int = 1,
+        # 진입 시점 방향 proba 대비 추가 하락폭(Δ < -x)이면 signal_exit_th (EXP_B)
+        signal_exit_th_delta_from_entry: Optional[float] = None,
+        # 손실형 선별 보조: 임계 기반 signal_exit_th 에서만 직전 바 close 로 청산가 조정 (δ_p, MAE_cut)
+        signal_exit_th_loss_aux_delta_p: Optional[float] = None,
+        signal_exit_th_loss_aux_mae_cut: Optional[float] = None,
+        signal_exit_th_loss_aux_short_only: bool = False,
+        signal_exit_th_loss_aux_min_bars: Optional[int] = None,
+        # 손실 보조 보호 게이트 (선택): 직전 바 close 조정을 건너뜀
+        signal_exit_th_loss_aux_gate_delta_unreal_positive: bool = False,
+        signal_exit_th_loss_aux_gate_mfe_min: Optional[float] = None,
+        # Adaptive ENTRY: require state_log unique_round_trips >= N; None = off
+        entry_min_unique_round_trips: Optional[int] = None,
+        # CSV path for load_latest_window_stats; None -> data/diagnostics/fr2/state_log.csv
+        entry_urt_state_log_path: Optional[Path] = None,
+        # URT from load_latest_window_stats taken before state_log append (see LstmAttn run_backtest)
+        entry_urt_state_log_snapshot: Optional[int] = None,
+        # When set (e.g. compare script), overrides default "pre_append_snapshot" in result metadata
+        entry_urt_gate_value_source_override: Optional[str] = None,
+        # Profit lock exit (optional; default OFF — 동일 파라미터면 기존 결과 유지)
+        enable_profit_lock_exit: bool = False,
+        profit_lock_take_profit: float = 0.0015,
+        profit_lock_stop_loss: float = -0.0030,
+        profit_lock_max_bars: int = 12,
+        profit_lock_conservative_intrabar: bool = True,
+        # Overtrading / re-entry control (optional; default OFF)
+        enable_reentry_cooldown: bool = False,
+        reentry_cooldown_bars: int = 12,
+        enable_directional_cooldown: bool = False,
+        directional_cooldown_bars: int = 12,
+        enable_post_tp_block: bool = False,
+        post_tp_block_bars: int = 6,
+        enable_post_sl_block: bool = False,
+        post_sl_block_bars: int = 12,
+        # Regime ablation (diagnostics): entry-only skip; default OFF
+        enable_regime_filter: bool = False,
+        regime_filter_mode: str = "none",
+        regime_combo_block_keys: tuple[str, ...] | None = None,
+        # Positive regime (allow-list): block when bar not in allowed regime; default OFF
+        enable_positive_regime_filter: bool = False,
+        positive_regime_filter_mode: str = "none",
+        # Adaptive positive regime: gate ON일 때만 positive filter 적용; default OFF
+        enable_adaptive_positive_regime_filter: bool = False,
+        adaptive_positive_regime_mode: str = "none",
+        enable_confidence_filter: bool = False,
+        confidence_filter_mode: str = "none",
     ) -> BacktestResult:
         """
         Execute trades based on signals in DataFrame.
@@ -976,10 +1243,21 @@ class MLBacktestEngine(ABC):
         position: dict | None = None
         balance = 1.0
         entries_attempted = 0
+        entries_blocked_by_regime_ablation = 0
+        entries_blocked_by_positive_regime = 0
+        positive_regime_allowed_entries = 0
+        positive_regime_blocked_entries = 0
+        adaptive_positive_gate_on_count = 0
+        entries_blocked_by_adaptive_positive = 0
+        adaptive_positive_allowed_entries = 0
+        adaptive_positive_blocked_entries = 0
+        entries_blocked_by_confidence = 0
         exits_executed = 0
         tp_exits = 0
         sl_exits = 0
-        
+        profit_lock_tp_exits = 0
+        profit_lock_sl_exits = 0
+
         # Additional tracking
         position_entry_bar_index: int | None = None
         daily_balance_start: float = 1.0
@@ -992,9 +1270,14 @@ class MLBacktestEngine(ABC):
         
         effective_commission_rate = commission_rate if commission_rate is not None else DEFAULT_COMMISSION_RATE
         effective_slippage_rate = slippage_rate if slippage_rate is not None else DEFAULT_SLIPPAGE_RATE
-        
+        effective_min_hold_bars = min_hold_bars_override if min_hold_bars_override is not None else min_hold_bars
+        effective_cooldown_bars = cooldown_bars_override if cooldown_bars_override is not None else cooldown_bars
+
         # Track trade events for logging
         trade_events: list[dict] = []  # Entry/Exit/Flip events
+        signal_exit_th_trade_count = 0
+        signal_exit_th_scaled_profit_sum = 0.0
+        signal_exit_th_loss_aux_applied = 0
         
         # Track first 10 trades for detailed debugging
         trade_count = 0
@@ -1008,6 +1291,8 @@ class MLBacktestEngine(ABC):
         # Anti-overtrading state tracking
         # ======================================================================
         last_exit_bar_index: int | None = None  # For cooldown tracking
+        last_exit_direction: str | None = None
+        last_exit_reason: str | None = None
         entry_count_long = 0
         entry_count_short = 0
         exit_count = 0
@@ -1023,15 +1308,75 @@ class MLBacktestEngine(ABC):
             "margin_zone": 0,
             "hysteresis": 0,
             "stage2_no_trade": 0,  # Stage-2에서 Trade=False로 차단
+            "regime_ablation": 0,
+            "positive_regime": 0,
         }
-        
+        skipped_by_min_max_proba = 0
+        skipped_by_max_entropy = 0
+        skipped_by_proba_gap = 0
+        spread_rejected_list: list[float] = []
+        spread_executed_list: list[float] = []
+        # Phase D11: directional gap + flat suppression fail counts
+        directional_gap_fail_count = 0
+        long_directional_gap_fail_count = 0
+        short_directional_gap_fail_count = 0
+        flat_suppression_fail_count = 0
+
         # Stage-2 statistics
         stage2_no_trade_count = 0
         stage2_trade_count = 0
         stage2_exit_on_flat_count = 0
         
         logger.debug(f"{self.log_prefix} Starting trade execution loop: {len(df)} rows to process")
-        
+
+        # ======================================================================
+        # [FILTER DISTRIBUTION] max_proba / entropy 비율 (필터 원인 분석용)
+        # ======================================================================
+        if proba_long_arr is not None and proba_short_arr is not None and len(proba_long_arr) > 0:
+            n_bars = min(len(proba_long_arr), len(proba_short_arr), len(df))
+            cnt_ge_045 = cnt_ge_050 = cnt_ge_055 = cnt_ge_060 = 0
+            cnt_le_160 = cnt_le_155 = cnt_le_150 = cnt_le_145 = 0
+            for idx in range(n_bars):
+                pl = float(proba_long_arr[idx]) if idx < len(proba_long_arr) else 0.0
+                ps = float(proba_short_arr[idx]) if idx < len(proba_short_arr) else 0.0
+                pf = max(0.0, min(1.0, 1.0 - pl - ps))
+                mp = max(pl, ps, pf)
+                h = 0.0
+                for p in (pl, ps, pf):
+                    if p > 1e-12:
+                        h -= p * math.log2(p)
+                if mp >= 0.45:
+                    cnt_ge_045 += 1
+                if mp >= 0.50:
+                    cnt_ge_050 += 1
+                if mp >= 0.55:
+                    cnt_ge_055 += 1
+                if mp >= 0.60:
+                    cnt_ge_060 += 1
+                if h <= 1.60:
+                    cnt_le_160 += 1
+                if h <= 1.55:
+                    cnt_le_155 += 1
+                if h <= 1.50:
+                    cnt_le_150 += 1
+                if h <= 1.45:
+                    cnt_le_145 += 1
+            ratio_ge_045 = cnt_ge_045 / n_bars if n_bars else 0
+            ratio_ge_050 = cnt_ge_050 / n_bars if n_bars else 0
+            ratio_ge_055 = cnt_ge_055 / n_bars if n_bars else 0
+            ratio_ge_060 = cnt_ge_060 / n_bars if n_bars else 0
+            ratio_le_160 = cnt_le_160 / n_bars if n_bars else 0
+            ratio_le_155 = cnt_le_155 / n_bars if n_bars else 0
+            ratio_le_150 = cnt_le_150 / n_bars if n_bars else 0
+            ratio_le_145 = cnt_le_145 / n_bars if n_bars else 0
+            logger.info(
+                f"{self.log_prefix}[FILTER DISTRIBUTION] n_bars={n_bars} "
+                f"ratio_max_proba_ge_045={ratio_ge_045:.4f} ge_050={ratio_ge_050:.4f} "
+                f"ge_055={ratio_ge_055:.4f} ge_060={ratio_ge_060:.4f} | "
+                f"ratio_entropy_le_160={ratio_le_160:.4f} le_155={ratio_le_155:.4f} "
+                f"le_150={ratio_le_150:.4f} le_145={ratio_le_145:.4f}"
+            )
+
         # ======================================================================
         # [DEBUG] Signal 컬럼명 및 값 매핑 확인 (처음 200 bars)
         # ======================================================================
@@ -1115,7 +1460,143 @@ class MLBacktestEngine(ABC):
         blocked_by_min_hold = 0
         blocked_by_cooldown = 0
         blocked_by_guard_hard = 0
+        blocked_by_ot_global = 0
+        blocked_by_ot_directional = 0
+        blocked_by_ot_post_tp = 0
+        blocked_by_ot_post_sl = 0
         
+        # Regime filter: Long entry gate only (EMA or Vol Compression)
+        entries_blocked_by_regime = 0
+        entries_blocked_by_regime_price = 0
+        entries_blocked_by_regime_slope = 0
+        entries_blocked_by_regime_vol = 0
+        entries_blocked_by_regime_vol_slope = 0
+        entries_blocked_by_regime_vol_breakout = 0
+        entries_allowed_on_decompress = 0
+        entries_blocked_by_regime_flat_slope = 0
+        entries_blocked_by_regime_downtrend = 0
+        entries_blocked_by_regime_proba_quantile = 0
+        entries_blocked_by_flat_gate = 0
+        entries_blocked_by_urt_gate = 0
+        urt_gate_block_samples: list[dict[str, int]] = []
+        # Entry URT: prefer snapshot (CSV before append_state_log in run_backtest); else read file here.
+        entry_urt_gate_active = False
+        entry_urt_from_state_log: int | None = None
+        entry_urt_state_log_resolved: Path | None = None
+        entry_urt_gate_value_source: str | None = None
+        if entry_min_unique_round_trips is not None:
+            entry_urt_state_log_resolved = (
+                Path(entry_urt_state_log_path)
+                if entry_urt_state_log_path is not None
+                else Path("data/diagnostics/fr2/state_log.csv")
+            )
+            # Only snapshot from run_backtest (CSV before append_state_log). Re-reading the file here
+            # would see runtime_activation_probe rows appended immediately before execute_trades.
+            if entry_urt_state_log_snapshot is not None:
+                entry_urt_from_state_log = int(entry_urt_state_log_snapshot)
+                entry_urt_gate_active = True
+                entry_urt_gate_value_source = (
+                    entry_urt_gate_value_source_override
+                    if entry_urt_gate_value_source_override is not None
+                    else "pre_append_snapshot"
+                )
+        # Position scaling (proba-based) stats
+        entries_scaled_count = 0
+        entries_scaled_applied_count = 0  # 실제로 scale 적용된 진입 수 (skip 제외)
+        scale_sum = 0.0
+        scale_sq_sum = 0.0
+        scale_min_val = 1.0
+        scale_max_val = 0.0
+        scale_bins_counts: dict[str, int] = {"[0.0]": 0, "[0.25-0.4]": 0, "[0.4-0.6]": 0, "[0.6-0.8]": 0, "[0.8-1.0]": 0}
+        early_exit_count = 0
+        total_exit_evaluations = 0  # Phase C3: bars where we evaluated early exit
+        flat_exit_adjusted_count = 0  # Phase C3: evaluations where we used reduced effective_bad_k
+        flat_exit_trigger_count = 0  # Phase C3: early exits that used reduced effective_bad_k
+        time_stop_exit_count = 0  # Phase C4: exits due to time_stop
+        partial_tp_count = 0  # Phase C7: number of trades that had a partial TP
+        partial_tp_pnl_list: list[float] = []  # Phase C7: realized return from each partial TP
+        break_even_exit_count = 0  # Phase C9: exits due to break-even stop
+        ema_series: Optional[pd.Series] = None
+        ema_slope_series: Optional[pd.Series] = None
+        vol_series: Optional[pd.Series] = None
+        compress_series: Optional[pd.Series] = None
+        decompress_event_series: Optional[pd.Series] = None
+        rolling_high_series: Optional[pd.Series] = None
+        q_series: Optional[pd.Series] = None
+        if regime_filter_enabled and "close" in df.columns:
+            if regime_rule in ("ema_only", "ema_plus_slope"):
+                from src.strategy_filters.regime_filter import compute_ema, compute_ema_slope
+                ema_series = compute_ema(df["close"], span=regime_ema_span)
+                if regime_rule == "ema_plus_slope":
+                    ema_slope_series = compute_ema_slope(ema_series, lookback=regime_slope_lookback)
+            elif regime_rule == "vol_compress":
+                from src.strategy_filters.regime_filter import compute_vol_compress
+                vol_series = compute_vol_compress(df["close"], window=vol_window)
+            elif regime_rule == "vol_slope":
+                from src.strategy_filters.regime_filter import compute_ema, compute_ema_slope, compute_vol_compress
+                ema_series = compute_ema(df["close"], span=regime_ema_span)
+                ema_slope_series = compute_ema_slope(ema_series, lookback=regime_slope_lookback)
+                vol_series = compute_vol_compress(df["close"], window=vol_window)
+            elif regime_rule == "vol_breakout":
+                from src.strategy_filters.regime_filter import compute_ema, compute_vol_compress
+                vol_series = compute_vol_compress(df["close"], window=vol_window)
+                compress_series = vol_series < vol_threshold
+                decompress_event_series = (compress_series.shift(1) == True) & (compress_series == False)
+                ema_series = compute_ema(df["close"], span=regime_ema_span)
+                rolling_high_series = df["close"].rolling(breakout_lookback).max().shift(1)
+            elif regime_rule == "flat_slope":
+                from src.strategy_filters.regime_filter import compute_ema, compute_ema_slope
+                ema_series = compute_ema(df["close"], span=regime_ema_span)
+                ema_slope_series = compute_ema_slope(ema_series, lookback=regime_slope_lookback)
+            elif regime_rule == "downtrend_block":
+                from src.strategy_filters.regime_filter import compute_ema, compute_ema_slope
+                ema_series = compute_ema(df["close"], span=regime_ema_span)
+                ema_slope_series = compute_ema_slope(ema_series, lookback=regime_slope_lookback)
+            elif regime_rule == "proba_quantile" and proba_long_arr is not None and len(proba_long_arr) > 0:
+                # Rolling quantile of p (no lookahead: shift(1) then rolling)
+                n_align = min(len(df), len(proba_long_arr))
+                p_series_proba = pd.Series(proba_long_arr[:n_align], index=range(n_align))
+                min_periods = max(50, q_window // 10)
+                q_series = p_series_proba.shift(1).rolling(q_window, min_periods=min_periods).quantile(q)
+
+        regime_ablation_block_mask: np.ndarray | None = None
+        if enable_regime_filter and regime_filter_mode not in (None, "", "none"):
+            from src.strategy_filters.regime_ablation import compute_regime_ablation_block_mask
+
+            regime_ablation_block_mask = compute_regime_ablation_block_mask(
+                df,
+                regime_filter_mode,
+                regime_combo_block_keys=regime_combo_block_keys,
+            )
+
+        positive_regime_block_mask: np.ndarray | None = None
+        positive_regime_key_arr: np.ndarray | None = None
+        use_static_positive = enable_positive_regime_filter and not enable_adaptive_positive_regime_filter
+        if use_static_positive and positive_regime_filter_mode not in (None, "", "none"):
+            from src.strategy_filters.regime_ablation import (
+                compute_positive_regime_allow_mask,
+                compute_regime_components,
+            )
+
+            *_, positive_regime_key_arr = compute_regime_components(df)
+            positive_regime_block_mask = ~compute_positive_regime_allow_mask(
+                df, positive_regime_filter_mode
+            )
+
+        adaptive_gate_on_mask: np.ndarray | None = None
+        adaptive_positive_final_block: np.ndarray | None = None
+        adaptive_regime_key_arr: np.ndarray | None = None
+        if enable_adaptive_positive_regime_filter and adaptive_positive_regime_mode not in (None, "", "none"):
+            from src.strategy_filters.regime_ablation import (
+                compute_adaptive_positive_block_mask,
+                compute_regime_components as _arc,
+            )
+
+            *_, adaptive_regime_key_arr = _arc(df)
+            adaptive_gate_on_mask, _, adaptive_positive_final_block = compute_adaptive_positive_block_mask(
+                df, adaptive_positive_regime_mode
+            )
+
         for i, row in enumerate(df.itertuples()):
             signal: Signal = getattr(row, "signal")
             current_price = float(getattr(row, "close"))
@@ -1318,6 +1799,9 @@ class MLBacktestEngine(ABC):
                         
                         position = None
                         position_entry_bar_index = None
+                        last_exit_bar_index = i
+                        last_exit_direction = direction
+                        last_exit_reason = "daily_loss_limit"
                     continue
             
             # Check for exit conditions if position exists
@@ -1329,17 +1813,52 @@ class MLBacktestEngine(ABC):
             blocked_by_margin_zone = False
             
             if position is not None:
+                sth_crossed_for_aux = False  # 임계/트레일링 기반 signal_exit_th 여부 (손실 보조용)
                 entry_price = position["entry_price"]
                 direction = position["side"]
                 bars_held = i - position_entry_bar_index if position_entry_bar_index is not None else 0
+                # MFE/MAE (bar high/low) for trade log / sanity check
+                if direction == "LONG":
+                    ret_high = (current_high - entry_price) / entry_price
+                    ret_low = (current_low - entry_price) / entry_price
+                else:
+                    ret_high = (entry_price - current_low) / entry_price
+                    ret_low = (entry_price - current_high) / entry_price
+                mfe_cur = position.get("max_favorable_excursion")
+                mae_cur = position.get("max_adverse_excursion")
+                position["max_favorable_excursion"] = max(mfe_cur if mfe_cur is not None else ret_high, ret_high)
+                position["max_adverse_excursion"] = min(mae_cur if mae_cur is not None else ret_low, ret_low)
                 
                 # ======================================================================
                 # [ANTI-OVERTRADING] 최소 보유 기간 체크
                 # ======================================================================
-                if min_hold_bars is not None and bars_held < min_hold_bars:
+                if effective_min_hold_bars is not None and bars_held < effective_min_hold_bars:
                     # 강제 청산 조건(TP/SL/max_holding)은 예외
                     # 하지만 신호 기반 청산은 min_hold 동안 금지
                     blocked_by_min_hold_flag = True
+
+                # Profit lock exit (optional): 현재 봉 intrabar TP/SL, max_bars 이내만 (max_holding/time 이전에 평가)
+                if (
+                    exit_reason is None
+                    and enable_profit_lock_exit
+                    and position_entry_bar_index is not None
+                    and profit_lock_max_bars >= 1
+                ):
+                    bh_pl = i - int(position_entry_bar_index)
+                    if 1 <= bh_pl <= int(profit_lock_max_bars):
+                        pl_r, pl_px = resolve_profit_lock_intrabar(
+                            direction=direction,
+                            entry_price=float(entry_price),
+                            current_high=float(current_high),
+                            current_low=float(current_low),
+                            take_profit=float(profit_lock_take_profit),
+                            stop_loss=float(profit_lock_stop_loss),
+                            conservative=bool(profit_lock_conservative_intrabar),
+                        )
+                        if pl_r is not None and pl_px is not None:
+                            exit_reason = pl_r
+                            exit_price = float(pl_px)
+                            blocked_by_min_hold_flag = False
                 
                 # Max holding bars (강제 청산 - min_hold 예외 없음)
                 if max_holding_bars is not None and position_entry_bar_index is not None:
@@ -1347,6 +1866,76 @@ class MLBacktestEngine(ABC):
                         exit_reason = "max_holding"
                         exit_price = current_price
                         blocked_by_min_hold_flag = False  # 강제 청산은 min_hold 무시
+                
+                # Partial take-profit (Phase C7): 수익 구간에서 tp_ratio만큼 먼저 청산 (1 trade당 1회)
+                # [AUDIT] 부분 청산 시 수수료: 청산 notional = ratio*size*price → fee in return = ratio*(price/entry)*fee_ratio.
+                # 기존: partial_fee_impact = fee_ratio*(1+price/entry) (비율 미적용·과다). partial_tp_fee_correct=True 시 정식 적용.
+                if (
+                    exit_reason is None
+                    and partial_tp_enabled
+                    and not position.get("partial_tp_done", False)
+                ):
+                    if direction == "LONG":
+                        current_return = (current_price - entry_price) / entry_price
+                    else:
+                        current_return = (entry_price - current_price) / entry_price
+                    if current_return >= partial_tp_threshold:
+                        fee_ratio = effective_commission_rate + effective_slippage_rate
+                        partial_gross = current_return * partial_tp_ratio
+                        if partial_tp_fee_correct:
+                            partial_fee_impact = partial_tp_ratio * (current_price / entry_price) * fee_ratio
+                        else:
+                            partial_fee_impact = fee_ratio * (1.0 + current_price / entry_price)
+                        partial_net_return = partial_gross - partial_fee_impact
+                        position_scale_pt = position.get("position_scale", 1.0)
+                        balance *= 1.0 + partial_net_return * position_scale_pt
+                        position["partial_tp_done"] = True
+                        position["remaining_ratio"] = 1.0 - partial_tp_ratio
+                        partial_tp_count += 1
+                        partial_tp_pnl_list.append(partial_net_return)
+                        if trade_events is not None:
+                            trade_events.append({
+                                "event": "PARTIAL_TP",
+                                "ts": str(row_timestamp),
+                                "entry_price": entry_price,
+                                "exit_price": current_price,
+                                "side": direction,
+                                "partial_tp_ratio": partial_tp_ratio,
+                                "partial_net_return": partial_net_return,
+                                "profit": partial_net_return,
+                            })
+                
+                # Break-even stop (Phase C9): max_unrealized >= be_threshold 이면 stop = entry, 가격이 entry로 돌아오면 청산
+                if exit_reason is None and break_even_stop_enabled and be_threshold > 0 and position is not None:
+                    if direction == "LONG":
+                        current_return = (current_price - entry_price) / entry_price
+                    else:
+                        current_return = (entry_price - current_price) / entry_price
+                    position["max_unrealized_return"] = max(
+                        position.get("max_unrealized_return", current_return),
+                        current_return,
+                    )
+                    if position["max_unrealized_return"] >= be_threshold:
+                        if not position.get("be_stop_triggered", False):
+                            position["be_arm_ts"] = str(row_timestamp)
+                        position["be_stop_triggered"] = True
+                    if position.get("be_stop_triggered", False):
+                        if direction == "LONG" and current_low <= entry_price:
+                            exit_reason = "break_even"
+                            exit_price = entry_price
+                            break_even_exit_count += 1
+                        elif direction == "SHORT" and current_high >= entry_price:
+                            exit_reason = "break_even"
+                            exit_price = entry_price
+                            break_even_exit_count += 1
+                
+                # Time-stop (Phase C4): holding_bars >= time_stop_bars 이면 강제 청산
+                if exit_reason is None and time_stop_enabled and time_stop_bars > 0 and position_entry_bar_index is not None:
+                    if bars_held >= time_stop_bars:
+                        exit_reason = "time_stop"
+                        exit_price = current_price
+                        time_stop_exit_count += 1
+                        blocked_by_min_hold_flag = False
                 
                 # Calculate returns for TP/SL (only if not already exiting)
                 if exit_reason is None:
@@ -1371,21 +1960,61 @@ class MLBacktestEngine(ABC):
                             blocked_by_min_hold_flag = False  # 강제 청산은 min_hold 무시
                 
                 # ======================================================================
+                # [EARLY EXIT] min_hold 만족 후 최근 N바에서 proba < p_floor 인 바가 K개 이상이면 청산
+                # [Phase C3] flat_exit_aware: when proba_flat > threshold, use effective_bad_k = max(1, bad_k - delta)
+                # ======================================================================
+                if exit_reason is None and not blocked_by_min_hold_flag and early_exit_enabled and direction == "LONG" and proba_long_arr is not None:
+                    total_exit_evaluations += 1
+                    effective_bad_k = early_exit_bad_k
+                    if flat_exit_aware_enabled and proba_short_arr is not None and i < len(proba_long_arr) and i < len(proba_short_arr):
+                        p_long_i = float(proba_long_arr[i])
+                        p_short_i = float(proba_short_arr[i])
+                        p_flat_i = max(0.0, min(1.0, 1.0 - p_long_i - p_short_i))
+                        if p_flat_i > flat_exit_threshold:
+                            effective_bad_k = max(1, early_exit_bad_k - flat_exit_badk_delta)
+                            flat_exit_adjusted_count += 1
+                    start_j = max(0, i - early_exit_lookback + 1)
+                    bad_count = 0
+                    for j in range(start_j, i + 1):
+                        if j < len(proba_long_arr) and float(proba_long_arr[j]) < early_exit_p_floor:
+                            bad_count += 1
+                    if bad_count >= effective_bad_k:
+                        exit_reason = "early_exit"
+                        exit_price = current_price
+                        early_exit_count += 1
+                        if effective_bad_k != early_exit_bad_k:
+                            flat_exit_trigger_count += 1
+                
+                # ======================================================================
                 # [ANTI-OVERTRADING] 히스테리시스 기반 신호 체크
                 # ======================================================================
                 if exit_reason is None and not blocked_by_min_hold_flag:
                     # 히스테리시스: enter/exit threshold 분리
                     if proba_long_arr is not None and proba_short_arr is not None:
-                        p_long = proba_long_arr[i] if i < len(proba_long_arr) else 0.0
-                        p_short = proba_short_arr[i] if i < len(proba_short_arr) else 0.0
+                        p_long = float(proba_long_arr[i]) if i < len(proba_long_arr) else 0.0
+                        p_short = float(proba_short_arr[i]) if i < len(proba_short_arr) else 0.0
                         
                         # Exit threshold 체크 (enter보다 낮은 임계값)
                         if direction == "LONG":
                             # LONG 포지션: proba_long < exit_long_th 이면 청산
                             if exit_long_th is not None:
-                                if p_long < exit_long_th:
+                                W = max(1, int(signal_exit_th_trailing_window_bars))
+                                crossed_trailing = False
+                                if position_entry_bar_index is not None and W > 1:
+                                    j0 = max(int(position_entry_bar_index), i - W + 1)
+                                    seg = proba_long_arr[j0 : i + 1]
+                                    crossed_trailing = bool(float(np.min(seg)) < float(exit_long_th))
+                                else:
+                                    crossed_trailing = p_long < exit_long_th
+                                delta_hit = False
+                                if signal_exit_th_delta_from_entry is not None and position is not None:
+                                    ep = position.get("entry_dir_proba")
+                                    if ep is not None:
+                                        delta_hit = (p_long - float(ep)) < -float(signal_exit_th_delta_from_entry)
+                                if crossed_trailing or delta_hit:
                                     exit_reason = "signal_exit_th"
                                     exit_price = current_price
+                                    sth_crossed_for_aux = crossed_trailing
                             else:
                                 # exit_long_th가 없으면 기존 로직 사용
                                 exit_reason = self._should_exit_position(position, signal)
@@ -1394,9 +2023,23 @@ class MLBacktestEngine(ABC):
                         elif direction == "SHORT":
                             # SHORT 포지션: proba_short < exit_short_th 이면 청산
                             if exit_short_th is not None:
-                                if p_short < exit_short_th:
+                                W = max(1, int(signal_exit_th_trailing_window_bars))
+                                crossed_trailing = False
+                                if position_entry_bar_index is not None and W > 1:
+                                    j0 = max(int(position_entry_bar_index), i - W + 1)
+                                    seg = proba_short_arr[j0 : i + 1]
+                                    crossed_trailing = bool(float(np.min(seg)) < float(exit_short_th))
+                                else:
+                                    crossed_trailing = p_short < exit_short_th
+                                delta_hit = False
+                                if signal_exit_th_delta_from_entry is not None and position is not None:
+                                    ep = position.get("entry_dir_proba")
+                                    if ep is not None:
+                                        delta_hit = (p_short - float(ep)) < -float(signal_exit_th_delta_from_entry)
+                                if crossed_trailing or delta_hit:
                                     exit_reason = "signal_exit_th"
                                     exit_price = current_price
+                                    sth_crossed_for_aux = crossed_trailing
                             else:
                                 # exit_short_th가 없으면 기존 로직 사용
                                 exit_reason = self._should_exit_position(position, signal)
@@ -1407,6 +2050,68 @@ class MLBacktestEngine(ABC):
                         exit_reason = self._should_exit_position(position, signal)
                     if exit_reason is not None and exit_price is None:
                         exit_price = current_price
+                
+                # 손실형 signal_exit_th 보조: (entry_proba - proba[i-1]) > δ_p 및 MAE < mae_cut 일 때 직전 바 close 로 청산
+                if (
+                    position is not None
+                    and exit_reason == "signal_exit_th"
+                    and exit_price is not None
+                    and signal_exit_th_loss_aux_delta_p is not None
+                    and signal_exit_th_loss_aux_mae_cut is not None
+                    and sth_crossed_for_aux
+                    and i > 0
+                ):
+                    ep = position.get("entry_dir_proba")
+                    mae_val = position.get("max_adverse_excursion")
+                    bh = i - position_entry_bar_index if position_entry_bar_index is not None else 0
+                    ok_dir = (not signal_exit_th_loss_aux_short_only) or direction == "SHORT"
+                    ok_bars = (
+                        signal_exit_th_loss_aux_min_bars is None
+                        or bh >= int(signal_exit_th_loss_aux_min_bars)
+                    )
+                    if ep is not None and mae_val is not None and ok_dir and ok_bars:
+                        p_prev: float | None = None
+                        drop = 0.0
+                        if direction == "LONG" and proba_long_arr is not None:
+                            p_prev = float(proba_long_arr[i - 1])
+                            drop = float(ep) - p_prev
+                        elif direction == "SHORT" and proba_short_arr is not None:
+                            p_prev = float(proba_short_arr[i - 1])
+                            drop = float(ep) - p_prev
+                        if (
+                            p_prev is not None
+                            and drop > float(signal_exit_th_loss_aux_delta_p)
+                            and float(mae_val) < float(signal_exit_th_loss_aux_mae_cut)
+                        ):
+                            apply_loss_aux_price = True
+                            # 청산 직전 4바 Δunrealized (winners/losers 분석과 동일 정의)
+                            entry_bar = position_entry_bar_index
+                            if entry_bar is not None and entry_bar >= 0 and i < len(df):
+                                cx = float(df["close"].iloc[i])
+                                j4 = max(int(entry_bar), i - 4)
+                                cj4 = float(df["close"].iloc[j4])
+                                if direction == "LONG":
+                                    u_exit = (cx - entry_price) / entry_price
+                                    u_prev4 = (cj4 - entry_price) / entry_price
+                                else:
+                                    u_exit = (entry_price - cx) / entry_price
+                                    u_prev4 = (entry_price - cj4) / entry_price
+                                d_unreal_4 = u_exit - u_prev4
+                            else:
+                                d_unreal_4 = 0.0
+                            if signal_exit_th_loss_aux_gate_delta_unreal_positive and d_unreal_4 > 0.0:
+                                apply_loss_aux_price = False
+                            mfe_tracked = position.get("max_favorable_excursion")
+                            if (
+                                apply_loss_aux_price
+                                and signal_exit_th_loss_aux_gate_mfe_min is not None
+                                and mfe_tracked is not None
+                                and float(mfe_tracked) >= float(signal_exit_th_loss_aux_gate_mfe_min)
+                            ):
+                                apply_loss_aux_price = False
+                            if apply_loss_aux_price:
+                                exit_price = float(df["close"].iloc[i - 1])
+                                signal_exit_th_loss_aux_applied += 1
                 
                 # Execute exit if needed
                 if exit_reason is not None:
@@ -1436,6 +2141,21 @@ class MLBacktestEngine(ABC):
                         effective_exit = exit_price + exit_cost
                         profit = (effective_entry - effective_exit) / effective_entry
                     
+                    # Phase C7: 부분 익절 후 잔여 포지션만 청산 시 잔여 비율 기준 수익률 적용
+                    # [AUDIT] 잔여 청산 시 entry 수수료는 진입 시 이미 지불됨. exit만 잔여 notional 기준: remaining_ratio*(exit/entry)*fee_ratio.
+                    # partial_tp_fee_correct=True 시 위 정식 적용; 기본값은 기존 결과 호환 유지.
+                    remaining_ratio = position.get("remaining_ratio", 1.0)
+                    if remaining_ratio < 1.0:
+                        fee_ratio = effective_commission_rate + effective_slippage_rate
+                        if partial_tp_fee_correct:
+                            fee_impact_remaining = remaining_ratio * (exit_price / entry_price) * fee_ratio
+                        else:
+                            fee_impact_remaining = fee_ratio * (1.0 + exit_price / entry_price)
+                        if direction == "LONG":
+                            profit = (exit_price - entry_price) / entry_price * remaining_ratio - fee_impact_remaining
+                        else:
+                            profit = (entry_price - exit_price) / entry_price * remaining_ratio - fee_impact_remaining
+                    
                     # Calculate fees and slippage
                     total_fee = entry_cost + exit_cost
                     slippage_cost = abs(exit_price - current_price) if exit_price != current_price else 0.0
@@ -1453,6 +2173,14 @@ class MLBacktestEngine(ABC):
                         trade_event = "EXIT_SL"
                     elif exit_reason == "max_holding":
                         trade_event = "EXIT_MAX_HOLDING"
+                    elif exit_reason == "time_stop":
+                        trade_event = "EXIT_TIME_STOP"
+                    elif exit_reason == "break_even":
+                        trade_event = "EXIT_BREAK_EVEN"
+                    elif exit_reason == "profit_lock_tp":
+                        trade_event = "EXIT_PROFIT_LOCK_TP"
+                    elif exit_reason == "profit_lock_sl":
+                        trade_event = "EXIT_PROFIT_LOCK_SL"
                     elif exit_reason == "signal_opposite" or exit_reason == "signal_exit_th":
                         # Check if we're entering opposite position (flip)
                         if signal in ("LONG", "SHORT") and signal != direction:
@@ -1480,6 +2208,9 @@ class MLBacktestEngine(ABC):
                         profit=scaled_profit,  # 실제 반영된 수익률 (원본 profit * position_scale)
                     )
                     trades.append(trade)
+                    if exit_reason == "signal_exit_th":
+                        signal_exit_th_trade_count += 1
+                        signal_exit_th_scaled_profit_sum += scaled_profit
                     
                     # [MONITOR][EXIT] 로그 기록
                     trade_id = position.get("trade_id") if position else None
@@ -1659,6 +2390,12 @@ class MLBacktestEngine(ABC):
                         stage2_trade_for_dump = stage2_trade
                         stage2_reason_for_dump = stage2_reason
                     
+                    bars_held_exit = i - position_entry_bar_index if position_entry_bar_index is not None else 0
+                    _exit_rule = (
+                        "profit_lock"
+                        if exit_reason in ("profit_lock_tp", "profit_lock_sl")
+                        else None
+                    )
                     trade_events.append({
                         "event": trade_event,
                         "idx": i,
@@ -1672,7 +2409,28 @@ class MLBacktestEngine(ABC):
                         "pnl_change": pnl_change,
                         "balance_after": balance_after,
                         "exit_reason": exit_reason,
-                        "bars_held": i - position_entry_bar_index if position_entry_bar_index is not None else 0,
+                        "exit_rule": _exit_rule,
+                        "exit_bar_index": i,
+                        "profit_lock_take_profit": (
+                            float(profit_lock_take_profit)
+                            if exit_reason in ("profit_lock_tp", "profit_lock_sl")
+                            else None
+                        ),
+                        "profit_lock_stop_loss": (
+                            float(profit_lock_stop_loss)
+                            if exit_reason in ("profit_lock_tp", "profit_lock_sl")
+                            else None
+                        ),
+                        "bars_held": bars_held_exit,
+                        "entry_ts": position.get("entry_time"),
+                        "exit_ts": str(row_timestamp),
+                        "holding_bars": bars_held_exit,
+                        "net_return": profit,
+                        "position_scale": position.get("position_scale", 1.0),
+                        "max_favorable_excursion": position.get("max_favorable_excursion"),
+                        "max_adverse_excursion": position.get("max_adverse_excursion"),
+                        "be_armed": position.get("be_stop_triggered", False),
+                        "be_arm_ts": position.get("be_arm_ts"),
                         # Dump fields
                         "raw_signal": raw_signal,
                         "final_signal": signal,
@@ -1680,6 +2438,9 @@ class MLBacktestEngine(ABC):
                         "stage2_reason": stage2_reason_for_dump,
                         "guard_decision": guard_decision_for_dump,
                         "trade_index": len(trades) + 1,  # 1-based trade index
+                        "top1_proba": position.get("entry_top1_proba"),
+                        "top2_proba": position.get("entry_top2_proba"),
+                        "proba_gap": position.get("entry_proba_gap"),
                     })
                     
                     logger.debug(
@@ -1689,41 +2450,39 @@ class MLBacktestEngine(ABC):
                         f"pnl_change={pnl_change:.6f} balance={balance_after:.6f} "
                         f"exit_reason={exit_reason} bars_held={i - position_entry_bar_index if position_entry_bar_index is not None else 0}"
                     )
-                    
-                    trades.append(
-                        Trade(
-                            entry_time=position["entry_time"],
-                            exit_time=str(row_timestamp),
-                            entry_price=entry_price,
-                            exit_price=exit_price,
-                            direction=direction,
-                            profit=profit,
-                        )
-                    )
+                    # NOTE: Do not append a second Trade for the same exit (scaled_profit row already recorded above).
                     equity_curve.append(balance)
                     exits_executed += 1
                     if exit_reason == "tp":
                         tp_exits += 1
                     elif exit_reason == "sl":
                         sl_exits += 1
+                    elif exit_reason == "profit_lock_tp":
+                        profit_lock_tp_exits += 1
+                    elif exit_reason == "profit_lock_sl":
+                        profit_lock_sl_exits += 1
                     position = None
                     position_entry_bar_index = None
                     last_exit_bar_index = i  # Track exit for cooldown
+                    last_exit_direction = direction
+                    last_exit_reason = exit_reason if exit_reason is not None else "unknown"
                     exit_count += 1
             
             # ======================================================================
             # [ANTI-OVERTRADING] Entry logic with cooldown and hysteresis
             # ======================================================================
             if position is None and not trading_disabled:
+                blocked_by_regime_ablation_flag = False
+                blocked_by_positive_regime_flag = False
                 # Entry 시도 카운팅: signal이 LONG/SHORT인 순간부터 카운팅
                 if signal in ("LONG", "SHORT"):
                     entries_attempted += 1
                 
                 # Cooldown 체크
                 blocked_by_cooldown_flag = False
-                if cooldown_bars is not None and last_exit_bar_index is not None:
+                if effective_cooldown_bars is not None and last_exit_bar_index is not None:
                     bars_since_exit = i - last_exit_bar_index
-                    if bars_since_exit < cooldown_bars:
+                    if bars_since_exit < effective_cooldown_bars:
                         blocked_by_cooldown_flag = True
                         blocked_by_cooldown += 1  # 모니터링용 카운터
                         if signal in ("LONG", "SHORT"):
@@ -1731,11 +2490,161 @@ class MLBacktestEngine(ABC):
                             logger.debug(
                                 f"{self.log_prefix}[ENTRY BLOCKED] Cooldown: "
                                 f"signal={signal}, bars_since_exit={bars_since_exit}, "
-                                f"cooldown_bars={cooldown_bars}"
+                                f"cooldown_bars={effective_cooldown_bars}"
                             )
+
+                # 재진입 억제 (profit lock 등 조기 청산 후 과매매 완화); 기본 OFF
+                blocked_by_ot_flag = False
+                ot_cooldown_type: str | None = None
+                ot_skip_reason: str | None = None
+                any_ot_enabled = (
+                    enable_reentry_cooldown
+                    or enable_directional_cooldown
+                    or enable_post_tp_block
+                    or enable_post_sl_block
+                )
+                if signal in ("LONG", "SHORT"):
+                    blocked_by_ot_flag, ot_cooldown_type, ot_skip_reason = overtrading_reentry_block(
+                        bar_index=i,
+                        signal=signal,
+                        last_exit_bar_index=last_exit_bar_index,
+                        last_exit_direction=last_exit_direction,
+                        last_exit_reason=last_exit_reason,
+                        enable_reentry_cooldown=enable_reentry_cooldown,
+                        reentry_cooldown_bars=reentry_cooldown_bars,
+                        enable_directional_cooldown=enable_directional_cooldown,
+                        directional_cooldown_bars=directional_cooldown_bars,
+                        enable_post_tp_block=enable_post_tp_block,
+                        post_tp_block_bars=post_tp_block_bars,
+                        enable_post_sl_block=enable_post_sl_block,
+                        post_sl_block_bars=post_sl_block_bars,
+                    )
+                    if blocked_by_ot_flag:
+                        if ot_cooldown_type == "global":
+                            blocked_by_ot_global += 1
+                        elif ot_cooldown_type == "directional":
+                            blocked_by_ot_directional += 1
+                        elif ot_cooldown_type == "post_tp":
+                            blocked_by_ot_post_tp += 1
+                        elif ot_cooldown_type == "post_sl":
+                            blocked_by_ot_post_sl += 1
+                        if emit_trade_log and any_ot_enabled:
+                            trade_events.append({
+                                "event": "ENTRY_SKIPPED_OT",
+                                "idx": i,
+                                "ts": str(row_timestamp),
+                                "signal": signal,
+                                "skip_due_to_cooldown": True,
+                                "cooldown_type": ot_cooldown_type,
+                                "skip_reason": ot_skip_reason,
+                                "bars_since_exit": (
+                                    i - last_exit_bar_index
+                                    if last_exit_bar_index is not None
+                                    else None
+                                ),
+                                "last_exit_reason": last_exit_reason,
+                                "last_exit_direction": last_exit_direction,
+                            })
                 
+                if (
+                    enable_regime_filter
+                    and regime_filter_mode not in (None, "", "none")
+                    and regime_ablation_block_mask is not None
+                    and signal in ("LONG", "SHORT")
+                ):
+                    if bool(regime_ablation_block_mask[i]):
+                        blocked_by_regime_ablation_flag = True
+                        entries_blocked_by_regime_ablation += 1
+                        block_reasons["regime_ablation"] = block_reasons.get("regime_ablation", 0) + 1
+
+                blocked_by_adaptive_positive_flag = False
+                if (
+                    use_static_positive
+                    and positive_regime_filter_mode not in (None, "", "none")
+                    and positive_regime_block_mask is not None
+                    and signal in ("LONG", "SHORT")
+                    and not blocked_by_cooldown_flag
+                    and not blocked_by_ot_flag
+                    and not blocked_by_regime_ablation_flag
+                ):
+                    if bool(positive_regime_block_mask[i]):
+                        blocked_by_positive_regime_flag = True
+                        entries_blocked_by_positive_regime += 1
+                        positive_regime_blocked_entries += 1
+                        block_reasons["positive_regime"] = block_reasons.get("positive_regime", 0) + 1
+                        if emit_trade_log:
+                            rk_parts = ["", "", ""]
+                            if positive_regime_key_arr is not None and i < len(positive_regime_key_arr):
+                                rk = str(positive_regime_key_arr[i])
+                                parts = rk.split("_", 2)
+                                if len(parts) >= 3:
+                                    rk_parts = [parts[0], parts[1], parts[2]]
+                            trade_events.append(
+                                {
+                                    "event": "ENTRY_SKIPPED_POSITIVE_REGIME",
+                                    "idx": i,
+                                    "ts": str(row_timestamp),
+                                    "signal": signal,
+                                    "skip_reason": "positive_regime_filter",
+                                    "positive_regime_filter_mode": positive_regime_filter_mode,
+                                    "ema200_side": rk_parts[0],
+                                    "trend_state": rk_parts[1],
+                                    "vol_bucket": rk_parts[2],
+                                }
+                            )
+                    else:
+                        positive_regime_allowed_entries += 1
+
+                if (
+                    enable_adaptive_positive_regime_filter
+                    and adaptive_positive_regime_mode not in (None, "", "none")
+                    and adaptive_positive_final_block is not None
+                    and signal in ("LONG", "SHORT")
+                    and not blocked_by_cooldown_flag
+                    and not blocked_by_ot_flag
+                    and not blocked_by_regime_ablation_flag
+                    and not blocked_by_positive_regime_flag
+                ):
+                    if adaptive_gate_on_mask is not None and bool(adaptive_gate_on_mask[i]):
+                        adaptive_positive_gate_on_count += 1
+                    if bool(adaptive_positive_final_block[i]):
+                        blocked_by_adaptive_positive_flag = True
+                        entries_blocked_by_adaptive_positive += 1
+                        adaptive_positive_blocked_entries += 1
+                        block_reasons["adaptive_positive"] = block_reasons.get("adaptive_positive", 0) + 1
+                        if emit_trade_log:
+                            rk_parts = ["", "", ""]
+                            if adaptive_regime_key_arr is not None and i < len(adaptive_regime_key_arr):
+                                rk = str(adaptive_regime_key_arr[i])
+                                parts = rk.split("_", 2)
+                                if len(parts) >= 3:
+                                    rk_parts = [parts[0], parts[1], parts[2]]
+                            trade_events.append(
+                                {
+                                    "event": "ENTRY_SKIPPED_ADAPTIVE_POSITIVE_REGIME",
+                                    "idx": i,
+                                    "ts": str(row_timestamp),
+                                    "signal": signal,
+                                    "skip_reason": "adaptive_positive_regime_filter",
+                                    "adaptive_positive_regime_mode": adaptive_positive_regime_mode,
+                                    "adaptive_gate_on": True,
+                                    "ema200_side": rk_parts[0],
+                                    "trend_state": rk_parts[1],
+                                    "vol_bucket": rk_parts[2],
+                                }
+                            )
+                    else:
+                        adaptive_positive_allowed_entries += 1
+
                 # Entry 허용 체크
-                if signal in ("LONG", "SHORT") and not blocked_by_cooldown_flag:
+                if (
+                    signal in ("LONG", "SHORT")
+                    and not blocked_by_cooldown_flag
+                    and not blocked_by_ot_flag
+                    and not blocked_by_regime_ablation_flag
+                    and not blocked_by_positive_regime_flag
+                    and not blocked_by_adaptive_positive_flag
+                ):
                         # 히스테리시스: enter threshold 체크
                         entry_allowed = False
                         blocked_by_hysteresis = False
@@ -1744,7 +2653,11 @@ class MLBacktestEngine(ABC):
                         hysteresis_reason = ""
                         guard_scale = 1.0  # 기본값 (Guard v2 OFF일 때)
                         guard_v2_decision = "ALLOW"  # 기본값
-                        
+                        skip_entry_filter = False  # min_max_proba / max_entropy 필터 (옵션)
+                        entry_proba_gap_val = None
+                        entry_top1_val = None
+                        entry_top2_val = None
+
                         # Guard v2 디버그: proba 배열 확인
                         if guard_v2 is not None and i < 5:
                             logger.info(
@@ -1765,7 +2678,105 @@ class MLBacktestEngine(ABC):
                         if proba_long_arr is not None and proba_short_arr is not None:
                             p_long = proba_long_arr[i] if i < len(proba_long_arr) else 0.0
                             p_short = proba_short_arr[i] if i < len(proba_short_arr) else 0.0
-                            
+                            p_flat = float(1.0 - p_long - p_short)
+                            p_flat = max(0.0, min(1.0, p_flat))
+
+                            # [ENTRY FILTER] flat-proba gate (Phase C): skip when proba_flat > max_flat_proba
+                            if entry_flat_gate_enabled and p_flat > max_flat_proba:
+                                skip_entry_filter = True
+                                entries_blocked_by_flat_gate += 1
+
+                            # [ENTRY FILTER] min_max_proba / max_entropy (optional; D12: skip when use_legacy_entry_gates=False)
+                            if use_legacy_entry_gates and (min_max_proba is not None or max_entropy is not None):
+                                current_max_proba = max(p_long, p_short, p_flat)
+                                _h = 0.0
+                                for _p in (p_long, p_short, p_flat):
+                                    if _p > 1e-12:
+                                        _h -= _p * math.log2(_p)
+                                current_entropy = float(_h)
+                                if min_max_proba is not None and current_max_proba < min_max_proba:
+                                    skip_entry_filter = True
+                                    skipped_by_min_max_proba += 1
+                                if max_entropy is not None and current_entropy > max_entropy:
+                                    skip_entry_filter = True
+                                    skipped_by_max_entropy += 1
+
+                            # [ENTRY FILTER] confidence spread (Phase D10): spread = top1 - top2; require spread >= min_proba_gap
+                            _sorted_probs = sorted([p_long, p_short, p_flat], reverse=True)
+                            entry_top1_val = _sorted_probs[0]
+                            entry_top2_val = _sorted_probs[1]
+                            entry_proba_gap_val = entry_top1_val - entry_top2_val
+                            if min_proba_gap is not None and min_proba_gap > 0 and entry_proba_gap_val < min_proba_gap:
+                                skip_entry_filter = True
+                                skipped_by_proba_gap += 1
+                                spread_rejected_list.append(entry_proba_gap_val)
+
+                            # [ENTRY FILTER] Phase D11: directional gap (long_edge / short_edge)
+                            if min_directional_gap is not None and signal == "LONG":
+                                long_edge = float(p_long - p_short)
+                                if long_edge < min_directional_gap:
+                                    skip_entry_filter = True
+                                    directional_gap_fail_count += 1
+                                    long_directional_gap_fail_count += 1
+                            if min_directional_gap is not None and signal == "SHORT":
+                                short_edge = float(p_short - p_long)
+                                if short_edge < min_directional_gap:
+                                    skip_entry_filter = True
+                                    directional_gap_fail_count += 1
+                                    short_directional_gap_fail_count += 1
+
+                            # [ENTRY FILTER] Phase D11: flat suppression (p_flat <= max_flat_entry_proba)
+                            if max_flat_entry_proba is not None and p_flat > max_flat_entry_proba:
+                                skip_entry_filter = True
+                                flat_suppression_fail_count += 1
+
+                            # [ENTRY FILTER] Signal quality / confidence filter (diagnostics)
+                            if enable_confidence_filter and confidence_filter_mode not in (None, "", "none"):
+                                _cf_mode = confidence_filter_mode
+                                _cf_max_p = max(p_long, p_short)
+                                _cf_sorted = sorted([p_long, p_short, p_flat], reverse=True)
+                                _cf_margin = _cf_sorted[0] - _cf_sorted[1]
+                                _cf_h = 0.0
+                                for _cp in (p_long, p_short, p_flat):
+                                    if _cp > 1e-12:
+                                        _cf_h -= _cp * math.log(_cp)
+                                _cf_pass = True
+                                if _cf_mode == "max_proba_055":
+                                    _cf_pass = _cf_max_p >= 0.55
+                                elif _cf_mode == "max_proba_060":
+                                    _cf_pass = _cf_max_p >= 0.60
+                                elif _cf_mode == "max_proba_065":
+                                    _cf_pass = _cf_max_p >= 0.65
+                                elif _cf_mode == "max_proba_070":
+                                    _cf_pass = _cf_max_p >= 0.70
+                                elif _cf_mode == "max_proba_075":
+                                    _cf_pass = _cf_max_p >= 0.75
+                                elif _cf_mode == "margin_005":
+                                    _cf_pass = _cf_margin >= 0.05
+                                elif _cf_mode == "margin_010":
+                                    _cf_pass = _cf_margin >= 0.10
+                                elif _cf_mode == "margin_015":
+                                    _cf_pass = _cf_margin >= 0.15
+                                elif _cf_mode == "margin_020":
+                                    _cf_pass = _cf_margin >= 0.20
+                                elif _cf_mode == "entropy_120":
+                                    _cf_pass = _cf_h <= 1.20
+                                elif _cf_mode == "entropy_110":
+                                    _cf_pass = _cf_h <= 1.10
+                                elif _cf_mode == "entropy_100":
+                                    _cf_pass = _cf_h <= 1.00
+                                elif _cf_mode == "entropy_090":
+                                    _cf_pass = _cf_h <= 0.90
+                                elif _cf_mode == "hybrid_mp060_mg010":
+                                    _cf_pass = _cf_max_p >= 0.60 and _cf_margin >= 0.10
+                                elif _cf_mode == "hybrid_mp065_et110":
+                                    _cf_pass = _cf_max_p >= 0.65 and _cf_h <= 1.10
+                                elif _cf_mode == "hybrid_mg010_et110":
+                                    _cf_pass = _cf_margin >= 0.10 and _cf_h <= 1.10
+                                if not _cf_pass:
+                                    skip_entry_filter = True
+                                    entries_blocked_by_confidence += 1
+
                             # Guard v2 체크 (신호 발생 시점)
                             if guard_v2 is not None:
                                 # threshold는 long_threshold 또는 short_threshold 사용
@@ -1950,6 +2961,26 @@ class MLBacktestEngine(ABC):
                                 f"enter_long_th={enter_long_th}, enter_short_th={enter_short_th}"
                             )
                         
+                        if skip_entry_filter:
+                            entry_allowed = False
+                        if (
+                            entry_allowed
+                            and entry_min_unique_round_trips is not None
+                            and entry_urt_gate_active
+                            and entry_urt_from_state_log is not None
+                            and int(entry_urt_from_state_log) < int(entry_min_unique_round_trips)
+                        ):
+                            entry_allowed = False
+                            entries_blocked_by_urt_gate += 1
+                            block_reasons["urt_gate"] = block_reasons.get("urt_gate", 0) + 1
+                            if len(urt_gate_block_samples) < 10:
+                                urt_gate_block_samples.append(
+                                    {
+                                        "bar_index": int(i),
+                                        "urt": int(entry_urt_from_state_log),
+                                        "threshold": int(entry_min_unique_round_trips),
+                                    }
+                                )
                         if entry_allowed:
                             # ======================================================================
                             # [PATCH 1] stage2_cap 계산 스코프 통일 (ENTRY 시점에서 항상 재계산)
@@ -2143,6 +3174,87 @@ class MLBacktestEngine(ABC):
                                 hysteresis_reason = f"Stage2_CAP_BLOCK: final_scale={final_scale:.3f} < {stage2_block_if_final_scale_below:.3f}"
                                 continue  # ENTRY 차단, 다음 루프로
                             
+                            # [Regime filter] Long entry gate (EMA or Vol Compression)
+                            if regime_filter_enabled and signal == "LONG":
+                                if regime_rule in ("ema_only", "ema_plus_slope") and ema_series is not None and i < len(ema_series):
+                                    close_val = current_price
+                                    ema_i = float(ema_series.iloc[i])
+                                    if close_val <= ema_i:
+                                        entries_blocked_by_regime_price += 1
+                                        entries_blocked_by_regime += 1
+                                        continue
+                                    if regime_rule == "ema_plus_slope" and ema_slope_series is not None and i < len(ema_slope_series):
+                                        slope_i = ema_slope_series.iloc[i]
+                                        if pd.isna(slope_i) or float(slope_i) <= 0:
+                                            entries_blocked_by_regime_slope += 1
+                                            entries_blocked_by_regime += 1
+                                            continue
+                                elif regime_rule == "vol_compress" and vol_series is not None and i < len(vol_series):
+                                    vol_i = vol_series.iloc[i]
+                                    if pd.isna(vol_i) or float(vol_i) <= vol_threshold:
+                                        entries_blocked_by_regime_vol += 1
+                                        entries_blocked_by_regime += 1
+                                        continue
+                                elif regime_rule == "vol_slope" and vol_series is not None and ema_slope_series is not None and i < len(vol_series) and i < len(ema_slope_series):
+                                    vol_i = vol_series.iloc[i]
+                                    slope_i = ema_slope_series.iloc[i]
+                                    compress = pd.isna(vol_i) or float(vol_i) <= vol_threshold
+                                    slope_ok = not pd.isna(slope_i) and float(slope_i) > 0
+                                    allow_entry = (not compress) or slope_ok
+                                    if not allow_entry:
+                                        entries_blocked_by_regime_vol_slope += 1
+                                        entries_blocked_by_regime += 1
+                                        continue
+                                elif regime_rule == "vol_breakout" and compress_series is not None and decompress_event_series is not None and ema_series is not None and i < len(compress_series) and i < len(decompress_event_series) and i < len(ema_series):
+                                    compress_i = bool(compress_series.iloc[i])
+                                    decompress_i = bool(decompress_event_series.iloc[i])
+                                    if compress_i:
+                                        entries_blocked_by_regime_vol += 1
+                                        entries_blocked_by_regime += 1
+                                        continue
+                                    if decompress_i:
+                                        ema_i = ema_series.iloc[i]
+                                        ema_ok = not pd.isna(ema_i) and current_price > float(ema_i)
+                                        if breakout_mode == "ema":
+                                            breakout_ok = ema_ok
+                                        else:
+                                            rh_i = rolling_high_series.iloc[i] if rolling_high_series is not None and i < len(rolling_high_series) else None
+                                            high_break = rh_i is not None and not pd.isna(rh_i) and current_price > float(rh_i)
+                                            breakout_ok = ema_ok and high_break
+                                        if not breakout_ok:
+                                            entries_blocked_by_regime_vol_breakout += 1
+                                            entries_blocked_by_regime += 1
+                                            continue
+                                        entries_allowed_on_decompress += 1
+                                    # else: non-compress and not decompress_event -> allow as usual
+                                elif regime_rule == "flat_slope" and ema_slope_series is not None and i < len(ema_slope_series):
+                                    slope_i = ema_slope_series.iloc[i]
+                                    if pd.isna(slope_i) or abs(float(slope_i)) <= slope_threshold:
+                                        entries_blocked_by_regime_flat_slope += 1
+                                        entries_blocked_by_regime += 1
+                                        continue
+                                elif regime_rule == "downtrend_block" and ema_series is not None and ema_slope_series is not None and i < len(ema_series) and i < len(ema_slope_series):
+                                    ema_i = ema_series.iloc[i]
+                                    slope_i = ema_slope_series.iloc[i]
+                                    below_ema = pd.isna(ema_i) or current_price <= float(ema_i)
+                                    slope_non_positive = not pd.isna(slope_i) and float(slope_i) <= 0
+                                    is_downtrend = below_ema and slope_non_positive
+                                    if is_downtrend:
+                                        entries_blocked_by_regime_downtrend += 1
+                                        entries_blocked_by_regime += 1
+                                        continue
+                                elif regime_rule == "proba_quantile" and proba_long_arr is not None and q_series is not None and i < len(proba_long_arr) and i < len(q_series):
+                                    p_i = float(proba_long_arr[i])
+                                    q_th_i = q_series.iloc[i]
+                                    if pd.isna(q_th_i):
+                                        gate = p_floor
+                                    else:
+                                        gate = max(p_floor, float(q_th_i))
+                                    if p_i < gate:
+                                        entries_blocked_by_regime_proba_quantile += 1
+                                        entries_blocked_by_regime += 1
+                                        continue
+                            
                             # [정밀 분석] ENTRY 시점 final_scale 및 stage2_cap 수집 (entry_allowed일 때만)
                             if entry_allowed:
                                 final_scale_at_entry.append(final_scale)
@@ -2167,20 +3279,64 @@ class MLBacktestEngine(ABC):
                                 }
                                 stage2_score_samples.append(sample)
                             
-                            # trade_id 할당
+                            # [Position scaling] Proba-based scale (LONG only); combine with final_scale
+                            effective_position_scale = final_scale
+                            if position_scaling_enabled and direction == "LONG":
+                                p_for_scale = float(p_long) if p_long is not None else 0.0
+                                proba_scale = _position_scale_from_proba(
+                                    p_for_scale,
+                                    position_scaling_mode,
+                                    position_p_floor,
+                                    position_p_full,
+                                    position_size_min,
+                                    position_size_max,
+                                    position_p_mid,
+                                    position_k,
+                                )
+                                entries_scaled_count += 1
+                                bin_key = _scale_bin_key(proba_scale)
+                                scale_bins_counts[bin_key] = scale_bins_counts.get(bin_key, 0) + 1
+                                if proba_scale <= 0.0:
+                                    # 방어적 no-op: entry skip, 통계만 기록
+                                    continue
+                                entries_scaled_applied_count += 1
+                                scale_sum += proba_scale
+                                scale_sq_sum += proba_scale * proba_scale
+                                scale_min_val = min(scale_min_val, proba_scale)
+                                scale_max_val = max(scale_max_val, proba_scale)
+                                effective_position_scale = final_scale * proba_scale
+                            
+                            # trade_id 할당 (scale<=0 continue 이후이므로 실제 진입만 ID 부여)
                             trade_id = next_trade_id
                             next_trade_id += 1
                             
+                            if entry_proba_gap_val is not None:
+                                spread_executed_list.append(entry_proba_gap_val)
+                            entry_dir_proba_val: float | None = None
+                            if direction == "LONG" and proba_long_arr is not None and i < len(proba_long_arr):
+                                entry_dir_proba_val = float(proba_long_arr[i])
+                            elif direction == "SHORT" and proba_short_arr is not None and i < len(proba_short_arr):
+                                entry_dir_proba_val = float(proba_short_arr[i])
                             position = {
                                 "side": direction,  # direction 사용 (signal과 동일해야 함)
                                 "entry_price": current_price,
                                 "entry_time": str(row_timestamp),
-                                "position_scale": final_scale,  # final_scale 저장 (Guard v2 * Stage-2)
+                                "entry_dir_proba": entry_dir_proba_val,
+                                "position_scale": effective_position_scale,  # Guard v2 * Stage-2 * proba_scale(if enabled)
                                 "stage2_cap": stage2_cap if use_stage2 else 1.0,  # CAP breakdown용
                                 "final_scale": final_scale,  # CAP breakdown용
                                 "guard_scale": guard_scale,  # Guard v2 breakdown용
                                 "entry_idx": i,  # CAP breakdown용
                                 "trade_id": trade_id,  # ENTRY/EXIT 연결용
+                                "partial_tp_done": False,  # Phase C7: 1 trade당 1회 부분 익절
+                                "remaining_ratio": 1.0,  # Phase C7: 부분 익절 후 잔여 비율
+                                "max_unrealized_return": 0.0,  # Phase C9: break-even용
+                                "be_stop_triggered": False,  # Phase C9: break-even stop 활성화 여부
+                                "max_favorable_excursion": None,  # trade log MFE
+                                "max_adverse_excursion": None,  # trade log MAE
+                                "entry_top1_proba": entry_top1_val,
+                                "entry_top2_proba": entry_top2_val,
+                                "entry_proba_gap": entry_proba_gap_val,
                             }
                             
                             # [MONITOR][ENTRY] 로그 기록
@@ -2356,8 +3512,13 @@ class MLBacktestEngine(ABC):
                                 f"direction={direction} entry_price={current_price:.2f} fee={entry_cost:.4f} "
                                 f"balance={balance:.6f}"
                             )
-                elif signal in ("LONG", "SHORT") and blocked_by_cooldown_flag:
-                    # Entry blocked by cooldown (already counted above)
+                elif signal in ("LONG", "SHORT") and (
+                    blocked_by_cooldown_flag
+                    or blocked_by_ot_flag
+                    or blocked_by_regime_ablation_flag
+                    or blocked_by_positive_regime_flag
+                ):
+                    # Entry blocked by cooldown, overtrading, regime ablation, or positive-regime gate
                     pass
         
         # Close remaining position at end (forced EOD close)
@@ -2422,6 +3583,9 @@ class MLBacktestEngine(ABC):
             
             equity_curve.append(balance)
             exits_executed += 1
+            last_exit_bar_index = len(df) - 1
+            last_exit_direction = direction
+            last_exit_reason = "eod_forced"
             
             # Update StrategyGuard with completed trade
             if guard is not None and profit is not None:
@@ -2441,8 +3605,12 @@ class MLBacktestEngine(ABC):
                 )
         
         # Compute statistics
-        from src.backtest.engine import _compute_trade_stats
+        from src.backtest.engine import _compute_trade_stats, dedupe_trades_round_trips
+
         stats = _compute_trade_stats(trades)
+        deduped_trades = dedupe_trades_round_trips(trades)
+        unique_round_trips = len(deduped_trades)
+        duplicate_trade_rows = len(trades) - unique_round_trips
         
         # Calculate max drawdown
         if equity_curve:
@@ -2626,7 +3794,8 @@ class MLBacktestEngine(ABC):
         )
         logger.info(
             f"{self.log_prefix}[TRADE COUNT SUMMARY] total_exits={exits_executed} "
-            f"(signal_exit={exits_executed - tp_exits - sl_exits}, tp={tp_exits}, sl={sl_exits})"
+            f"(signal_exit={exits_executed - tp_exits - sl_exits - profit_lock_tp_exits - profit_lock_sl_exits}, "
+            f"tp={tp_exits}, sl={sl_exits}, profit_lock_tp={profit_lock_tp_exits}, profit_lock_sl={profit_lock_sl_exits})"
         )
         logger.info("=" * 60)
         
@@ -2682,13 +3851,274 @@ class MLBacktestEngine(ABC):
             max_consecutive_wins=stats["max_consecutive_wins"],
             max_consecutive_losses=stats["max_consecutive_losses"],
         )
-        
+        result["unique_round_trips"] = unique_round_trips
+        result["duplicate_trade_rows"] = duplicate_trade_rows
+        result["signal_exit_th_count"] = signal_exit_th_trade_count
+        result["signal_exit_th_total_profit"] = signal_exit_th_scaled_profit_sum
+        result["signal_exit_th_loss_aux_applied"] = signal_exit_th_loss_aux_applied
+
         # Add Stage-2 statistics (optional fields)
         result["stage2_no_trade_count"] = stage2_no_trade_count
         result["stage2_trade_count"] = stage2_trade_count
         result["stage2_exit_on_flat_count"] = stage2_exit_on_flat_count
         result["block_reasons"] = block_reasons
-        
+        result["filters_applied"] = {
+            "min_max_proba": min_max_proba,
+            "max_entropy": max_entropy,
+            "min_proba_gap": min_proba_gap,
+            "min_directional_gap": min_directional_gap,
+            "max_flat_entry_proba": max_flat_entry_proba,
+            "min_hold": effective_min_hold_bars,
+            "cooldown": effective_cooldown_bars,
+        }
+        result["filter_skip_stats"] = {
+            "by_min_max_proba": skipped_by_min_max_proba,
+            "by_max_entropy": skipped_by_max_entropy,
+            "by_proba_gap": skipped_by_proba_gap,
+            "by_directional_gap": directional_gap_fail_count,
+            "by_flat_suppression": flat_suppression_fail_count,
+        }
+        result["directional_gap_fail_count"] = directional_gap_fail_count
+        result["flat_suppression_fail_count"] = flat_suppression_fail_count
+        result["long_directional_gap_fail_count"] = long_directional_gap_fail_count
+        result["short_directional_gap_fail_count"] = short_directional_gap_fail_count
+        result["filter_block_breakdown"] = {
+            "by_min_max_proba": skipped_by_min_max_proba,
+            "by_max_entropy": skipped_by_max_entropy,
+            "by_proba_gap": skipped_by_proba_gap,
+            "by_directional_gap": directional_gap_fail_count,
+            "by_flat_suppression": flat_suppression_fail_count,
+            "long_directional_gap_fail": long_directional_gap_fail_count,
+            "short_directional_gap_fail": short_directional_gap_fail_count,
+        }
+        result["filtered_trade_count"] = skipped_by_proba_gap
+        total_entry_attempts = entries_attempted
+        result["filtered_trade_ratio"] = (skipped_by_proba_gap / total_entry_attempts) if total_entry_attempts and total_entry_attempts > 0 else 0.0
+        result["mean_spread_of_executed_trades"] = float(sum(spread_executed_list) / len(spread_executed_list)) if spread_executed_list else None
+        result["mean_spread_of_rejected_trades"] = float(sum(spread_rejected_list) / len(spread_rejected_list)) if spread_rejected_list else None
+
+        # Regime filter (EMA200) 통계
+        result["regime_enabled"] = regime_filter_enabled
+        result["regime_span"] = regime_ema_span
+        result["regime_rule"] = regime_rule if regime_filter_enabled else None
+        result["regime_slope_lookback"] = regime_slope_lookback if regime_filter_enabled and regime_rule in ("ema_only", "ema_plus_slope", "vol_slope", "flat_slope", "downtrend_block") else None
+        result["vol_window"] = vol_window if regime_filter_enabled and regime_rule in ("vol_compress", "vol_slope", "vol_breakout") else None
+        result["vol_threshold"] = vol_threshold if regime_filter_enabled and regime_rule in ("vol_compress", "vol_slope", "vol_breakout") else None
+        result["breakout_lookback"] = breakout_lookback if regime_filter_enabled and regime_rule == "vol_breakout" else None
+        result["breakout_mode"] = breakout_mode if regime_filter_enabled and regime_rule == "vol_breakout" else None
+        result["slope_threshold"] = slope_threshold if regime_filter_enabled and regime_rule == "flat_slope" else None
+        result["q_window"] = q_window if regime_filter_enabled and regime_rule == "proba_quantile" else None
+        result["q"] = q if regime_filter_enabled and regime_rule == "proba_quantile" else None
+        result["p_floor"] = p_floor if regime_filter_enabled and regime_rule == "proba_quantile" else None
+        result["q_threshold_mean"] = float(q_series.dropna().mean()) if regime_filter_enabled and regime_rule == "proba_quantile" and q_series is not None and q_series.notna().any() else None
+        result["entry_price_basis"] = "close" if regime_filter_enabled else None
+        result["ema_align_basis"] = "same_bar" if regime_filter_enabled and regime_rule in ("ema_only", "ema_plus_slope") else None
+        if regime_filter_enabled and ema_series is not None and len(ema_series) == len(df):
+            pct_above = float((df["close"] > ema_series).sum() / len(df))
+            result["pct_above_ema200"] = pct_above
+        else:
+            result["pct_above_ema200"] = None
+        if regime_filter_enabled and regime_rule == "vol_compress" and vol_series is not None and len(vol_series) == len(df):
+            result["pct_compress"] = float((vol_series <= vol_threshold).sum() / len(df))
+        elif regime_filter_enabled and regime_rule == "vol_breakout" and vol_series is not None and len(vol_series) == len(df):
+            result["pct_compress"] = float((vol_series < vol_threshold).sum() / len(df))
+        else:
+            result["pct_compress"] = None
+        if regime_filter_enabled and regime_rule == "vol_slope" and vol_series is not None and ema_slope_series is not None and len(vol_series) == len(df) and len(ema_slope_series) == len(df):
+            compress = vol_series <= vol_threshold
+            slope_positive = ema_slope_series > 0
+            block_mask = compress & (~slope_positive)
+            result["pct_vol_slope_block"] = float(block_mask.sum() / len(df))
+        else:
+            result["pct_vol_slope_block"] = None
+        if regime_filter_enabled and regime_rule == "flat_slope" and ema_slope_series is not None and len(ema_slope_series) == len(df):
+            flat_mask = ema_slope_series.isna() | (ema_slope_series.abs() <= slope_threshold)
+            result["pct_flat_slope_block"] = float(flat_mask.sum() / len(df))
+        else:
+            result["pct_flat_slope_block"] = None
+        if regime_filter_enabled and regime_rule == "downtrend_block" and ema_series is not None and ema_slope_series is not None and len(ema_series) == len(df) and len(ema_slope_series) == len(df):
+            below_ema = df["close"] <= ema_series
+            downtrend_mask = below_ema & (~ema_slope_series.isna()) & (ema_slope_series <= 0)
+            result["pct_downtrend_block"] = float(downtrend_mask.sum() / len(df))
+        else:
+            result["pct_downtrend_block"] = None
+        result["entries_blocked_by_regime"] = entries_blocked_by_regime
+        result["enable_regime_filter"] = enable_regime_filter
+        result["regime_filter_mode"] = regime_filter_mode if enable_regime_filter else "none"
+        result["regime_combo_block_keys"] = (
+            regime_combo_block_keys
+            if enable_regime_filter and regime_filter_mode == "combo_f5_worst_keys"
+            else None
+        )
+        result["entries_blocked_by_regime_ablation"] = entries_blocked_by_regime_ablation
+        result["enable_positive_regime_filter"] = enable_positive_regime_filter
+        result["positive_regime_filter_mode"] = (
+            positive_regime_filter_mode if enable_positive_regime_filter else "none"
+        )
+        result["entries_blocked_by_positive_regime"] = entries_blocked_by_positive_regime
+        result["positive_regime_allowed_entries"] = positive_regime_allowed_entries
+        result["positive_regime_blocked_entries"] = positive_regime_blocked_entries
+        result["enable_adaptive_positive_regime_filter"] = enable_adaptive_positive_regime_filter
+        result["adaptive_positive_regime_mode"] = (
+            adaptive_positive_regime_mode if enable_adaptive_positive_regime_filter else "none"
+        )
+        result["adaptive_positive_gate_on_count"] = adaptive_positive_gate_on_count
+        result["entries_blocked_by_adaptive_positive"] = entries_blocked_by_adaptive_positive
+        result["adaptive_positive_allowed_entries"] = adaptive_positive_allowed_entries
+        result["adaptive_positive_blocked_entries"] = adaptive_positive_blocked_entries
+        result["enable_confidence_filter"] = enable_confidence_filter
+        result["confidence_filter_mode"] = confidence_filter_mode if enable_confidence_filter else "none"
+        result["entries_blocked_by_confidence"] = entries_blocked_by_confidence
+        result["entries_blocked_by_regime_price"] = entries_blocked_by_regime_price if regime_filter_enabled else None
+        result["entries_blocked_by_regime_slope"] = entries_blocked_by_regime_slope if regime_filter_enabled else None
+        result["entries_blocked_by_regime_vol"] = entries_blocked_by_regime_vol if regime_filter_enabled else None
+        result["entries_blocked_by_regime_vol_slope"] = entries_blocked_by_regime_vol_slope if regime_filter_enabled else None
+        result["entries_blocked_by_regime_vol_breakout"] = entries_blocked_by_regime_vol_breakout if regime_filter_enabled else None
+        result["entries_allowed_on_decompress"] = entries_allowed_on_decompress if regime_filter_enabled else None
+        result["entries_blocked_by_regime_flat_slope"] = entries_blocked_by_regime_flat_slope if regime_filter_enabled else None
+        result["entries_blocked_by_regime_downtrend"] = entries_blocked_by_regime_downtrend if regime_filter_enabled else None
+        result["entries_blocked_by_regime_proba_quantile"] = entries_blocked_by_regime_proba_quantile if regime_filter_enabled else None
+        result["entry_flat_gate_enabled"] = entry_flat_gate_enabled
+        result["entries_blocked_by_flat_gate"] = entries_blocked_by_flat_gate if entry_flat_gate_enabled else None
+        result["pct_flat_gate_block"] = (entries_blocked_by_flat_gate / entries_attempted) if entry_flat_gate_enabled and entries_attempted > 0 else None
+        result["entries_blocked_by_urt_gate"] = (
+            None
+            if entry_min_unique_round_trips is not None and not entry_urt_gate_active
+            else (entries_blocked_by_urt_gate if entry_min_unique_round_trips is not None else None)
+        )
+        result["pct_urt_gate_block"] = (
+            None
+            if entry_min_unique_round_trips is not None and not entry_urt_gate_active
+            else (
+                (entries_blocked_by_urt_gate / entries_attempted)
+                if entry_min_unique_round_trips is not None and entries_attempted > 0
+                else None
+            )
+        )
+        result["entry_urt_from_state_log"] = (
+            entry_urt_from_state_log if entry_min_unique_round_trips is not None else None
+        )
+        result["entry_urt_gate_active"] = (
+            bool(entry_urt_gate_active) if entry_min_unique_round_trips is not None else None
+        )
+        result["entry_urt_state_log_path"] = (
+            str(entry_urt_state_log_resolved)
+            if entry_min_unique_round_trips is not None and entry_urt_state_log_resolved is not None
+            else None
+        )
+        result["entry_urt_gate_value_source"] = (
+            entry_urt_gate_value_source if entry_min_unique_round_trips is not None else None
+        )
+        result["entry_urt_gate_block_samples"] = (
+            urt_gate_block_samples if entry_min_unique_round_trips is not None else None
+        )
+        result["max_flat_proba"] = max_flat_proba if entry_flat_gate_enabled else None
+        attempted_before_regime = entries_blocked_by_regime + entry_count_long
+        result["blocked_ratio"] = (
+            entries_blocked_by_regime / attempted_before_regime
+            if attempted_before_regime > 0 else 0.0
+        )
+        result["pct_proba_quantile_block"] = (
+            entries_blocked_by_regime_proba_quantile / attempted_before_regime
+            if regime_filter_enabled and regime_rule == "proba_quantile" and attempted_before_regime > 0 else None
+        )
+        # Position scaling (proba-based) result keys
+        result["position_scaling"] = position_scaling_mode if position_scaling_enabled else "off"
+        result["position_p_floor"] = position_p_floor if position_scaling_enabled else None
+        result["position_p_full"] = position_p_full if position_scaling_enabled else None
+        result["position_size_min"] = position_size_min if position_scaling_enabled else None
+        result["position_size_max"] = position_size_max if position_scaling_enabled else None
+        result["position_p_mid"] = position_p_mid if position_scaling_enabled and position_scaling_mode == "sigmoid" else None
+        result["position_k"] = position_k if position_scaling_enabled and position_scaling_mode == "sigmoid" else None
+        result["entries_scaled_count"] = entries_scaled_count if position_scaling_enabled else None
+        result["entries_scaled_applied_count"] = entries_scaled_applied_count if position_scaling_enabled else None
+        result["scale_mean"] = (scale_sum / entries_scaled_applied_count) if position_scaling_enabled and entries_scaled_applied_count > 0 else None
+        result["scale_min"] = scale_min_val if position_scaling_enabled and entries_scaled_applied_count > 0 else None
+        result["scale_max"] = scale_max_val if position_scaling_enabled and entries_scaled_applied_count > 0 else None
+        result["scale_bins"] = dict(scale_bins_counts) if position_scaling_enabled else None
+        # Early exit stats
+        result["early_exit_enabled"] = early_exit_enabled
+        result["early_exit_count"] = early_exit_count if early_exit_enabled else None
+        num_exits = len(trades)
+        result["early_exit_rate"] = (early_exit_count / num_exits) if early_exit_enabled and num_exits > 0 else None
+        result["early_exit_lookback"] = early_exit_lookback if early_exit_enabled else None
+        result["early_exit_p_floor"] = early_exit_p_floor if early_exit_enabled else None
+        result["early_exit_bad_k"] = early_exit_bad_k if early_exit_enabled else None
+        result["flat_exit_trigger_count"] = flat_exit_trigger_count if (early_exit_enabled and flat_exit_aware_enabled) else None
+        result["pct_flat_exit_adjusted"] = (flat_exit_adjusted_count / total_exit_evaluations) if (early_exit_enabled and flat_exit_aware_enabled and total_exit_evaluations > 0) else None
+        result["time_stop_enabled"] = time_stop_enabled
+        result["time_stop_bars"] = time_stop_bars if time_stop_enabled else None
+        result["time_stop_exit_count"] = time_stop_exit_count if time_stop_enabled else None
+        result["pct_time_stop_exits"] = (time_stop_exit_count / num_exits) if time_stop_enabled and num_exits > 0 else None
+
+        # Partial take-profit (Phase C7): 타입 정규화 (docs/phase_c7_summary.md)
+        # partial_tp=on: count(int>=0), pct(float), avg_pnl(float or 0.0). partial_tp=off: count=0, pct=0.0, avg_pnl=None
+        result["partial_tp_enabled"] = partial_tp_enabled
+        result["partial_tp_threshold"] = partial_tp_threshold if partial_tp_enabled else None
+        result["partial_tp_ratio"] = partial_tp_ratio if partial_tp_enabled else None
+        result["partial_tp_count"] = partial_tp_count  # 항상 int (off 시 0)
+        result["pct_partial_tp"] = (partial_tp_count / num_exits) if num_exits > 0 else 0.0  # 항상 float (off 시 0.0)
+        result["partial_tp_avg_pnl"] = (
+            (sum(partial_tp_pnl_list) / len(partial_tp_pnl_list))
+            if partial_tp_pnl_list
+            else (0.0 if partial_tp_enabled else None)  # on & count==0 -> 0.0, off -> None
+        )
+
+        # Break-even stop (Phase C9)
+        result["break_even_stop_enabled"] = break_even_stop_enabled
+        result["be_threshold"] = be_threshold if break_even_stop_enabled else None
+        result["break_even_exit_count"] = break_even_exit_count if break_even_stop_enabled else None
+        result["pct_break_even_exits"] = (
+            (break_even_exit_count / num_exits) if break_even_stop_enabled and num_exits > 0 else None
+        )
+        result["profit_lock_enabled"] = enable_profit_lock_exit
+        result["profit_lock_take_profit"] = profit_lock_take_profit if enable_profit_lock_exit else None
+        result["profit_lock_stop_loss"] = profit_lock_stop_loss if enable_profit_lock_exit else None
+        result["profit_lock_max_bars"] = profit_lock_max_bars if enable_profit_lock_exit else None
+        result["profit_lock_conservative_intrabar"] = (
+            profit_lock_conservative_intrabar if enable_profit_lock_exit else None
+        )
+        result["profit_lock_tp_exits"] = profit_lock_tp_exits
+        result["profit_lock_sl_exits"] = profit_lock_sl_exits
+        result["overtrading_control"] = {
+            "enable_reentry_cooldown": enable_reentry_cooldown,
+            "reentry_cooldown_bars": reentry_cooldown_bars if enable_reentry_cooldown else None,
+            "enable_directional_cooldown": enable_directional_cooldown,
+            "directional_cooldown_bars": directional_cooldown_bars if enable_directional_cooldown else None,
+            "enable_post_tp_block": enable_post_tp_block,
+            "post_tp_block_bars": post_tp_block_bars if enable_post_tp_block else None,
+            "enable_post_sl_block": enable_post_sl_block,
+            "post_sl_block_bars": post_sl_block_bars if enable_post_sl_block else None,
+            "blocked_entry_global": blocked_by_ot_global,
+            "blocked_entry_directional": blocked_by_ot_directional,
+            "blocked_entry_post_tp": blocked_by_ot_post_tp,
+            "blocked_entry_post_sl": blocked_by_ot_post_sl,
+        }
+        if emit_trade_log:
+            result["trade_events"] = trade_events
+
+        # Exit reason breakdown: time_stop / early_exit / break_even / normal_exit (상호배타)
+        exit_reason_counts: dict[str, int] = {"time_stop": 0, "early_exit": 0, "break_even": 0, "normal_exit": 0}
+        exit_reason_pnls: dict[str, list[float]] = {"time_stop": [], "early_exit": [], "break_even": [], "normal_exit": []}
+        for event in trade_events:
+            if event.get("event", "").startswith("EXIT") and "exit_reason" in event:
+                reason = event.get("exit_reason") or "normal_exit"
+                if reason == "time_stop":
+                    bucket = "time_stop"
+                elif reason == "early_exit":
+                    bucket = "early_exit"
+                elif reason == "break_even":
+                    bucket = "break_even"
+                else:
+                    bucket = "normal_exit"
+                exit_reason_counts[bucket] = exit_reason_counts.get(bucket, 0) + 1
+                if "profit" in event and event["profit"] is not None:
+                    exit_reason_pnls.setdefault(bucket, []).append(float(event["profit"]))
+        result["exit_reason_counts"] = exit_reason_counts
+        result["exit_reason_avg_pnl"] = {
+            k: (sum(v) / len(v) if v else None) for k, v in exit_reason_pnls.items()
+        }
+
         # ======================================================================
         # [정밀 분석] 통계 출력 (요청 1-3)
         # ======================================================================
@@ -3015,6 +4445,8 @@ class MLBacktestEngine(ABC):
             "anti_overtrading": {
                 "min_hold_bars": min_hold_bars,
                 "cooldown_bars": cooldown_bars,
+                "min_hold_effective": effective_min_hold_bars,
+                "cooldown_effective": effective_cooldown_bars,
             },
             "guard_v2": {
                 "use_strategy_guard_v2": use_strategy_guard_v2,
@@ -3027,6 +4459,9 @@ class MLBacktestEngine(ABC):
             },
         }
         
+        # 백테스트 성과 지표 (summary JSON 및 Discord 리포트용)
+        equity_curve = result.get("equity_curve") if isinstance(result, dict) else getattr(result, "equity_curve", None)
+        final_equity = float(equity_curve[-1]) if equity_curve and len(equity_curve) > 0 else None
         monitor.save_summary(
             total_checks=total_checks,
             entries_attempted=entries_attempted,
@@ -3036,6 +4471,11 @@ class MLBacktestEngine(ABC):
             blocked_by_cooldown=blocked_by_cooldown,
             blocked_by_guard_hard=blocked_by_guard_hard,
             config_snapshot=config_snapshot,
+            total_return=result.get("total_return") if isinstance(result, dict) else getattr(result, "total_return", None),
+            max_drawdown=result.get("max_drawdown") if isinstance(result, dict) else getattr(result, "max_drawdown", None),
+            win_rate=result.get("win_rate") if isinstance(result, dict) else getattr(result, "win_rate", None),
+            avg_profit=result.get("avg_profit") if isinstance(result, dict) else getattr(result, "avg_profit", None),
+            equity_final=final_equity,
         )
         monitor.close()
         

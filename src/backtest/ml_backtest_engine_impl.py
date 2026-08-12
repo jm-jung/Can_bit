@@ -24,9 +24,25 @@ from src.strategies.ml_signal_policy import (
     ActionDecisionConfig,
     ActionDecisionState,
     decide_action_3class,
+    decide_action_directional_edge,
+    decide_action_directional_edge_margin_conf,
+)
+from src.strategies.signal_exit_th_activation import (
+    LOSS_AUX_DELTA_P,
+    LOSS_AUX_MAE_CUT,
+    LOSS_AUX_SKIP_IF_DELTA_UNREAL_POSITIVE,
+    append_state_log_activation,
+    compute_runtime_trades_60d,
+    compute_shadow_rt_a_on,
+    compute_vol_bucket,
+    load_latest_entry_urt_snapshot,
+    load_latest_window_stats,
+    resolve_loss_aux_gate,
+    should_activate_rt_a,
 )
 
 logger = logging.getLogger(__name__)
+STATE_LOG_PATH = Path("data/diagnostics/fr2/state_log.csv")
 
 
 class XgbBacktestEngine(MLBacktestEngine):
@@ -304,18 +320,27 @@ class LstmAttnBacktestEngine(MLBacktestEngine):
             return proba_long_cache, proba_short_cache, df_with_proba
         
         # Otherwise, load from cache file
+        use_events: bool | None = None
+        tcn_preset: str | None = getattr(self, "tcn_preset", None)
+        if self.strategy_name == "ml_tcn" and not tcn_preset:
+            import os
+            ev = os.environ.get("USE_EVENTS_FOR_TCN", "").strip().lower()
+            use_events = ev not in ("0", "false", "no")
         cache_path = _get_cache_path(
             strategy_name=self.strategy_name,
             symbol=self.symbol,
             timeframe=self.timeframe,
-            feature_preset="base",  # LSTM doesn't use feature_preset
+            feature_preset="base",
+            use_events=use_events,
+            tcn_preset=tcn_preset if self.strategy_name == "ml_tcn" else None,
         )
-        
+
         if not cache_path.exists():
+            hint = f" --preset {tcn_preset}" if tcn_preset else ""
             raise FileNotFoundError(
                 f"{self.log_prefix} Probability cache not found: {cache_path}. "
                 f"Please run: python -m src.optimization.ml_proba_cache "
-                f"--strategy {self.strategy_name} --symbol {self.symbol} --timeframe {self.timeframe}"
+                f"--strategy {self.strategy_name} --symbol {self.symbol} --timeframe {self.timeframe}{hint}"
             )
         
         logger.info(f"{self.log_prefix} Loading predictions from cache: {cache_path}")
@@ -413,6 +438,12 @@ class LstmAttnBacktestEngine(MLBacktestEngine):
         flat_max_th: Optional[float] = None,
         margin_th: Optional[float] = None,
         apply_confirmation_to_flips: bool = True,
+        # D12/D13: decision mode (argmax vs directional edge vs directional_edge_margin_conf)
+        decision_mode: str = "argmax",
+        min_directional_edge: Optional[float] = None,
+        require_direction_gt_flat: bool = True,
+        min_side_flat_margin: Optional[float] = None,
+        min_confidence: Optional[float] = None,
         # Stage-2 parameters
         use_stage2: bool = False,
         stage2_trade_th: Optional[float] = None,
@@ -463,7 +494,24 @@ class LstmAttnBacktestEngine(MLBacktestEngine):
         # Track reason codes for logging
         reason_code_counts: dict[str, int] = {}
         action_counts: dict[str, int] = {"LONG": 0, "SHORT": 0, "FLAT": 0}
-        
+        # D12/D13: directional mode stats (for return)
+        directional_rule_reject_count = 0
+        use_directional_mode = decision_mode in (
+            "directional_edge",
+            "directional_edge_gated",
+            "directional_edge_margin_conf",
+        )
+        if use_directional_mode:
+            min_edge = min_directional_edge if min_directional_edge is not None else 0.04
+        else:
+            min_edge = 0.0
+        long_edge_sum_entry = 0.0
+        long_edge_entry_count = 0
+        short_edge_sum_entry = 0.0
+        short_edge_entry_count = 0
+        pflat_sum_rejected = 0.0
+        pflat_rejected_count = 0
+
         # Sample logging: first 5, random 5, and trade events
         sample_indices = set(range(min(5, n)))
         if n > 10:
@@ -472,7 +520,7 @@ class LstmAttnBacktestEngine(MLBacktestEngine):
             random_indices = np.random.choice(range(5, n), size=min(5, n - 5), replace=False)
             sample_indices.update(random_indices)
         
-        # Generate signals using SSOT function
+        # Generate signals using SSOT or D12 directional edge
         for i in range(n):
             p_long = proba_long_padded[i]
             p_short = proba_short_padded[i]
@@ -483,63 +531,93 @@ class LstmAttnBacktestEngine(MLBacktestEngine):
             if "timestamp" in df.columns:
                 ts = str(df.iloc[i]["timestamp"])
             
-            # ======================================================================
-            # [ANTI-OVERTRADING] No-trade zone 확대
-            # ======================================================================
-            # flat_max_th: max(proba_long, proba_short) < flat_max_th 이면 FLAT
-            if flat_max_th is not None:
-                max_proba = max(p_long, p_short)
-                if max_proba < flat_max_th:
-                    signals[i] = "HOLD"
-                    reason_code_counts["FLAT_MAX_TH"] = reason_code_counts.get("FLAT_MAX_TH", 0) + 1
-                    action_counts["FLAT"] = action_counts.get("FLAT", 0) + 1
-                    continue
-            
-            # margin_th: |proba_long - proba_short| < margin_th 이면 FLAT
-            if margin_th is not None:
-                proba_diff = abs(p_long - p_short)
-                if proba_diff < margin_th:
-                    signals[i] = "HOLD"
-                    reason_code_counts["MARGIN_TH"] = reason_code_counts.get("MARGIN_TH", 0) + 1
-                    action_counts["FLAT"] = action_counts.get("FLAT", 0) + 1
-                    continue
-            
-            # Update state
-            state.current_idx = i
-            
-            # Decide action using SSOT
-            result = decide_action_3class(
-                proba={"p_long": p_long, "p_flat": p_flat, "p_short": p_short},
-                config=config,
-                state=state,
-                idx=i,
-                ts=ts,
-            )
-            
-            # Map FLAT to HOLD for compatibility
-            action = result.action
-            if action == "FLAT":
-                action = "HOLD"
-            
-            signals[i] = action
-            
-            # Track counts
-            reason_code = result.reason_code
-            reason_code_counts[reason_code] = reason_code_counts.get(reason_code, 0) + 1
-            action_counts[action] = action_counts.get(action, 0) + 1
-            
-            # Sample logging (DEBUG level)
-            if i in sample_indices:
-                logger.debug(
-                    f"{self.log_prefix}[POLICY] idx={i} ts={ts} "
-                    f"pL={p_long:.4f} pF={p_flat:.4f} pS={p_short:.4f} "
-                    f"top1={result.debug_info['top1_label']}({result.debug_info['top1_prob']:.4f}) "
-                    f"top2={result.debug_info['top2_label']}({result.debug_info['top2_prob']:.4f}) "
-                    f"margin={result.debug_info['margin']:.4f} "
-                    f"min_conf={result.debug_info['min_confidence']:.4f} "
-                    f"cooldown={result.debug_info['cooldown_left']} "
-                    f"reason={reason_code} action={action}"
+            if use_directional_mode:
+                if decision_mode == "directional_edge_margin_conf":
+                    flat_margin = min_side_flat_margin if min_side_flat_margin is not None else 0.0
+                    conf = min_confidence if min_confidence is not None else min_proba_dominance
+                    result = decide_action_directional_edge_margin_conf(
+                        proba={"p_long": p_long, "p_flat": p_flat, "p_short": p_short},
+                        min_directional_edge=min_edge,
+                        min_flat_margin=flat_margin,
+                        min_confidence=conf,
+                    )
+                else:
+                    result = decide_action_directional_edge(
+                        proba={"p_long": p_long, "p_flat": p_flat, "p_short": p_short},
+                        min_directional_edge=min_edge,
+                        require_direction_gt_flat=require_direction_gt_flat,
+                        min_side_flat_margin=min_side_flat_margin,
+                    )
+                action = result.action
+                if action == "FLAT":
+                    action = "HOLD"
+                    directional_rule_reject_count += 1
+                    pflat_sum_rejected += p_flat
+                    pflat_rejected_count += 1
+                reason_code = result.reason_code
+                signals[i] = action
+                reason_code_counts[reason_code] = reason_code_counts.get(reason_code, 0) + 1
+                action_counts[action] = action_counts.get(action, 0) + 1
+                dbg = result.debug_info or {}
+                if action == "LONG":
+                    long_edge_sum_entry += float(dbg.get("long_edge", p_long - p_short))
+                    long_edge_entry_count += 1
+                elif action == "SHORT":
+                    short_edge_sum_entry += float(dbg.get("short_edge", p_short - p_long))
+                    short_edge_entry_count += 1
+                if i in sample_indices:
+                    logger.debug(
+                        f"{self.log_prefix}[D12 DIRECTIONAL] idx={i} ts={ts} "
+                        f"pL={p_long:.4f} pF={p_flat:.4f} pS={p_short:.4f} "
+                        f"long_edge={result.debug_info.get('long_edge', 0):.4f} short_edge={result.debug_info.get('short_edge', 0):.4f} "
+                        f"reason={reason_code} action={action}"
+                    )
+            else:
+                # ======================================================================
+                # [ANTI-OVERTRADING] No-trade zone 확대 (argmax mode only)
+                # ======================================================================
+                if flat_max_th is not None:
+                    max_proba = max(p_long, p_short)
+                    if max_proba < flat_max_th:
+                        signals[i] = "HOLD"
+                        reason_code_counts["FLAT_MAX_TH"] = reason_code_counts.get("FLAT_MAX_TH", 0) + 1
+                        action_counts["FLAT"] = action_counts.get("FLAT", 0) + 1
+                        continue
+                
+                if margin_th is not None:
+                    proba_diff = abs(p_long - p_short)
+                    if proba_diff < margin_th:
+                        signals[i] = "HOLD"
+                        reason_code_counts["MARGIN_TH"] = reason_code_counts.get("MARGIN_TH", 0) + 1
+                        action_counts["FLAT"] = action_counts.get("FLAT", 0) + 1
+                        continue
+                
+                state.current_idx = i
+                result = decide_action_3class(
+                    proba={"p_long": p_long, "p_flat": p_flat, "p_short": p_short},
+                    config=config,
+                    state=state,
+                    idx=i,
+                    ts=ts,
                 )
+                action = result.action
+                if action == "FLAT":
+                    action = "HOLD"
+                signals[i] = action
+                reason_code = result.reason_code
+                reason_code_counts[reason_code] = reason_code_counts.get(reason_code, 0) + 1
+                action_counts[action] = action_counts.get(action, 0) + 1
+                if i in sample_indices:
+                    logger.debug(
+                        f"{self.log_prefix}[POLICY] idx={i} ts={ts} "
+                        f"pL={p_long:.4f} pF={p_flat:.4f} pS={p_short:.4f} "
+                        f"top1={result.debug_info['top1_label']}({result.debug_info['top1_prob']:.4f}) "
+                        f"top2={result.debug_info['top2_label']}({result.debug_info['top2_prob']:.4f}) "
+                        f"margin={result.debug_info['margin']:.4f} "
+                        f"min_conf={result.debug_info['min_confidence']:.4f} "
+                        f"cooldown={result.debug_info['cooldown_left']} "
+                        f"reason={reason_code} action={action}"
+                    )
         
         # Log summary
         total_signals = sum(action_counts.values())
@@ -568,6 +646,34 @@ class LstmAttnBacktestEngine(MLBacktestEngine):
                     f"Thresholds may be too strict: long={long_threshold:.3f}, short={short_threshold}. "
                     f"Consider re-optimizing with relaxed constraints."
                 )
+        
+        # D12: expose signal stats for result/meta (all modes)
+        self._last_signal_stats = {
+            "signal_long_count": int(action_counts.get("LONG", 0)),
+            "signal_short_count": int(action_counts.get("SHORT", 0)),
+            "signal_flat_count": int(action_counts.get("FLAT", 0)),
+        }
+        if use_directional_mode:
+            self._last_signal_stats["directional_rule_reject_count"] = directional_rule_reject_count
+            self._last_signal_stats["decision_mode"] = decision_mode
+            self._last_signal_stats["min_directional_edge"] = min_edge
+            self._last_signal_stats["require_direction_gt_flat"] = require_direction_gt_flat
+            self._last_signal_stats["min_side_flat_margin"] = min_side_flat_margin
+            if long_edge_entry_count > 0:
+                self._last_signal_stats["avg_long_edge_entry"] = long_edge_sum_entry / long_edge_entry_count
+            if short_edge_entry_count > 0:
+                self._last_signal_stats["avg_short_edge_entry"] = short_edge_sum_entry / short_edge_entry_count
+            if pflat_rejected_count > 0:
+                self._last_signal_stats["avg_pflat_rejected"] = pflat_sum_rejected / pflat_rejected_count
+            logger.info(
+                f"{self.log_prefix} D12 directional mode: decision_mode={decision_mode}, "
+                f"min_directional_edge={min_edge}, require_direction_gt_flat={require_direction_gt_flat}, "
+                f"min_side_flat_margin={min_side_flat_margin}; "
+                f"LONG={action_counts['LONG']}, SHORT={action_counts['SHORT']}, FLAT={action_counts['FLAT']}, "
+                f"directional_rule_reject={directional_rule_reject_count}"
+            )
+        else:
+            self._last_signal_stats["decision_mode"] = "argmax"
         
         df = df.copy()
         df["raw_signal"] = signals  # Stage-1 결과
@@ -865,6 +971,98 @@ class LstmAttnBacktestEngine(MLBacktestEngine):
         stage2_cap_entropy_mid_th: float = 0.62,   # 완화: 0.64 → 0.62
         stage2_cap_pdiff_tiny_th: float = 0.002,
         stage2_cap_pdiff_small_th: float = 0.005,  # 기본값 승격: pdiff_small_005 (기존 0.004)
+        # Entry filters (minimal invasive: optional)
+        min_max_proba: Optional[float] = None,
+        max_entropy: Optional[float] = None,
+        min_proba_gap: float = 0.0,
+        min_directional_gap: Optional[float] = None,
+        max_flat_entry_proba: Optional[float] = None,
+        min_hold_bars_override: Optional[int] = None,
+        cooldown_bars_override: Optional[int] = None,
+        # D12/D13: decision mode (argmax vs directional_edge / directional_edge_gated / directional_edge_margin_conf)
+        decision_mode: str = "argmax",
+        min_directional_edge: Optional[float] = None,
+        require_direction_gt_flat: bool = True,
+        min_side_flat_margin: Optional[float] = None,
+        min_confidence: Optional[float] = None,
+        use_legacy_entry_gates_with_directional: bool = True,
+        # Regime filter (EMA200, default OFF)
+        regime_filter_enabled: bool = False,
+        regime_ema_span: int = 200,
+        regime_rule: str = "ema_only",
+        regime_slope_lookback: int = 48,
+        vol_window: int = 48,
+        vol_threshold: float = 0.0010,
+        breakout_lookback: int = 96,
+        breakout_mode: str = "ema_high",
+        slope_threshold: float = 1e-5,
+        q_window: int = 8640,
+        q: float = 0.90,
+        p_floor: float = 0.55,
+        position_scaling_enabled: bool = False,
+        position_scaling_mode: str = "linear",
+        position_p_floor: float = 0.55,
+        position_p_full: float = 0.65,
+        position_size_min: float = 0.25,
+        position_size_max: float = 1.0,
+        position_p_mid: float = 0.60,
+        position_k: float = 25.0,
+        early_exit_enabled: bool = False,
+        early_exit_lookback: int = 12,
+        early_exit_p_floor: float = 0.55,
+        early_exit_bad_k: int = 8,
+        entry_flat_gate_enabled: bool = False,
+        max_flat_proba: float = 0.45,
+        flat_exit_aware_enabled: bool = False,
+        flat_exit_threshold: float = 0.30,
+        flat_exit_badk_delta: int = 2,
+        time_stop_enabled: bool = False,
+        time_stop_bars: int = 96,
+        # Partial take-profit (Phase C7, default OFF)
+        partial_tp_enabled: bool = False,
+        partial_tp_threshold: float = 0.0025,
+        partial_tp_ratio: float = 0.5,
+        # Break-even stop (Phase C9, default OFF)
+        break_even_stop_enabled: bool = False,
+        be_threshold: float = 0.0,
+        emit_trade_log: bool = False,
+        # signal_exit_th 전용 (EXP_A/B); 기본은 trailing=1 → 기존 동작
+        signal_exit_th_trailing_window_bars: int = 1,
+        signal_exit_th_delta_from_entry: Optional[float] = None,
+        # 손실형 선별 보조: 조건 만족 시 직전 바 close 로 청산가만 조정 (전체 조기화 아님)
+        signal_exit_th_loss_aux_delta_p: Optional[float] = None,
+        signal_exit_th_loss_aux_mae_cut: Optional[float] = None,
+        signal_exit_th_loss_aux_short_only: bool = False,
+        signal_exit_th_loss_aux_min_bars: Optional[int] = None,
+        signal_exit_th_loss_aux_gate_delta_unreal_positive: bool = False,
+        signal_exit_th_loss_aux_gate_mfe_min: Optional[float] = None,
+        entry_min_unique_round_trips: Optional[int] = None,
+        entry_urt_state_log_path: Optional[Path] = None,
+        # Optional: force entry URT gate snapshot (compare A/B shares one load_latest result)
+        entry_urt_state_log_snapshot_override: Optional[int] = None,
+        # Profit lock exit (optional; default OFF)
+        enable_profit_lock_exit: bool = False,
+        profit_lock_take_profit: float = 0.0015,
+        profit_lock_stop_loss: float = -0.0030,
+        profit_lock_max_bars: int = 12,
+        profit_lock_conservative_intrabar: bool = True,
+        enable_reentry_cooldown: bool = False,
+        reentry_cooldown_bars: int = 12,
+        enable_directional_cooldown: bool = False,
+        directional_cooldown_bars: int = 12,
+        enable_post_tp_block: bool = False,
+        post_tp_block_bars: int = 6,
+        enable_post_sl_block: bool = False,
+        post_sl_block_bars: int = 12,
+        enable_regime_filter: bool = False,
+        regime_filter_mode: str = "none",
+        regime_combo_block_keys: tuple[str, ...] | None = None,
+        enable_positive_regime_filter: bool = False,
+        positive_regime_filter_mode: str = "none",
+        enable_adaptive_positive_regime_filter: bool = False,
+        adaptive_positive_regime_mode: str = "none",
+        enable_confidence_filter: bool = False,
+        confidence_filter_mode: str = "none",
     ) -> BacktestResult:
         """
         Run LSTM backtest with 3-class logic.
@@ -942,9 +1140,12 @@ class LstmAttnBacktestEngine(MLBacktestEngine):
         # Apply index_mask if provided
         if index_mask is not None:
             if len(index_mask) != len(df):
-                logger.warning(
-                    f"{self.log_prefix}[CACHE DEBUG] index_mask length ({len(index_mask)}) != df length ({len(df)}). Ignoring mask."
+                msg = (
+                    f"{self.log_prefix}[CACHE DEBUG] index_mask length ({len(index_mask)}) "
+                    f"!= df length ({len(df)}). Abort evaluation to avoid stale fallback."
                 )
+                logger.error(msg)
+                raise ValueError(msg)
             else:
                 rows_before = len(df)
                 df = df[index_mask].reset_index(drop=True)
@@ -1010,6 +1211,20 @@ class LstmAttnBacktestEngine(MLBacktestEngine):
         else:
             logger.info(f"{self.log_prefix} Stage-2 disabled (using Stage-1 only)")
         
+        # D12: legacy entry gates (min_max_proba, max_entropy): argmax always; directional_edge_gated always; directional_edge only if use_legacy_entry_gates_with_directional
+        use_legacy_entry_gates = (
+            decision_mode == "argmax"
+            or decision_mode == "directional_edge_gated"
+            or (decision_mode == "directional_edge" and use_legacy_entry_gates_with_directional)
+        )
+        if decision_mode != "argmax":
+            logger.info(
+                f"{self.log_prefix} D12 decision_mode={decision_mode}, "
+                f"min_directional_edge={min_directional_edge}, require_direction_gt_flat={require_direction_gt_flat}, "
+                f"min_side_flat_margin={min_side_flat_margin}, use_legacy_entry_gates={use_legacy_entry_gates}"
+            )
+        
+        self._last_signal_stats = {}
         df = self.generate_signals(
             proba_long_arr=proba_long_arr,
             proba_short_arr=proba_short_arr,
@@ -1027,6 +1242,11 @@ class LstmAttnBacktestEngine(MLBacktestEngine):
             flat_max_th=flat_max_th,
             margin_th=margin_th,
             apply_confirmation_to_flips=apply_confirmation_to_flips,
+            decision_mode=decision_mode,
+            min_directional_edge=min_directional_edge,
+            require_direction_gt_flat=require_direction_gt_flat,
+            min_side_flat_margin=min_side_flat_margin,
+            min_confidence=min_confidence,
             # Stage-2 parameters
             use_stage2=use_stage2,
             stage2_trade_th=stage2_trade_th,
@@ -1036,6 +1256,86 @@ class LstmAttnBacktestEngine(MLBacktestEngine):
             stage2_cooldown_bars=stage2_cooldown_bars,
         )
         
+        # SAFE conditional activation (RT-A primary / VOL-A shadow)
+        _resolved_urt_log = (
+            Path(entry_urt_state_log_path)
+            if entry_urt_state_log_path is not None
+            else STATE_LOG_PATH
+        )
+        window_stats = load_latest_window_stats(_resolved_urt_log)
+        entry_snapshot_meta = load_latest_entry_urt_snapshot(_resolved_urt_log)
+        # Entry URT gate snapshot: optional compare-script override, else B_with_meta row from CSV.
+        entry_urt_snapshot_for_gate: int | None = None
+        _exec_urt_source_override: str | None = None
+        if entry_min_unique_round_trips is not None and entry_urt_state_log_snapshot_override is not None:
+            try:
+                entry_urt_snapshot_for_gate = int(entry_urt_state_log_snapshot_override)
+                _exec_urt_source_override = "compare_fixed_snapshot"
+            except (TypeError, ValueError):
+                entry_urt_snapshot_for_gate = None
+        if entry_min_unique_round_trips is not None and entry_urt_snapshot_for_gate is None:
+            _urt_snap_raw = entry_snapshot_meta.get("unique_round_trips")
+            if _urt_snap_raw is not None:
+                try:
+                    entry_urt_snapshot_for_gate = int(float(_urt_snap_raw))
+                except (TypeError, ValueError):
+                    entry_urt_snapshot_for_gate = None
+        vol_bucket = compute_vol_bucket(df)
+        window_stats["vol_bucket"] = vol_bucket
+        # Primary source: runtime rolling 60d trade-count proxy from current signals.
+        unique_round_trips_window = compute_runtime_trades_60d(df)
+        if unique_round_trips_window is not None:
+            window_stats["trades_60d"] = unique_round_trips_window
+        # Fallback source: latest metrics snapshot path.
+        if unique_round_trips_window is None:
+            unique_round_trips_window = window_stats.get("trades_60d")
+        if unique_round_trips_window is None:
+            unique_round_trips_window = window_stats.get("unique_round_trips")
+        if unique_round_trips_window is not None:
+            try:
+                unique_round_trips_window = int(float(unique_round_trips_window))
+                # should_activate_rt_a reads unique_round_trips key.
+                window_stats["unique_round_trips"] = unique_round_trips_window
+            except Exception:
+                unique_round_trips_window = None
+        rt_a_on = False
+        try:
+            rt_a_on = should_activate_rt_a(window_stats)
+        except Exception:
+            # Never break pipeline on activation path
+            rt_a_on = False
+        vol_shadow_on = vol_bucket in {"mid", "high"}
+        shadow_rt_a_on = compute_shadow_rt_a_on(unique_round_trips_window)
+        effective_loss_aux_gate, loss_aux_gate_source = resolve_loss_aux_gate(
+            rt_a_on, shadow_rt_a_on
+        )
+        append_state_log_activation(
+            state_log_path=STATE_LOG_PATH,
+            rt_a_on=rt_a_on,
+            vol_shadow_on=vol_shadow_on,
+            unique_round_trips=unique_round_trips_window,
+            vol_bucket=vol_bucket,
+        )
+
+        # loss_aux params follow effective gate (rt_a_on unless adaptive flag uses shadow)
+        rt_loss_aux_delta_p = LOSS_AUX_DELTA_P if effective_loss_aux_gate else None
+        rt_loss_aux_mae_cut = LOSS_AUX_MAE_CUT if effective_loss_aux_gate else None
+        rt_loss_aux_gate_delta_unreal_positive = (
+            LOSS_AUX_SKIP_IF_DELTA_UNREAL_POSITIVE if effective_loss_aux_gate else False
+        )
+
+        logger.info(
+            "%s RT-A activation: rt_a_on=%s, shadow_rt_a_on=%s, effective_loss_aux_gate=%s (%s), vol_shadow_on=%s, unique_round_trips=%s, vol_bucket=%s",
+            self.log_prefix,
+            rt_a_on,
+            shadow_rt_a_on,
+            effective_loss_aux_gate,
+            loss_aux_gate_source,
+            vol_shadow_on,
+            unique_round_trips_window,
+            vol_bucket,
+        )
+
         # Execute trades
         result = self.execute_trades(
             df=df,
@@ -1053,6 +1353,59 @@ class LstmAttnBacktestEngine(MLBacktestEngine):
             exit_short_th=exit_short_th,
             min_hold_bars=min_hold_bars,
             cooldown_bars=cooldown_bars,
+            min_max_proba=min_max_proba,
+            max_entropy=max_entropy,
+            min_proba_gap=min_proba_gap,
+            min_directional_gap=min_directional_gap,
+            max_flat_entry_proba=max_flat_entry_proba,
+            min_hold_bars_override=min_hold_bars_override,
+            cooldown_bars_override=cooldown_bars_override,
+            use_legacy_entry_gates=use_legacy_entry_gates,
+            regime_filter_enabled=regime_filter_enabled,
+            regime_ema_span=regime_ema_span,
+            regime_rule=regime_rule,
+            regime_slope_lookback=regime_slope_lookback,
+            vol_window=vol_window,
+            vol_threshold=vol_threshold,
+            breakout_lookback=breakout_lookback,
+            breakout_mode=breakout_mode,
+            slope_threshold=slope_threshold,
+            q_window=q_window,
+            q=q,
+            p_floor=p_floor,
+            position_scaling_enabled=position_scaling_enabled,
+            position_scaling_mode=position_scaling_mode,
+            position_p_floor=position_p_floor,
+            position_p_full=position_p_full,
+            position_size_min=position_size_min,
+            position_size_max=position_size_max,
+            position_p_mid=position_p_mid,
+            position_k=position_k,
+            early_exit_enabled=early_exit_enabled,
+            early_exit_lookback=early_exit_lookback,
+            early_exit_p_floor=early_exit_p_floor,
+            early_exit_bad_k=early_exit_bad_k,
+            entry_flat_gate_enabled=entry_flat_gate_enabled,
+            max_flat_proba=max_flat_proba,
+            flat_exit_aware_enabled=flat_exit_aware_enabled,
+            flat_exit_threshold=flat_exit_threshold,
+            flat_exit_badk_delta=flat_exit_badk_delta,
+            time_stop_enabled=time_stop_enabled,
+            time_stop_bars=time_stop_bars,
+            partial_tp_enabled=partial_tp_enabled,
+            partial_tp_threshold=partial_tp_threshold,
+            partial_tp_ratio=partial_tp_ratio,
+            break_even_stop_enabled=break_even_stop_enabled,
+            be_threshold=be_threshold,
+            emit_trade_log=emit_trade_log,
+            signal_exit_th_trailing_window_bars=signal_exit_th_trailing_window_bars,
+            signal_exit_th_delta_from_entry=signal_exit_th_delta_from_entry,
+            signal_exit_th_loss_aux_delta_p=rt_loss_aux_delta_p,
+            signal_exit_th_loss_aux_mae_cut=rt_loss_aux_mae_cut,
+            signal_exit_th_loss_aux_short_only=signal_exit_th_loss_aux_short_only,
+            signal_exit_th_loss_aux_min_bars=signal_exit_th_loss_aux_min_bars,
+            signal_exit_th_loss_aux_gate_delta_unreal_positive=rt_loss_aux_gate_delta_unreal_positive,
+            signal_exit_th_loss_aux_gate_mfe_min=signal_exit_th_loss_aux_gate_mfe_min,
             proba_long_arr=proba_long_arr,
             proba_short_arr=proba_short_arr,
             # Direction filter
@@ -1087,8 +1440,56 @@ class LstmAttnBacktestEngine(MLBacktestEngine):
             stage2_cap_entropy_mid_th=stage2_cap_entropy_mid_th,
             stage2_cap_pdiff_tiny_th=stage2_cap_pdiff_tiny_th,
             stage2_cap_pdiff_small_th=stage2_cap_pdiff_small_th,
+            entry_min_unique_round_trips=entry_min_unique_round_trips,
+            entry_urt_state_log_path=(
+                entry_urt_state_log_path
+                if entry_urt_state_log_path is not None
+                else (STATE_LOG_PATH if entry_min_unique_round_trips is not None else None)
+            ),
+            entry_urt_state_log_snapshot=(
+                entry_urt_snapshot_for_gate if entry_min_unique_round_trips is not None else None
+            ),
+            entry_urt_gate_value_source_override=_exec_urt_source_override,
+            enable_profit_lock_exit=enable_profit_lock_exit,
+            profit_lock_take_profit=profit_lock_take_profit,
+            profit_lock_stop_loss=profit_lock_stop_loss,
+            profit_lock_max_bars=profit_lock_max_bars,
+            profit_lock_conservative_intrabar=profit_lock_conservative_intrabar,
+            enable_reentry_cooldown=enable_reentry_cooldown,
+            reentry_cooldown_bars=reentry_cooldown_bars,
+            enable_directional_cooldown=enable_directional_cooldown,
+            directional_cooldown_bars=directional_cooldown_bars,
+            enable_post_tp_block=enable_post_tp_block,
+            post_tp_block_bars=post_tp_block_bars,
+            enable_post_sl_block=enable_post_sl_block,
+            post_sl_block_bars=post_sl_block_bars,
+            enable_regime_filter=enable_regime_filter,
+            regime_filter_mode=regime_filter_mode,
+            regime_combo_block_keys=regime_combo_block_keys,
+            enable_positive_regime_filter=enable_positive_regime_filter,
+            positive_regime_filter_mode=positive_regime_filter_mode,
+            enable_adaptive_positive_regime_filter=enable_adaptive_positive_regime_filter,
+            adaptive_positive_regime_mode=adaptive_positive_regime_mode,
+            enable_confidence_filter=enable_confidence_filter,
+            confidence_filter_mode=confidence_filter_mode,
         )
         
+        # D12: merge signal stats into result for report/meta
+        if getattr(self, "_last_signal_stats", None):
+            result.update(self._last_signal_stats)
+        result["rt_a_on"] = rt_a_on
+        result["vol_shadow_on"] = vol_shadow_on
+        result["vol_bucket"] = vol_bucket
+        result["window_unique_round_trips"] = unique_round_trips_window
+        result["loss_aux_applied_toggle"] = int(effective_loss_aux_gate)
+        result["entry_snapshot_selected_timestamp"] = entry_snapshot_meta.get("selected_timestamp")
+        result["entry_snapshot_selected_strategy_name"] = entry_snapshot_meta.get("selected_strategy_name")
+        result["entry_snapshot_selected_trades_60d_raw"] = entry_snapshot_meta.get("selected_trades_60d_raw")
+        result["entry_snapshot_selected_unique_round_trips_raw"] = entry_snapshot_meta.get(
+            "selected_unique_round_trips_raw"
+        )
+        result["entry_snapshot_selected_source"] = entry_snapshot_meta.get("selected_source")
+
         return result
 
 
@@ -1097,16 +1498,18 @@ def get_ml_backtest_engine(
     symbol: str,
     timeframe: str,
     feature_preset: str = "extended_safe",
+    tcn_preset: str | None = None,
 ) -> MLBacktestEngine:
     """
     Factory function to create appropriate backtest engine.
-    
+
     Args:
         strategy_name: Strategy identifier ("ml_xgb" or "ml_lstm_attn")
         symbol: Trading symbol
         timeframe: Timeframe
         feature_preset: Feature preset (for XGBoost)
-    
+        tcn_preset: For ml_tcn only: "base" or "calendar_e0" for cache path.
+
     Returns:
         MLBacktestEngine instance
     """
@@ -1122,15 +1525,15 @@ def get_ml_backtest_engine(
             strategy_name=strategy_name,
             symbol=symbol,
             timeframe=timeframe,
-            feature_preset="base",  # LSTM doesn't use feature_preset
+            feature_preset="base",
         )
     elif strategy_name == "ml_tcn":
-        # TCN uses the same engine as LSTM-Attn (both are 3-class models)
         return LstmAttnBacktestEngine(
             strategy_name=strategy_name,
             symbol=symbol,
             timeframe=timeframe,
-            feature_preset="base",  # TCN doesn't use feature_preset
+            feature_preset="base",
+            tcn_preset=tcn_preset,
         )
     else:
         raise ValueError(f"Unsupported ML strategy: {strategy_name}")

@@ -119,7 +119,14 @@ def parse_args() -> argparse.Namespace:
         choices=["base", "extended_safe", "extended_full"],
         help="Feature preset for ml_xgb strategy (default: extended_safe)",
     )
-    
+    parser.add_argument(
+        "--preset",
+        type=str,
+        default=None,
+        choices=["base", "calendar_e0"],
+        help="For ml_tcn: cache/preset (base or calendar_e0). Selects which proba cache to load.",
+    )
+
     # ======================================================================
     # Anti-overtrading parameters (플립/과다매매 억제)
     # ======================================================================
@@ -503,6 +510,8 @@ def main():
     logger.info(f"Symbol: {args.symbol}, Timeframe: {args.timeframe}")
     if args.strategy == "ml_xgb":
         logger.info(f"Feature preset: {args.feature_preset}")
+    if args.strategy == "ml_tcn" and args.preset:
+        logger.info(f"TCN preset: {args.preset}")
     logger.info(f"Start date: {args.start_date or 'All available'}")
     logger.info(f"End date: {args.end_date or 'All available'}")
     logger.info("=" * 60)
@@ -535,6 +544,7 @@ def main():
         symbol=args.symbol,
         timeframe=args.timeframe,
         feature_preset=args.feature_preset,
+        tcn_preset=args.preset if args.strategy == "ml_tcn" else None,
     )
     
     # Convert direction to long_only/short_only for backward compatibility

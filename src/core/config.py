@@ -124,6 +124,38 @@ class Settings(BaseSettings):
     BINANCE_SYMBOL: str = "BTC/USDT"
     BINANCE_SANDBOX_MODE: bool = True
     BINANCE_LIVE_TRADING: bool = False
+
+    # FR2 Meta Layer rolling metrics 공급자 갱신(운영 검증용)
+    META_METRICS_REFRESH_ENABLED: bool = Field(
+        default=True,
+        description="True면 백그라운드에서 meta rolling metrics source를 주기 갱신합니다.",
+    )
+    META_METRICS_REFRESH_SECONDS: float = Field(
+        default=3600.0,
+        description="rolling metrics refresh 주기(초). 기본 1시간.",
+    )
+    META_METRICS_REFRESH_MODE: str = Field(
+        default="operational_latest",
+        description="meta rolling metrics refresh mode: 'operational_latest' | 'research_step' | 'legacy_last_row'(검증용).",
+    )
+
+    # 서버 켜놓기 모드: 자동 트레이딩 루프 on/off (False면 캔들 업데이트만 수행, 트레이딩 스텝은 API로만)
+    AUTO_TRADING_ENABLED: bool = Field(
+        default=True,
+        description="True면 백그라운드에서 1분마다 trading_step 실행. False면 /trade/step 등 API로만 실행.",
+    )
+
+    # Swagger/API에서 수동 호출 시 trading_step 타임아웃(초)
+    TRADING_STEP_TIMEOUT_SECONDS: float = Field(
+        default=90.0,
+        description="POST /trading/step 타임아웃(초). trading_step이 무거우면 늘리세요.",
+    )
+
+    # Meta Layer 평가 폴링 주기(초). evaluate()는 내부 rate-limit이 있으므로 폴링은 가볍게 유지.
+    META_EVAL_POLL_SECONDS: float = Field(
+        default=300.0,
+        description="Meta Layer evaluate() 폴링 주기(초). 기본 5분.",
+    )
     
     # ML Threshold Optimization settings
     USE_OPTIMIZED_THRESHOLDS: bool = Field(

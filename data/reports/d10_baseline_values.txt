@@ -1,0 +1,5 @@
+baseline run (this execution)
+  180d cost_on = 0.012621292690840447
+  365d cost_on = -0.0733818966155878
+  720d cost_on = -0.111968647467793
+  trades = 1491

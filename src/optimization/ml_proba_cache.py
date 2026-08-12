@@ -8,6 +8,7 @@ across multiple threshold combinations without recomputing.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,6 @@ import pandas as pd
 from src.backtest.engine import _get_ml_adapter
 from src.core.config import settings
 from src.indicators.basic import get_df_with_indicators, add_basic_indicators
-from src.ml.xgb_model import MLXGBModel
 from src.services.ohlcv_service import load_ohlcv_df
 from src.ml.features import build_feature_frame
 from src.features.ml_feature_config import MLFeatureConfig
@@ -39,10 +39,12 @@ def _get_cache_path(
     feature_preset: str = "extended_safe",
     start_date: str | None = None,
     end_date: str | None = None,
+    use_events: bool | None = None,
+    tcn_preset: str | None = None,
 ) -> Path:
     """
     Build cache file path for prediction probabilities.
-    
+
     Args:
         strategy_name: Strategy identifier (e.g., "ml_xgb")
         symbol: Trading symbol (e.g., "BTCUSDT")
@@ -50,17 +52,26 @@ def _get_cache_path(
         feature_preset: Feature preset (e.g., "extended_safe")
         start_date: Start date filter (YYYY-MM-DD format) or None
         end_date: End date filter (YYYY-MM-DD format) or None
-    
+        use_events: For ml_tcn, if False use _no_events suffix in filename (ignored if tcn_preset set).
+        tcn_preset: For ml_tcn, "base" or "calendar_e0" to separate caches by preset.
+
     Returns:
         Path to cache file
     """
     # Normalize symbol and timeframe
     symbol_norm = symbol.replace("/", "").upper()
     timeframe_norm = timeframe.lower()
-    
+
     # Build base filename
     if strategy_name == "ml_xgb":
         base_filename = f"{strategy_name}_{symbol_norm}_{timeframe_norm}_{feature_preset}"
+    elif strategy_name == "ml_tcn":
+        if tcn_preset and tcn_preset != "base":
+            base_filename = f"{strategy_name}_{symbol_norm}_{timeframe_norm}_{tcn_preset}"
+        elif use_events is False:
+            base_filename = f"{strategy_name}_{symbol_norm}_{timeframe_norm}_no_events"
+        else:
+            base_filename = f"{strategy_name}_{symbol_norm}_{timeframe_norm}"
     else:
         base_filename = f"{strategy_name}_{symbol_norm}_{timeframe_norm}"
     
@@ -99,15 +110,17 @@ def get_or_build_predictions(
     df: pd.DataFrame | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
+    use_events: bool | None = None,
+    tcn_preset: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
     """
     Get prediction probabilities from cache or compute them.
-    
+
     This function:
     1. Checks if cache file exists and is valid
     2. If cache exists and force_rebuild=False, loads from cache
     3. Otherwise, computes predictions and saves to cache
-    
+
     Args:
         strategy_name: Strategy identifier (e.g., "ml_xgb", "ml_lstm_attn")
         symbol: Trading symbol (default: from settings)
@@ -118,7 +131,8 @@ def get_or_build_predictions(
         df: Optional DataFrame with OHLCV + indicators. If None, loads from service.
         start_date: Filter OHLCV and predictions to samples at or after this date (YYYY-MM-DD format)
         end_date: Filter OHLCV and predictions to samples at or before this date (YYYY-MM-DD format)
-    
+        use_events: For ml_tcn, if False use no-events model and no event columns (default: settings.EVENTS_ENABLED).
+
     Returns:
         Tuple of (proba_long: np.ndarray, proba_short: np.ndarray, df: pd.DataFrame)
     """
@@ -127,9 +141,24 @@ def get_or_build_predictions(
         symbol = getattr(settings, "BINANCE_SYMBOL", "BTC/USDT").replace("/", "").upper()
     if timeframe is None:
         timeframe = getattr(settings, "THRESHOLD_TIMEFRAME", "1m")
-    
+    if use_events is None and strategy_name == "ml_tcn":
+        env_val = os.environ.get("USE_EVENTS_FOR_TCN", "").strip().lower()
+        if env_val in ("0", "false", "no"):
+            use_events = False
+        elif env_val in ("1", "true", "yes"):
+            use_events = True
+        else:
+            use_events = getattr(settings, "EVENTS_ENABLED", True)
+
     cache_path = _get_cache_path(
-        strategy_name, symbol, timeframe, feature_preset, start_date, end_date
+        strategy_name,
+        symbol,
+        timeframe,
+        feature_preset,
+        start_date,
+        end_date,
+        use_events=use_events if strategy_name == "ml_tcn" and tcn_preset is None else None,
+        tcn_preset=tcn_preset if strategy_name == "ml_tcn" else None,
     )
     
     # Check cache validity if not forcing rebuild
@@ -321,6 +350,8 @@ def get_or_build_predictions(
         timeframe=timeframe,
         feature_preset=feature_preset,
         nthread=nthread,
+        use_events=use_events if strategy_name == "ml_tcn" and tcn_preset is None else None,
+        tcn_preset=tcn_preset if strategy_name == "ml_tcn" else None,
     )
     
     # ======================================================================
@@ -432,21 +463,24 @@ def compute_ml_proba_cache(
     timeframe: str | None = None,
     feature_preset: str = "extended_safe",
     nthread: int | None = None,
+    use_events: bool | None = None,
+    tcn_preset: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
     """
     Compute prediction probabilities (proba_long, proba_short) for entire dataset.
-    
+
     This function computes predictions once and caches them, allowing
     threshold optimization to reuse predictions across multiple threshold
     combinations without recomputing.
-    
+
     Args:
         strategy_name: Strategy identifier (e.g., "ml_xgb", "ml_lstm_attn")
         df: Optional DataFrame with OHLCV + indicators. If None, loads from service.
         symbol: Trading symbol (default: from settings)
         timeframe: Timeframe (default: from settings)
         feature_preset: Feature preset for ml_xgb strategy (default: "extended_safe")
-    
+        use_events: For ml_tcn only: if False use no-events model and no event columns.
+
     Returns:
         Tuple of (proba_long: np.ndarray, proba_short: np.ndarray, df: pd.DataFrame)
         where proba_long[i] and proba_short[i] correspond to df.iloc[i]
@@ -457,7 +491,9 @@ def compute_ml_proba_cache(
         symbol = getattr(settings, "BINANCE_SYMBOL", "BTC/USDT").replace("/", "").upper()
     if timeframe is None:
         timeframe = getattr(settings, "THRESHOLD_TIMEFRAME", "1m")
-    
+    if use_events is None and strategy_name == "ml_tcn":
+        use_events = getattr(settings, "EVENTS_ENABLED", True)
+
     # Phase E: Load OHLCV data with timeframe support
     # Note: If df is provided, it should already be filtered by date range
     # (filtering is done in get_or_build_predictions before calling this function)
@@ -481,6 +517,7 @@ def compute_ml_proba_cache(
     # Phase E: Use MLXGBModel for ml_xgb strategy
     if strategy_name == "ml_xgb":
         try:
+            from src.ml.xgb_model import MLXGBModel
             model = MLXGBModel(
                 strategy=strategy_name,
                 symbol=symbol,
@@ -519,7 +556,11 @@ def compute_ml_proba_cache(
             has_separate_models = getattr(model, "has_separate_models", lambda: False)()
             min_rows = adapter.min_history_provider(model)
     else:
-        model = adapter.get_model()
+        if strategy_name == "ml_tcn" and use_events is not None:
+            from src.dl.tcn_model import get_tcn_model
+            model = get_tcn_model(use_events=use_events)
+        else:
+            model = adapter.get_model()
         if model is None:
             raise ValueError(f"{adapter.name} model instance is None. Cannot compute predictions.")
         if not getattr(model, "is_loaded", lambda: False)():
@@ -530,7 +571,7 @@ def compute_ml_proba_cache(
             )
         has_separate_models = getattr(model, "has_separate_models", lambda: False)()
         min_rows = adapter.min_history_provider(model)
-    
+
     proba_long_values: list[float] = []
     proba_short_values: list[float] = []
     valid_indices: list[int] = []
@@ -544,8 +585,9 @@ def compute_ml_proba_cache(
         f"timeframe={timeframe}, feature_preset={feature_preset if strategy_name == 'ml_xgb' else 'N/A'}"
     )
     
-    # Phase E: Use MLXGBModel's batch prediction if available
-    if isinstance(model, MLXGBModel):
+    # Phase E: Use MLXGBModel's batch prediction if available (ml_xgb only).
+    # NOTE: MLXGBModel 타입을 직접 참조하지 않고, method 존재로 분기한다.
+    if strategy_name == "ml_xgb" and hasattr(model, "predict_proba_long") and hasattr(model, "predict_proba_short"):
         # Extract features once for entire dataset
         feature_config = MLFeatureConfig.from_preset(feature_preset)
         full_features = build_feature_frame(
@@ -711,7 +753,7 @@ def compute_ml_proba_cache(
     elif strategy_name == "ml_tcn":
         # Optimized batch path for TCN (3-class model)
         from src.dl.tcn_model import TCNSignalModel
-        
+
         if not isinstance(model, TCNSignalModel):
             raise ValueError(
                 f"[Proba Cache][{adapter.name}] Expected TCNSignalModel, got {type(model)}"
@@ -722,26 +764,38 @@ def compute_ml_proba_cache(
             f"Class indices: FLAT={LstmClassIndex.FLAT}, LONG={LstmClassIndex.LONG}, SHORT={LstmClassIndex.SHORT}. "
             f"proba_long/proba_short are derived from 3-class softmax output."
         )
-        
-        # Extract features once for entire dataset
-        logger.info(
-            f"[Proba Cache][{adapter.name}] Extracting features for batch prediction..."
-        )
-        full_features = build_feature_frame(
-            df,
-            symbol=symbol,
-            timeframe=timeframe,
-            use_events=settings.EVENTS_ENABLED,
-        )
+
+        tcn_use_events = use_events if use_events is not None else getattr(settings, "EVENTS_ENABLED", True)
+        if tcn_preset == "calendar_e0":
+            feature_config = MLFeatureConfig.from_preset("calendar_e0")
+            logger.info(
+                f"[Proba Cache][{adapter.name}] Extracting features for batch prediction (preset=calendar_e0)..."
+            )
+            full_features = build_feature_frame(
+                df,
+                symbol=symbol,
+                timeframe=timeframe,
+                feature_config=feature_config,
+            )
+        else:
+            logger.info(
+                f"[Proba Cache][{adapter.name}] Extracting features for batch prediction (use_events={tcn_use_events})..."
+            )
+            full_features = build_feature_frame(
+                df,
+                symbol=symbol,
+                timeframe=timeframe,
+                use_events=tcn_use_events,
+            )
         full_features = full_features.dropna()
-        
+
         # Validate we have enough data
         if len(full_features) < min_rows:
             raise ValueError(
                 f"[Proba Cache][{adapter.name}] Not enough features after extraction: "
                 f"need at least {min_rows}, got {len(full_features)}"
             )
-        
+
         # Use batch prediction
         try:
             proba_long_arr, proba_short_arr = model.predict_proba_batch(
@@ -1183,6 +1237,13 @@ def _parse_args():
         help="Feature preset for ml_xgb strategy (default: extended_safe)",
     )
     parser.add_argument(
+        "--preset",
+        type=str,
+        default=None,
+        choices=["base", "calendar_e0"],
+        help="For ml_tcn: feature/cache preset - base (default) or calendar_e0",
+    )
+    parser.add_argument(
         "--force-rebuild",
         action="store_true",
         help="Force rebuild cache even if it already exists",
@@ -1229,6 +1290,8 @@ def main():
         logger.info(f"[ML_PROBA_CACHE] strategy={args.strategy}, symbol={args.symbol}, timeframe={args.timeframe}")
         if args.strategy == "ml_xgb":
             logger.info(f"[ML_PROBA_CACHE] feature_preset={args.feature_preset}")
+        if args.strategy == "ml_tcn" and args.preset:
+            logger.info(f"[ML_PROBA_CACHE] tcn_preset={args.preset}")
         if args.start_date or args.end_date:
             logger.info(f"[ML_PROBA_CACHE] date_range: start={args.start_date or 'None'}, end={args.end_date or 'None'}")
         logger.info(f"[ML_PROBA_CACHE] force_rebuild={args.force_rebuild}")
@@ -1253,6 +1316,7 @@ def main():
             feature_preset=args.feature_preset if args.strategy == "ml_xgb" else "base",
             start_date=args.start_date,
             end_date=args.end_date,
+            tcn_preset=args.preset if args.strategy == "ml_tcn" else None,
         )
         
         # Check if cache exists
@@ -1278,6 +1342,7 @@ def main():
             nthread=args.nthread,
             start_date=args.start_date,
             end_date=args.end_date,
+            tcn_preset=args.preset if args.strategy == "ml_tcn" else None,
         )
         
         # Success summary

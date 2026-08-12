@@ -1,0 +1,18 @@
+{
+  "verdict": "QQQ_DATA_PIPELINE_PASS",
+  "issues": [],
+  "warnings": [],
+  "metrics": {
+    "rows": 6890,
+    "start": "1999-03-10",
+    "end": "2026-07-30",
+    "duplicates": 0,
+    "ohlc_invariant_violations": 0,
+    "abs_return_gt_20pct_count": 0,
+    "missing_expected_sessions": 0,
+    "unexpected_sessions": 0,
+    "incomplete_session_removed": true
+  },
+  "production_ready": false,
+  "promotion_ready": false
+}

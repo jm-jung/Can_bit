@@ -216,3 +216,56 @@ __marimo__/
 src/data/*.csv
 # python -m src.optimization.ml_proba_cache --strategy ml_lstm_attn --symbol BTCUSDT --timeframe 5m
 #python -m src.optimization.optimize_ml_threshold --strategy ml_lstm_attn --symbol BTCUSDT --timeframe 5m --strategy-mode long_only
+
+# =============================================================================
+# CAN_BIT local tooling / dependency caches
+# =============================================================================
+/.pydeps/
+.venv.backup_*/
+.vscode/
+
+# =============================================================================
+# CAN_BIT runtime artifacts (regenerable, high-volume)
+# =============================================================================
+/data/diagnostics/
+/data/monitoring/
+/data/backups/
+/data/datasets/
+/data/state/
+/data/market/
+
+# =============================================================================
+# CAN_BIT research caches / regenerable feature & prediction matrices
+# (already-tracked files remain tracked; these rules block new untracked dumps)
+# =============================================================================
+/data/cache/ml_predictions/*.parquet
+/data/ohlcv/*.parquet
+/data/features/*.parquet
+
+# =============================================================================
+# CAN_BIT equity/ETF collected raw + normalized + feature matrices
+# Keep reports/, manifests/, model metadata JSON, research locks.
+# =============================================================================
+/data/equity_etf/qqq/raw/
+/data/equity_etf/qqq/normalized/
+/data/equity_etf/qqq/features/*.parquet
+/data/equity_etf/qqq/regime/raw/
+/data/equity_etf/qqq/regime/normalized/
+/data/equity_etf/qqq/regime/features/*.parquet
+/data/equity_etf/qqq/regime/models/*.parquet
+
+# Prospective live-run runtime outputs (not research summaries)
+/data/equity_etf/qqq/regime/prospective/cache/
+/data/equity_etf/qqq/regime/prospective/daily_snapshots/
+/data/equity_etf/qqq/regime/prospective/executions/
+/data/equity_etf/qqq/regime/prospective/locks/
+/data/equity_etf/qqq/regime/prospective/outbox/
+/data/equity_etf/qqq/regime/prospective/outcomes/
+/data/equity_etf/qqq/regime/prospective/predictions/
+/data/equity_etf/qqq/regime/prospective/shadow/
+/data/equity_etf/qqq/regime/prospective/state/
+/data/equity_etf/qqq/regime/prospective/models/*.joblib
+
+# CAN_BIT generated full OHLCV / local backup
+/data/ohlcv/BTCUSDT_5m_full.csv
+/data/ohlcv/BTCUSDT_5m_full.csv.bak

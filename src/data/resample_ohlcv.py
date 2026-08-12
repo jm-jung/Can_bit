@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -49,11 +50,11 @@ def resample_ohlcv(
     
     # Validate timeframes
     timeframe_map = {
-        "1m": "1T",
-        "3m": "3T",
-        "5m": "5T",
-        "15m": "15T",
-        "30m": "30T",
+        "1m": "1min",
+        "3m": "3min",
+        "5m": "5min",
+        "15m": "15min",
+        "30m": "30min",
     }
     
     if from_timeframe not in timeframe_map:
@@ -106,8 +107,10 @@ def resample_ohlcv(
     # Create output directory if it doesn't exist
     to_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # Save to CSV
-    resampled.to_csv(to_path, index=False)
+    # Save to CSV atomically to avoid partial reads during refresh/evaluate.
+    tmp_path = to_path.with_suffix(to_path.suffix + ".tmp")
+    resampled.to_csv(tmp_path, index=False)
+    os.replace(tmp_path, to_path)
     logger.info(f"[Resample OHLCV] Saved {to_timeframe} data to {to_path}")
     logger.info(f"[Resample OHLCV] Final date range: {resampled['timestamp'].min()} to {resampled['timestamp'].max()}")
 

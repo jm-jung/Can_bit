@@ -21,6 +21,7 @@ OHLCV_CSV_PATHS = {
     ("BTCUSDT", "5m"): PROJECT_ROOT / "data" / "ohlcv" / "BTCUSDT_5m_full.csv",
     # Add more mappings as needed for other symbols/timeframes
 }
+OUT_DIR = PROJECT_ROOT / "data" / "ohlcv"
 
 
 def _parse_timeframe(timeframe: str) -> str:
@@ -97,31 +98,15 @@ def _resample_ohlcv(df: pd.DataFrame, target_timeframe: str) -> pd.DataFrame:
     return resampled
 
 
-@lru_cache(maxsize=5)  # Cache up to 5 different timeframes
-def load_ohlcv_df(timeframe: str = "1m", symbol: str = "BTCUSDT") -> pd.DataFrame:
-    """
-    Load OHLCV data from CSV and optionally resample to target timeframe.
-    
-    Phase E: Multi-timeframe support with long-run resampled data.
-    
-    For timeframe=5m, uses pre-resampled full CSV (data/ohlcv/BTCUSDT_5m_full.csv)
-    instead of on-the-fly resampling to get longer historical data.
-    
-    Args:
-        timeframe: Target timeframe (default: "1m"). Supported: 1m, 3m, 5m, 15m, 30m
-        symbol: Trading symbol (default: "BTCUSDT")
-    
-    Returns:
-        DataFrame with OHLCV columns and timestamp column
-    
-    Raises:
-        FileNotFoundError: If CSV file not found
-        ValueError: If timeframe is not supported
-    """
+def _load_ohlcv_df_impl(
+    timeframe: str,
+    symbol: str,
+    include_microstructure: bool,
+) -> pd.DataFrame:
     # Parse and validate timeframe
     target_timeframe = _parse_timeframe(timeframe)
     symbol_upper = symbol.upper().replace("/", "")
-    
+
     # [ML] Check if we have a pre-resampled CSV for this symbol/timeframe combination
     csv_key = (symbol_upper, target_timeframe)
     if csv_key in OHLCV_CSV_PATHS:
@@ -140,6 +125,31 @@ def load_ohlcv_df(timeframe: str = "1m", symbol: str = "BTCUSDT") -> pd.DataFram
                 f"[OHLCV Loader] Loaded data: symbol={symbol_upper}, timeframe={target_timeframe}, "
                 f"path={csv_path.name}, rows={len(df)}"
             )
+            if include_microstructure and symbol_upper == "BTCUSDT" and target_timeframe == "5m":
+                micro_path = OUT_DIR / "BTCUSDT_5m_microstructure.parquet"
+                if micro_path.exists():
+                    micro = pd.read_parquet(micro_path)
+                    mts = pd.to_datetime(micro["timestamp"])
+                    if mts.dt.tz is not None:
+                        mts = mts.dt.tz_localize(None)
+                    micro["timestamp"] = mts.astype("datetime64[ns]")
+                    ots = pd.to_datetime(df["timestamp"])
+                    if ots.dt.tz is not None:
+                        ots = ots.dt.tz_localize(None)
+                    df["timestamp"] = ots.astype("datetime64[ns]")
+                    df = df.merge(
+                        micro,
+                        on="timestamp",
+                        how="left",
+                        suffixes=("", "_micro"),
+                    )
+                    # Drop duplicate columns if any (keep left)
+                    for c in micro.columns:
+                        if c != "timestamp" and c in df.columns:
+                            pass  # keep
+                    logger.info("[OHLCV Loader] Merged microstructure columns: %s", [c for c in micro.columns if c != "timestamp"])
+                else:
+                    logger.warning("[OHLCV Loader] Microstructure parquet not found: %s. Run fetch_futures_microstructure.", micro_path)
             return df
         else:
             # Pre-resampled file doesn't exist, fall back to on-the-fly resampling
@@ -175,6 +185,21 @@ def load_ohlcv_df(timeframe: str = "1m", symbol: str = "BTCUSDT") -> pd.DataFram
     )
     
     return df
+
+
+@lru_cache(maxsize=8)
+def load_ohlcv_df(
+    timeframe: str = "1m",
+    symbol: str = "BTCUSDT",
+    include_microstructure: bool = False,
+) -> pd.DataFrame:
+    """
+    Load OHLCV data from CSV and optionally resample / merge microstructure.
+
+    For timeframe=5m and symbol=BTCUSDT, when include_microstructure=True,
+    merges data/ohlcv/BTCUSDT_5m_microstructure.parquet if present (FR2).
+    """
+    return _load_ohlcv_df_impl(timeframe, symbol, include_microstructure)
 
 
 def get_last_candle() -> OHLCVCandle:

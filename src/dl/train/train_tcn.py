@@ -10,11 +10,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import math
 import random
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -28,6 +30,7 @@ from src.dl.models.tcn import TCNModel
 from src.dl.data.split import make_time_series_splits, log_split_summary
 from src.dl.data.labels import LstmClassIndex
 from src.dl.train.train_lstm_attn import create_sequences
+from src.features.ml_feature_config import MLFeatureConfig
 from src.services.ohlcv_service import load_ohlcv_df
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -83,6 +86,9 @@ def train_model(
     min_delta: float = 1e-4,
     device: torch.device | None = None,
     out_model_path: Path | str | None = None,
+    feature_preset: str = "base",
+    symbol: str | None = None,
+    timeframe: str | None = None,
 ) -> tuple[TCNModel, float, Path]:
     """
     Train TCN model.
@@ -107,7 +113,7 @@ def train_model(
         out_model_path: Path to save the trained model
         
     Returns:
-        Tuple of (model, best_val_loss, best_model_path)
+        Tuple of (model, best_val_loss, best_model_path, metrics_dict)
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -140,10 +146,16 @@ def train_model(
     logger.info(f"Model path: {out_model_path.resolve()}")
     
     # Load data
+    tf = timeframe or getattr(settings, "THRESHOLD_TIMEFRAME", "5m")
+    sym = symbol or getattr(settings, "BINANCE_SYMBOL", "BTC/USDT").replace("/", "").upper()
     logger.info("Loading OHLCV data...")
-    df = load_ohlcv_df()
+    include_micro = feature_preset == "microstructure_v1"
+    df = load_ohlcv_df(timeframe=tf, symbol=sym, include_microstructure=include_micro)
     df = df.sort_values("timestamp").reset_index(drop=True)
     logger.info(f"Loaded {len(df)} rows of OHLCV data")
+    
+    feature_config = MLFeatureConfig.from_preset(feature_preset)
+    logger.info(f"Feature preset: {feature_preset}")
     
     # Create sequences (same pipeline as LSTM-Attn)
     logger.info(f"Creating sequences (window_size={window_size}, horizon={horizon})...")
@@ -155,6 +167,7 @@ def train_model(
         neg_threshold=neg_threshold,
         ignore_margin=ignore_margin,
         debug_inspect=False,
+        feature_config=feature_config,
     )
     feature_dim = len(feature_cols)
     
@@ -358,13 +371,104 @@ def train_model(
     if best_state_dict is not None:
         model.load_state_dict(best_state_dict)
         logger.info(f"Loaded best model (val_loss={best_val_loss:.4f})")
-    
+
+    # Validation metrics (F1, CM, proba quality) on best model
+    metrics: dict[str, Any] = {}
+    model.eval()
+    all_logits: list[torch.Tensor] = []
+    all_labels: list[torch.Tensor] = []
+    with torch.no_grad():
+        for X_batch, y_batch in valid_loader:
+            X_batch = X_batch.to(device)
+            logits = model(X_batch)
+            all_logits.append(logits.cpu())
+            all_labels.append(y_batch)
+    logits_cat = torch.cat(all_logits, dim=0)
+    labels_cat = torch.cat(all_labels, dim=0)
+    y_true = labels_cat.numpy()
+    probs = F.softmax(logits_cat, dim=-1).numpy()
+    y_pred = logits_cat.argmax(dim=1).numpy()
+
+    try:
+        from sklearn.metrics import (
+            confusion_matrix,
+            f1_score,
+            precision_score,
+            recall_score,
+        )
+        cm = confusion_matrix(y_true, y_pred, labels=[0, 1, 2])
+        metrics["confusion_matrix"] = cm.tolist()
+        metrics["macro_f1"] = float(f1_score(y_true, y_pred, average="macro", zero_division=0.0))
+        for i, name in enumerate(["FLAT", "LONG", "SHORT"]):
+            p = precision_score(y_true, y_pred, labels=[i], average="macro", zero_division=0.0)
+            r = recall_score(y_true, y_pred, labels=[i], average="macro", zero_division=0.0)
+            f = f1_score(y_true, y_pred, labels=[i], average="macro", zero_division=0.0)
+            metrics[f"precision_{name}"] = float(p)
+            metrics[f"recall_{name}"] = float(r)
+            metrics[f"f1_{name}"] = float(f)
+    except ImportError:
+        # Minimal fallback: accuracy only, no sklearn
+        cm = np.zeros((3, 3), dtype=np.int64)
+        for a, b in zip(y_true, y_pred):
+            cm[int(a), int(b)] += 1
+        metrics["confusion_matrix"] = cm.tolist()
+        metrics["macro_f1"] = 0.0
+        for name in ["FLAT", "LONG", "SHORT"]:
+            metrics[f"precision_{name}"] = 0.0
+            metrics[f"recall_{name}"] = 0.0
+            metrics[f"f1_{name}"] = 0.0
+
+    # Proba quality on validation set
+    max_proba = np.max(probs, axis=1)
+    pl, ps = probs[:, 1], probs[:, 2]
+    pf = np.clip(1.0 - pl - ps, 0.0, 1.0)
+    entropy = np.zeros(len(probs))
+    for i in range(len(probs)):
+        for p in [pl[i], pf[i], ps[i]]:
+            if p > 1e-12:
+                entropy[i] -= p * math.log2(p)
+    metrics["val_avg_max_proba"] = float(max_proba.mean())
+    metrics["val_max_proba_p10"] = float(np.percentile(max_proba, 10))
+    metrics["val_max_proba_p90"] = float(np.percentile(max_proba, 90))
+    metrics["val_entropy_mean"] = float(entropy.mean())
+    metrics["val_entropy_p10"] = float(np.percentile(entropy, 10))
+    metrics["val_entropy_p90"] = float(np.percentile(entropy, 90))
+    metrics["val_max_proba_lt_055_ratio"] = float((max_proba < 0.55).mean())
+    metrics["val_acc"] = float((y_pred == y_true).mean())
+    metrics["val_loss"] = best_val_loss
+    metrics["val_class_dist"] = {
+        "FLAT": int((y_true == 0).sum()),
+        "LONG": int((y_true == 1).sum()),
+        "SHORT": int((y_true == 2).sum()),
+    }
+    metrics["train_class_dist"] = {
+        "FLAT": int((y_train == 0).sum()),
+        "LONG": int((y_train == 1).sum()),
+        "SHORT": int((y_train == 2).sum()),
+    }
+
+    logger.info(
+        "Val metrics: acc=%.4f macro_f1=%.4f avg_max_proba=%.4f entropy=%.4f max_proba<0.55=%.2f%%",
+        metrics["val_acc"],
+        metrics["macro_f1"],
+        metrics["val_avg_max_proba"],
+        metrics["val_entropy_mean"],
+        metrics["val_max_proba_lt_055_ratio"] * 100.0,
+    )
+    logger.info("Confusion matrix:\n%s", np.array(metrics["confusion_matrix"]))
+
     # Save model
     out_model_path.parent.mkdir(parents=True, exist_ok=True)
     model.save_model(out_model_path)
     logger.info(f"Model saved to: {out_model_path.resolve()}")
-    
-    return model, best_val_loss, out_model_path
+
+    # Save metrics JSON alongside model
+    metrics_path = out_model_path.parent / (out_model_path.stem + "_metrics.json")
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
+    logger.info(f"Metrics saved to: {metrics_path}")
+
+    return model, best_val_loss, out_model_path, metrics
 
 
 def main():
@@ -389,8 +493,8 @@ def main():
     parser.add_argument(
         "--feature-preset",
         type=str,
-        default="extended_safe",
-        help="Feature preset (default: extended_safe)",
+        default="base",
+        help="Feature preset: base, extended_safe, extended_safe_v1, microstructure_v1 (default: base)",
     )
     parser.add_argument(
         "--seq-len",
@@ -400,9 +504,23 @@ def main():
     )
     parser.add_argument(
         "--horizon-bars",
+        "--horizon",
         type=int,
         default=None,
+        dest="horizon_bars",
         help="Prediction horizon in bars (default: from settings)",
+    )
+    parser.add_argument(
+        "--pos-threshold",
+        type=float,
+        default=None,
+        help="Positive return threshold for LONG (default: from settings)",
+    )
+    parser.add_argument(
+        "--neg-threshold",
+        type=float,
+        default=None,
+        help="Negative return threshold for SHORT (default: -abs(pos_threshold) or settings)",
     )
     parser.add_argument(
         "--epochs",
@@ -460,12 +578,18 @@ def main():
     else:
         device = torch.device(args.device)
     
+    # neg_threshold default: -abs(pos_threshold) if pos_threshold set, else settings
+    pos_thr = args.pos_threshold
+    neg_thr = args.neg_threshold
+    if pos_thr is not None and neg_thr is None:
+        neg_thr = -abs(pos_thr)
+
     # Train model
-    model, best_val_loss, best_model_path = train_model(
+    model, best_val_loss, best_model_path, metrics = train_model(
         window_size=args.seq_len,
         horizon=args.horizon_bars,
-        pos_threshold=None,  # Use settings defaults
-        neg_threshold=None,
+        pos_threshold=pos_thr,
+        neg_threshold=neg_thr,
         ignore_margin=None,
         batch_size=args.batch_size,
         num_channels=[64, 64, 64, 64],  # Default TCN channels
@@ -479,6 +603,9 @@ def main():
         min_delta=1e-4,
         device=device,
         out_model_path=args.out_model,
+        feature_preset=args.feature_preset,
+        symbol=args.symbol,
+        timeframe=args.timeframe,
     )
     
     logger.info("=" * 60)
@@ -486,6 +613,8 @@ def main():
     logger.info("=" * 60)
     logger.info(f"Best validation loss: {best_val_loss:.4f}")
     logger.info(f"Best model saved to: {best_model_path.resolve()}")
+    if metrics:
+        logger.info("Validation metrics: %s", metrics)
     logger.info("Model training completed successfully!")
 
 

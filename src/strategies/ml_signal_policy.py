@@ -27,6 +27,10 @@ ReasonCode = Literal[
     "THRESHOLD_LONG",
     "THRESHOLD_SHORT",
     "FLAT_THRESHOLD",
+    # D12: directional edge mode
+    "DIRECTIONAL_EDGE_LONG",
+    "DIRECTIONAL_EDGE_SHORT",
+    "DIRECTIONAL_RULE_REJECT",
 ]
 
 
@@ -449,3 +453,172 @@ def decide_action_3class(
         },
     )
 
+
+def decide_action_directional_edge(
+    proba: dict[str, float] | tuple[float, float, float],
+    min_directional_edge: float,
+    require_direction_gt_flat: bool = True,
+    min_side_flat_margin: Optional[float] = None,
+) -> ActionDecisionResult:
+    """
+    D12: Directional edge based signal (no argmax).
+
+    - long_edge = p_long - p_short, short_edge = p_short - p_long
+    - LONG if long_edge >= min_directional_edge and p_long > p_flat (optional margin)
+    - SHORT if short_edge >= min_directional_edge and p_short > p_flat (optional margin)
+    - else FLAT (DIRECTIONAL_RULE_REJECT)
+
+    min_side_flat_margin: if set, require p_long - p_flat >= margin for LONG, p_short - p_flat >= margin for SHORT.
+    """
+    if isinstance(proba, dict):
+        p_long = proba.get("p_long", 0.0)
+        p_flat = proba.get("p_flat", 0.0)
+        p_short = proba.get("p_short", 0.0)
+    elif isinstance(proba, tuple) and len(proba) == 3:
+        p_long, p_flat, p_short = proba
+    else:
+        raise ValueError(
+            f"proba must be dict or tuple of 3 floats, got {type(proba)}"
+        )
+    long_edge = p_long - p_short
+    short_edge = p_short - p_long
+
+    def long_ok() -> bool:
+        if long_edge < min_directional_edge:
+            return False
+        if require_direction_gt_flat and not (p_long > p_flat):
+            return False
+        if min_side_flat_margin is not None and (p_long - p_flat) < min_side_flat_margin:
+            return False
+        return True
+
+    def short_ok() -> bool:
+        if short_edge < min_directional_edge:
+            return False
+        if require_direction_gt_flat and not (p_short > p_flat):
+            return False
+        if min_side_flat_margin is not None and (p_short - p_flat) < min_side_flat_margin:
+            return False
+        return True
+
+    long_qualifies = long_ok()
+    short_qualifies = short_ok()
+
+    if long_qualifies and short_qualifies:
+        action = "LONG" if long_edge >= short_edge else "SHORT"
+        reason_code: ReasonCode = "DIRECTIONAL_EDGE_LONG" if action == "LONG" else "DIRECTIONAL_EDGE_SHORT"
+    elif long_qualifies:
+        action = "LONG"
+        reason_code = "DIRECTIONAL_EDGE_LONG"
+    elif short_qualifies:
+        action = "SHORT"
+        reason_code = "DIRECTIONAL_EDGE_SHORT"
+    else:
+        action = "FLAT"
+        reason_code = "DIRECTIONAL_RULE_REJECT"
+
+    return ActionDecisionResult(
+        action=action,
+        reason_code=reason_code,
+        debug_info={
+            "p_long": p_long,
+            "p_flat": p_flat,
+            "p_short": p_short,
+            "long_edge": long_edge,
+            "short_edge": short_edge,
+            "min_directional_edge": min_directional_edge,
+            "require_direction_gt_flat": require_direction_gt_flat,
+            "min_side_flat_margin": min_side_flat_margin,
+            "reason_code": reason_code,
+            "final_action": action,
+        },
+    )
+
+
+def decide_action_directional_edge_margin_conf(
+    proba: dict[str, float] | tuple[float, float, float],
+    min_directional_edge: float,
+    min_flat_margin: float,
+    min_confidence: float,
+) -> ActionDecisionResult:
+    """
+    D13: Directional edge + flat margin + confidence 결합 룰.
+
+    LONG 조건:
+      long_edge = p_long - p_short
+      long_edge >= min_directional_edge
+      p_long - p_flat >= min_flat_margin
+      p_long >= min_confidence
+
+    SHORT 조건:
+      short_edge = p_short - p_long
+      short_edge >= min_directional_edge
+      p_short - p_flat >= min_flat_margin
+      p_short >= min_confidence
+
+    둘 다 만족하지 못하면 FLAT.
+    """
+    if isinstance(proba, dict):
+        p_long = proba.get("p_long", 0.0)
+        p_flat = proba.get("p_flat", 0.0)
+        p_short = proba.get("p_short", 0.0)
+    elif isinstance(proba, tuple) and len(proba) == 3:
+        p_long, p_flat, p_short = proba
+    else:
+        raise ValueError(
+            f"proba must be dict or tuple of 3 floats, got {type(proba)}"
+        )
+
+    long_edge = p_long - p_short
+    short_edge = p_short - p_long
+
+    def long_ok() -> bool:
+        if long_edge < min_directional_edge:
+            return False
+        if (p_long - p_flat) < min_flat_margin:
+            return False
+        if p_long < min_confidence:
+            return False
+        return True
+
+    def short_ok() -> bool:
+        if short_edge < min_directional_edge:
+            return False
+        if (p_short - p_flat) < min_flat_margin:
+            return False
+        if p_short < min_confidence:
+            return False
+        return True
+
+    long_qualifies = long_ok()
+    short_qualifies = short_ok()
+
+    if long_qualifies and short_qualifies:
+        action = "LONG" if long_edge >= short_edge else "SHORT"
+        reason_code: ReasonCode = "DIRECTIONAL_EDGE_LONG" if action == "LONG" else "DIRECTIONAL_EDGE_SHORT"
+    elif long_qualifies:
+        action = "LONG"
+        reason_code = "DIRECTIONAL_EDGE_LONG"
+    elif short_qualifies:
+        action = "SHORT"
+        reason_code = "DIRECTIONAL_EDGE_SHORT"
+    else:
+        action = "FLAT"
+        reason_code = "DIRECTIONAL_RULE_REJECT"
+
+    return ActionDecisionResult(
+        action=action,
+        reason_code=reason_code,
+        debug_info={
+            "p_long": p_long,
+            "p_flat": p_flat,
+            "p_short": p_short,
+            "long_edge": long_edge,
+            "short_edge": short_edge,
+            "min_directional_edge": min_directional_edge,
+            "min_flat_margin": min_flat_margin,
+            "min_confidence": min_confidence,
+            "reason_code": reason_code,
+            "final_action": action,
+        },
+    )
